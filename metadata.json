@@ -1,0 +1,6 @@
+{
+  "name": "iTred Commerce",
+  "description": "Industrial-grade Point of Sale, Deterministic Inventory Intelligence, Backup & Restore Hardening, Database Integrity Audits, Operational Readiness, Structured Activity Event Schema, Central Metric Dictionary, Operational Exception Ledger, Multi-Tender Shift & EOD Controls, Debtors & Creditors, Cash Manager, and Fiscalization Gateway.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
