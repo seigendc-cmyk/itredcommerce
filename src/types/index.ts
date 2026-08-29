@@ -1,12 +1,21 @@
 export type StaffRole = 'SYS_ADMIN' | 'STORE_MANAGER' | 'SENIOR_CASHIER' | 'CASHIER' | 'INVENTORY_OFFICER' | 'ACCOUNTANT';
 
+// Auth-scope role (DL-005): distinct from StaffRole above, which is a
+// free-form job role/title. This is the controlled vocabulary that drives
+// which of the five app surfaces and which RLS policies a staff member's
+// session gets — see ITRED_GOVERNANCE_AND_ARCHITECTURE.md DL-002/DL-005.
+export type StaffAccessRole = 'TILL_OPERATOR' | 'HEAD_OFFICE_STAFF' | 'EXECUTIVE' | 'RIDER' | 'PLATFORM_SUPER_ADMIN';
+
 export interface StaffMember {
   id: string;
+  tenantId?: string;
   code: string;
   name: string;
   role: StaffRole;
   roleTitle: string;
   department: string;
+  accessRole?: StaffAccessRole;
+  homeBranchId?: string;
   accessCode: string; // 4-6 digit pin
   permissions: string[];
   avatarInitials: string;
@@ -15,6 +24,7 @@ export interface StaffMember {
 }
 
 export interface Supplier {
+  tenantId?: string;
   code: string;
   name: string;
   contactPerson?: string;
@@ -111,6 +121,7 @@ export type POStatus = 'All' | 'Open' | 'Part Received' | 'Completed' | 'Rejecte
 export type CustomFieldType = 'text' | 'number' | 'decimal' | 'date' | 'boolean' | 'select' | 'multi-select';
 
 export interface CustomFieldDefinition {
+  tenantId?: string;
   id: string;
   label: string;
   industry: string;
@@ -124,6 +135,7 @@ export interface CustomFieldDefinition {
 }
 
 export interface PurchaseOrder {
+  tenantId?: string;
   poNumber: string;
   supplierName: string;
   supplierCode: string;
@@ -163,6 +175,7 @@ export interface PurchaseMemoItem {
 }
 
 export interface PurchaseMemo {
+  tenantId?: string;
   id: string;
   memoNumber: string;
   supplierName?: string;
@@ -183,10 +196,28 @@ export interface PurchaseMemo {
   approvalDate?: string;
 }
 
+// --------------------------------------------------------
+// MULTI-TENANCY (DL-001) — Tenant → Branch → Terminal
+// --------------------------------------------------------
+export type TenantStatus = 'ACTIVE' | 'SUSPENDED' | 'CLOSED';
+
+export interface Tenant {
+  id: string;
+  legalName: string;
+  displayName: string;
+  country: string; // ISO 3166-1 alpha-2; selects the FiscalizationProvider (DL-003)
+  baseCurrency: string; // ISO 4217
+  fiscalizationProvider?: string; // e.g. 'KRA_ETIMS'; unset until assigned (Prompt 11)
+  status: TenantStatus;
+  timezone: string;
+}
+
 export type LocationType = 'WAREHOUSE' | 'BRANCH';
 
 export interface Warehouse {
   id: string;
+  tenantId?: string;
+  branchId?: string;
   code: string;
   name: string;
   address: string;
@@ -203,11 +234,16 @@ export type TerminalStatus = 'ONLINE' | 'OFFLINE' | 'LOCKED' | 'IN_USE' | 'ACTIV
 
 export interface Terminal {
   id: string;
+  tenantId?: string;
   code: string;
   name: string;
   branchId: string;
   branchName: string;
   workstationType: 'COUNTER_POS' | 'EXPRESS_CHECKOUT' | 'BACKOFFICE_REGISTER';
+  // Which of the two Tauri deployables this install runs (DL-002).
+  appSurface?: 'BRANCH_TERMINAL' | 'HEAD_OFFICE';
+  activationCode?: string;
+  activatedAt?: string;
   activeCashierName?: string;
   currentCashierStaffId?: string;
   currentCashierStaffName?: string;
@@ -223,6 +259,7 @@ export interface Terminal {
 
 export interface Branch {
   id: string;
+  tenantId?: string;
   code: string;
   name: string;
   address: string;
@@ -275,6 +312,7 @@ export interface StockTransferItem {
 }
 
 export interface StockTransfer {
+  tenantId?: string;
   id: string;
   transferNumber: string;
   flowType?: StockTransferFlowType;
@@ -405,6 +443,7 @@ export interface GoodsReceiptNoteItem {
 }
 
 export interface GoodsReceiptNote {
+  tenantId?: string;
   id: string;
   grnNumber: string;
   poNumber: string;
@@ -423,6 +462,7 @@ export interface GoodsReceiptNote {
 }
 
 export interface StocktakeRecord {
+  tenantId?: string;
   id: string;
   batchNo: string;
   locationId: string;
@@ -440,6 +480,7 @@ export interface StocktakeRecord {
 }
 
 export interface StockAdjustmentRecord {
+  tenantId?: string;
   id: string;
   adjustmentNumber: string;
   locationId: string;
@@ -457,6 +498,7 @@ export interface StockAdjustmentRecord {
 }
 
 export interface ConnectedShopConfig {
+  tenantId?: string;
   id: string;
   locationId: string;
   locationType: LocationType;
@@ -470,6 +512,7 @@ export interface ConnectedShopConfig {
 }
 
 export interface InventoryItem {
+  tenantId?: string;
   sku: string;
   barcode: string;
   name?: string;
@@ -524,6 +567,7 @@ export type CreditStatus = 'ACTIVE' | 'SUSPENDED' | 'UNDER_REVIEW' | 'BLOCKED' |
 export type DebtorAccountStatus = 'GOOD_STANDING' | 'OVERDUE' | 'ON_HOLD' | 'IN_ARREARS' | 'ARCHIVED';
 
 export interface Customer {
+  tenantId?: string;
   id: string;
   accountNumber: string;
   name: string;
@@ -569,6 +613,7 @@ export interface SplitPaymentEntry {
 export type TransactionType = 'CASH_SALE' | 'CREDIT_SALE' | 'HELD_SALE' | 'LAYAWAY' | 'CREDIT_NOTE';
 
 export interface SaleTransaction {
+  tenantId?: string;
   saleId?: string;
   saleNumber: string;
   dateTime: string;
@@ -626,6 +671,7 @@ export interface SaleExecutionResult {
 }
 
 export interface HeldSale {
+  tenantId?: string;
   id: string;
   saleNumber: string;
   customer: Customer;
@@ -642,6 +688,7 @@ export interface HeldSale {
 }
 
 export interface HeldReceipt {
+  tenantId?: string;
   id: string;
   cashier: StaffMember;
   customer: Customer;
@@ -660,6 +707,7 @@ export interface LayawayPaymentRecord {
 }
 
 export interface LayawayOrder {
+  tenantId?: string;
   id: string;
   customer: Customer;
   cashier: StaffMember;
@@ -685,6 +733,7 @@ export interface CreditNoteReturnItem {
 }
 
 export interface CreditNote {
+  tenantId?: string;
   id: string;
   originalSaleNumber?: string;
   customer: Customer;
@@ -790,6 +839,7 @@ export interface ImmutableShiftReconciliationSnapshot {
 }
 
 export interface Shift {
+  tenantId?: string;
   id: string;
   shiftNumber: string;
   terminalId: string;
@@ -861,6 +911,7 @@ export interface EODReconciliationEntry {
 }
 
 export interface EODReport {
+  tenantId?: string;
   id: string;
   reportNumber: string;
   date: string;
@@ -922,6 +973,7 @@ export type StocktakeStatus =
   | 'CANCELLED';
 
 export interface StocktakeSession {
+  tenantId?: string;
   id: string;
   sessionNumber: string;
   title: string;
@@ -966,6 +1018,7 @@ export type ApprovalType =
 export type ApprovalStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
 
 export interface ApprovalRequest {
+  tenantId?: string;
   id: string;
   requestNumber: string;
   type: ApprovalType;
@@ -1002,6 +1055,7 @@ export interface ApprovalRequest {
 export type DebtorTransactionType = 'INVOICE' | 'PAYMENT' | 'CREDIT_NOTE' | 'JOURNAL_ADJ' | 'OPENING_BALANCE';
 
 export interface DebtorTransaction {
+  tenantId?: string;
   id: string;
   customerId: string;
   customerName: string;
@@ -1043,6 +1097,7 @@ export interface DebtorAgingBucket {
 export type CreditorTransactionType = 'PURCHASE_INVOICE' | 'GRN_ACCRUAL' | 'PAYMENT_MADE' | 'DEBIT_NOTE' | 'ADJUSTMENT';
 
 export interface CreditorTransaction {
+  tenantId?: string;
   id: string;
   supplierCode: string;
   supplierName: string;
@@ -1086,6 +1141,7 @@ export type CashBankAccountType =
   | 'OTHER';
 
 export interface CashBankAccount {
+  tenantId?: string;
   id: string;
   code: string;
   name: string;
@@ -1116,6 +1172,7 @@ export type CashBankMovementType =
   | 'CARD_SETTLEMENT';
 
 export interface CashBankTransaction {
+  tenantId?: string;
   id: string;
   accountId: string;
   accountName: string;
@@ -1149,6 +1206,7 @@ export type CashMovementCategory =
   | 'RECONCILIATION';
 
 export interface CashMovementRecord {
+  tenantId?: string;
   id: string;
   movementNumber: string;
   category: CashMovementCategory;
@@ -1183,6 +1241,7 @@ export type ReserveCategory =
   | 'MANAGEMENT_EMERGENCY_RESERVE';
 
 export interface BusinessReserve {
+  tenantId?: string;
   id: string;
   code: string;
   name: string;
@@ -1200,6 +1259,7 @@ export interface BusinessReserve {
 }
 
 export interface ReserveTransferRecord {
+  tenantId?: string;
   id: string;
   reserveId: string;
   reserveName: string;
@@ -1238,6 +1298,7 @@ export interface ItemTaxClassification {
 }
 
 export interface TaxFiscalConfig {
+  tenantId?: string;
   taxSystemName: string; // e.g. "Value Added Tax (VAT)", "Goods & Services Tax (GST)", "Sales Tax"
   taxRegistrationNumber: string; // e.g. "VAT-88492019-B"
   fiscalDeviceSerialNumber: string; // e.g. "FISCAL-ETR-2026-9921"
@@ -1300,6 +1361,7 @@ export interface BIUserResponse {
 }
 
 export interface BIRuleAlert {
+  tenantId?: string;
   id: string;
   ruleType: BIRuleType;
   category: BICategory;
@@ -1363,6 +1425,7 @@ export interface BusinessRuleResult {
 export type ReorderRecommendationStatus = 'NEW' | 'REVIEWED' | 'ACCEPTED' | 'IGNORED' | 'CONVERTED' | 'RESOLVED';
 
 export interface ReorderRecommendation {
+  tenantId?: string;
   id: string;
   sku: string;
   itemName: string;
@@ -1515,6 +1578,14 @@ export type ProductPlanEdition = 'STANDARD_DESKTOP' | 'PROFESSIONAL_DESKTOP' | '
 export interface LicenceInfo {
   productCode: string;
   installationId: string;
+  // Fixed at activation time and never changed without a full
+  // re-activation (DL-001/DL-002) — this is what binds a single
+  // installation to exactly one tenant (and, for terminal installs, one
+  // branch and one terminal record).
+  tenantId?: string;
+  branchId?: string;
+  terminalId?: string;
+  appSurface?: 'BRANCH_TERMINAL' | 'HEAD_OFFICE';
   activationCode: string;
   productStatus: 'ACTIVE' | 'WARNING' | 'EXPIRED';
   currentPlan: ProductPlanEdition;
@@ -1747,6 +1818,7 @@ export type DeviceOperationalStatus =
   | 'STANDBY';
 
 export interface PosDevice {
+  tenantId?: string;
   id: string;
   name: string;
   category: DeviceCategory;
@@ -1780,6 +1852,7 @@ export interface PosDevice {
 // PHASE 8: PAYMENT INTEGRATION CONFIGURATION
 // --------------------------------------------------------
 export interface PaymentMethodConfig {
+  tenantId?: string;
   id: string;
   methodType: PaymentMethodType;
   name: string;
@@ -1877,6 +1950,7 @@ export type ExceptionSeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
 export type ExceptionStatus = 'OPEN' | 'UNDER_REVIEW' | 'APPROVED' | 'REJECTED' | 'RESOLVED';
 
 export interface OperationalException {
+  tenantId?: string;
   id: string;
   exceptionNumber: string;
   title: string;
