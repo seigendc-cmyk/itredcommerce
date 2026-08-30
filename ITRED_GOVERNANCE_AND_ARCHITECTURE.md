@@ -564,6 +564,105 @@ plan (see chat history for the full review); decisions made:
   there is no PWA yet for it to apply to. Flagged as a decision the
   Executive/Rider PWA prompt must make explicitly, not default silently.
 
+## EXECUTIVE PWA ADDENDUM (2026-08-31)
+
+Prompt 6 builds the Executive PWA — the first surface DL-002 actually
+requires to be a *separate deployable*, not a client-side gate inside the
+shared Tauri codebase: `executive-pwa/` is its own package (own
+`package.json`, own Vite dev server on port 3100, own `.env`), talks to
+Supabase directly with the anon key, and has no dependency on the Express
+backend at all. It reuses `src/types/index.ts` and selected `src/components/ui`
+primitives via a `@shared` Vite alias (per DL-002's "share as much as
+practical"), but its data access, auth, and app shell are fully independent.
+
+### DL-013: Executive PWA — auth bridge, rollups, and honestly-scoped financials
+
+**Decision**: several related pieces, all introduced together for this one
+app surface:
+
+- **Sign-in** (`supabase/functions/executive-signin`): bridges `verify_staff_pin()`
+  (DL-011's shared primitive — same RPC the Express backend calls) to a real
+  Supabase Auth session, since this PWA has no backend of its own and reads
+  Supabase directly under RLS. On first sign-in it just-in-time provisions
+  an `auth.users` identity (synthetic `<staffId>@<tenantId>.execpwa.internal`
+  email, random password, never surfaced) and links it via `staff.auth_user_id`
+  (added by Prompt 5, unpopulated until now); it then mints a session
+  server-side (`generateLink` + `verifyOtp` in one call) so the user only
+  ever sees the PIN pad, never a magic-link/redirect UX. Only
+  `access_role = 'executive'` may sign in here — a correct PIN for any other
+  role is refused with `NOT_EXECUTIVE`. `supabase/functions/executive-roster`
+  is the unauthenticated staff-picker endpoint (names/initials only, same
+  acceptable-exposure precedent as the main app's `GET /auth/staff`).
+- **Session TTL**: Supabase's own access/refresh-token lifecycle applies as
+  normal, plus this app enforces its own 12h absolute ceiling on top
+  (`executive-pwa/src/lib/session.ts`, mirroring `ABSOLUTE_SESSION_CEILING_MS`
+  in the Tauri apps' `server/middleware/session.ts`) — checked at startup,
+  every 5 minutes, and on tab-visibility change, forcing a real
+  `supabase.auth.signOut()` (not just clearing a local flag) once it trips,
+  so a technically-still-refreshable session can't outlive it in a
+  left-open tab. This is the PWA session-TTL decision DL-011 flagged as
+  genuinely deferred, now made.
+- **Rollups** (`supabase/migrations/20260831090000_executive_rollups.sql`):
+  dashboard pages read from materialized views refreshed every 15 minutes
+  via `pg_cron`, not raw transaction aggregation on every page load. The one
+  correctness detail that matters most in that file: Postgres does not
+  enforce RLS on materialized views, so every `mv_*` view is ungranted and a
+  thin `v_*` wrapper view (re-applying `tenant_id = app_current_tenant_id()`)
+  is the only thing ever granted to `authenticated` — client code
+  (`executive-pwa/src/lib/rollups.ts`) only ever queries the `v_*` views.
+  `rollup_refresh_log` powers each page's "As of [time]" label.
+- **Chart of Accounts** (`supabase/migrations/20260831090100_chart_of_accounts.sql`):
+  an account *registry* (`chart_of_accounts`) plus a nullable one-to-one
+  linkage from real `cash_bank_accounts` rows to one GL account each —
+  explicitly not a double-entry posting engine, because no posting engine
+  exists anywhere in this schema. Existing accounts are not retroactively
+  assigned a GL account by the migration; back-office staff assign one
+  per account going forward.
+- **P&L and Balance Sheet** (`FinancialStatementsPage`): approximated from
+  the existing rollups and direct aggregates (sales rollup net
+  revenue/cost basis, expense rollup, cash/bank balances, inventory
+  valuation at cost, debtor/creditor totals) rather than derived from real
+  ledger postings, since there are none to derive from. The page carries an
+  explicit on-screen disclaimer saying so rather than presenting the numbers
+  as GL-accurate statements.
+- **Decision Flows / Pending Tasks**: read-only, by explicit scope decision
+  — `DECISION_FLOWS` is a read-only union of `operational_exceptions` +
+  `approval_requests`; `PENDING_TASKS` is pending approvals plus
+  open/part-received purchase orders (money already committed to a
+  supplier). Neither page offers a decide/resolve/approve action — those
+  stay in the back-office apps, this app is a dashboard, not another place
+  to action the same request from.
+- **Deliberately not built**: Market Signals & Seasonal Demand, Staffing
+  Scoring, and Health Scoring & Risk Factors all render a shared
+  `PendingSignOffPage` placeholder instead of a real page. Each needs a
+  scoring/analysis methodology proposed and signed off before
+  implementation — per this document's own "Open items" rule against
+  implementing scoring methodologies unilaterally — so shipping a
+  placeholder here was chosen over either a half-built page or a silently
+  missing menu item.
+
+**Rationale**: bridging PIN auth to a real Supabase session (rather than,
+say, giving this PWA its own separate credential) keeps "the PIN is the one
+credential" true across every surface, till operator through executive.
+Pre-aggregating via scheduled materialized views rather than querying raw
+transaction tables from the browser on every dashboard open keeps the app
+usable as transaction volume grows, and the `mv_*`/`v_*` split is what stops
+that optimization from accidentally becoming a cross-tenant data leak.
+Naming the financial statements as approximations rather than quietly
+presenting them as authoritative is the same "don't misrepresent what the
+system actually knows" principle DL-010's insert-only rate ledger and DL-004
+already apply elsewhere.
+
+**Operational step required, not yet done**: `access_token_hook()` (built by
+Prompt 5, still unregistered) must actually be registered under
+Authentication → Hooks in the Supabase project dashboard before this app can
+work at all — without it, a signed-in executive's JWT carries no
+`tenant_id`/`staff_role` claim, every RLS-protected query returns nothing,
+and the app will appear to sign in successfully but show empty dashboards
+everywhere. This is a deployment step no migration can perform; flag it
+explicitly when standing up a real Supabase project for this app, the same
+way the Tauri packaging gap is flagged above so it isn't lost.
+
 ### Open items (explicitly not decided here)
 
 - **Platform super-admin view scope**: referenced in DL-002 but deliberately

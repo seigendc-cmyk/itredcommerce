@@ -35,6 +35,21 @@ supabase db push
   future PWA prompt) on `staff`, and an `access_token_hook()` function
   ready to register once something populates `auth_user_id`. See the
   governance doc's DL-011/DL-012 addendum.
+- `20260831090000_executive_rollups.sql` (Prompt 6) — pre-aggregated
+  `mv_*` materialized views (daily sales, inventory valuation/turnover,
+  debtor/creditor ageing, expense rollup) refreshed every 15 minutes via
+  `pg_cron`, each fronted by an RLS-safe `v_*` wrapper view — matviews
+  don't support RLS directly, so only the wrapper views are granted to
+  `authenticated`. Requires the `pg_cron` extension enabled on the project.
+- `20260831090100_chart_of_accounts.sql` (Prompt 6) — the GL account
+  registry (`chart_of_accounts`) plus a nullable `gl_account_id` link from
+  `cash_bank_accounts` to it. Not a posting engine — see the governance
+  doc's DL-013 addendum for what this does and doesn't back.
+
+`functions/executive-signin` and `functions/executive-roster` (Prompt 6)
+are Supabase Edge Functions backing the Executive PWA's sign-in screen —
+deploy with `supabase functions deploy executive-signin executive-roster`.
+They are not applied by `supabase db push` (that only covers `migrations/`).
 
 `seed.sql` (not a migration — see below) seeds one dev tenant
 (`TENANT-NYAMUTSAMBA`) and migrates the four `INITIAL_STAFF_MEMBERS` mock
@@ -55,3 +70,9 @@ automatically after migrations) — `supabase db push` does not run it.
   branch-scoped, because they don't carry a `branch_id` in the source
   SQLite schema or the TypeScript types. That's a faithful port of an
   existing limitation, not a new one introduced here.
+- `access_token_hook()` still isn't registered anywhere by a migration
+  (Auth Hooks are a dashboard setting, not SQL) — and now that the
+  Executive PWA (Prompt 6) actually depends on it, this is a required
+  manual step before that app will show anything but empty dashboards:
+  Authentication → Hooks → Custom Access Token → point it at
+  `public.access_token_hook`.
