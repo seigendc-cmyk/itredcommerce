@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { apiGet, apiPost, ApiClientError } from './api/client';
 import { 
   AppStage, 
   ActiveView, 
@@ -52,8 +53,7 @@ import {
   BackupRecord,
   CashFlowProjectionEntry
 } from './types';
-import { buildImmutableReconciliationSnapshot, createOperationalExceptionFromVariance } from './utils/shiftReconciliation';
-import { 
+import {
   INITIAL_STAFF_MEMBERS,
   INITIAL_CUSTOMERS,
   INITIAL_SUPPLIERS,
@@ -196,7 +196,11 @@ export default function App() {
 
   // Phase 5 Shift, EOD, Stocktake & Governance State
   const [shifts, setShifts] = useState<Shift[]>(INITIAL_SHIFTS);
-  const [currentTerminalId, setCurrentTerminalId] = useState<string>('POS-D01');
+  // TERM-01 matches a real seeded terminals row so shift-open/checkout can
+  // resolve it server-side; 'POS-D01' (the old default) doesn't exist in the
+  // backend. Real terminal binding belongs to the still-open LicensingView/
+  // installation_config wiring gap noted in the Prompt 3 plan, not this one.
+  const [currentTerminalId, setCurrentTerminalId] = useState<string>('TERM-01');
   const [eodReports, setEodReports] = useState<EODReport[]>(INITIAL_EOD_REPORTS);
   const [stocktakeSessions, setStocktakeSessions] = useState<StocktakeSession[]>(INITIAL_STOCKTAKE_SESSIONS);
   const [approvalRequests, setApprovalRequests] = useState<ApprovalRequest[]>(INITIAL_APPROVAL_REQUESTS);
@@ -598,18 +602,48 @@ export default function App() {
     );
   };
 
-  // Operational Shift Check on Entry
+  // On entering the main app: pull the real product catalog, customer list,
+  // and this terminal's currently-open shift (if any) from the backend
+  // before deciding whether to prompt for a shift open — using the mock
+  // `shifts` state here would race the fetch and could show a stale "shift
+  // already open" that doesn't exist server-side (checkout would then fail
+  // with an unknown-shift error).
   useEffect(() => {
-    if (appStage === 'MAIN_APP' && !hasCheckedShiftOnEntry) {
-      setHasCheckedShiftOnEntry(true);
-      const activeOrUnclosedShift = shifts.find(
-        (s) => s.terminalId === currentTerminalId && (s.status === 'OPEN' || s.status === 'REQUIRES_CLOSURE')
-      );
-      if (!activeOrUnclosedShift || activeOrUnclosedShift.status === 'REQUIRES_CLOSURE') {
-        setIsShiftOpeningModalOpen(true);
+    if (appStage !== 'MAIN_APP' || hasCheckedShiftOnEntry) return;
+    setHasCheckedShiftOnEntry(true);
+
+    (async () => {
+      try {
+        const [items, customerList, currentShift] = await Promise.all([
+          apiGet<InventoryItem[]>('/inventory/items'),
+          apiGet<Customer[]>('/customers'),
+          apiGet<Shift | null>(`/shifts/current?terminalId=${encodeURIComponent(currentTerminalId)}`),
+        ]);
+        setInventoryItems(items);
+        setCustomers(customerList);
+        // Replace this terminal's shift state with the real backend truth —
+        // otherwise a stale mock-seeded "open" shift for this terminal can
+        // never be cleared and permanently blocks opening a real one.
+        setShifts((prev) => {
+          const withoutThisTerminal = prev.filter((s) => s.terminalId !== currentTerminalId);
+          return currentShift ? [currentShift, ...withoutThisTerminal] : withoutThisTerminal;
+        });
+        if (!currentShift || currentShift.status === 'REQUIRES_CLOSURE') {
+          setIsShiftOpeningModalOpen(true);
+        }
+      } catch {
+        // Backend unreachable — fall back to whatever the mock-seeded local
+        // state already has rather than blocking app entry entirely.
+        const activeOrUnclosedShift = shifts.find(
+          (s) => s.terminalId === currentTerminalId && (s.status === 'OPEN' || s.status === 'REQUIRES_CLOSURE')
+        );
+        if (!activeOrUnclosedShift || activeOrUnclosedShift.status === 'REQUIRES_CLOSURE') {
+          setIsShiftOpeningModalOpen(true);
+        }
       }
-    }
-  }, [appStage, hasCheckedShiftOnEntry, shifts, currentTerminalId]);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appStage, hasCheckedShiftOnEntry, currentTerminalId]);
 
   // Global Keyboard Shortcuts
   useEffect(() => {
@@ -1262,45 +1296,24 @@ export default function App() {
   };
 
   // Phase 5 Operational Handlers
-  const handleOpenShift = (shiftData: {
+  const handleOpenShift = async (shiftData: {
     terminalId: string;
     branchId: string;
     cashierStaffId: string;
     openingFloat: number;
     openingNotes?: string;
   }) => {
-    const terminal = (terminals || []).find((t) => t.id === shiftData.terminalId) || terminals?.[0] || { id: 'POS-D01', name: 'Main Counter Register #01' };
-    const branch = (branches || []).find((b) => b.id === shiftData.branchId) || branches?.[0] || { id: 'BR-01', name: 'Main Downtown Branch' };
-    const now = new Date();
-    const dateStr = now.toISOString().split('T')[0];
-    const timeStr = now.toISOString().replace('T', ' ').slice(0, 16);
-
-    const newShift: Shift = {
-      id: `SHIFT-${dateStr.replace(/-/g, '')}-${Math.floor(100 + Math.random() * 900)}`,
-      shiftNumber: `SH-${dateStr.replace(/-/g, '')}-${String(shifts.length + 1).padStart(3, '0')}`,
-      terminalId: shiftData.terminalId,
-      terminalName: terminal?.name || 'Main Counter Register #01',
-      branchId: shiftData.branchId,
-      branchName: branch?.name || 'Main Downtown Branch',
-      cashierStaffId: currentStaff.id,
-      cashierStaffName: currentStaff.name,
-      openedDateTime: timeStr,
-      openingDate: dateStr,
-      openingFloat: shiftData.openingFloat,
-      openingNotes: shiftData.openingNotes,
-      status: 'OPEN',
-      expectedCash: shiftData.openingFloat,
-      totalSalesCount: 0,
-      grossSales: 0,
-      totalCashSales: 0,
-      totalMobileMoneySales: 0,
-      totalCardSales: 0,
-      totalCreditSales: 0,
-      totalRefunds: 0,
-      totalPayouts: 0,
-      totalHeldSales: 0,
-      totalLayawayReceipts: 0,
-    };
+    let newShift: Shift;
+    try {
+      newShift = await apiPost<Shift>('/shifts', {
+        terminalId: shiftData.terminalId,
+        openingFloat: shiftData.openingFloat,
+        openingNotes: shiftData.openingNotes,
+      });
+    } catch (err) {
+      window.alert(err instanceof ApiClientError ? `Could not open shift: ${err.message}` : 'Could not reach the backend to open this shift.');
+      return;
+    }
 
     setShifts((prev) => [newShift, ...prev]);
     setIsShiftOpeningModalOpen(false);
@@ -1308,7 +1321,7 @@ export default function App() {
     // Record Immutable Shift Opening Activity Event
     const shiftOpenEvt: ActivityEvent = {
       id: `EVT-${Date.now()}`,
-      timestamp: timeStr,
+      timestamp: newShift.openedDateTime,
       eventType: 'SHIFT_OPENED',
       description: `Shift #${newShift.shiftNumber} opened on ${newShift.terminalName} by ${currentStaff.name} with opening float of $${shiftData.openingFloat.toFixed(2)} USD.`,
       staffId: currentStaff.id,
@@ -1327,7 +1340,7 @@ export default function App() {
     setActivityEvents((prev) => [shiftOpenEvt, ...prev]);
   };
 
-  const handleCloseShift = (
+  const handleCloseShift = async (
     shiftId: string,
     closureData: {
       closingFloat: number;
@@ -1344,57 +1357,44 @@ export default function App() {
       managerApprovedBy?: string;
     }
   ) => {
-    const closedTimeStr = new Date().toISOString().replace('T', ' ').slice(0, 16);
     const targetShift = shifts.find((s) => s.id === shiftId);
     if (!targetShift) return;
 
-    // Build immutable reconciliation snapshot
-    const reconciliationSnapshot = buildImmutableReconciliationSnapshot({
-      shift: targetShift,
-      closureData,
-      closedByStaff: currentStaff,
-      transactions: salesTransactions,
-      heldSales: heldSales,
-    });
+    // The server rebuilds the reconciliation snapshot from real persisted
+    // sales/held-sales for this shift (via shiftReconciliation.ts, reused
+    // server-side) and creates the variance exception row if one is
+    // warranted — this is the authoritative close, not a local computation.
+    let closedShift: Shift;
+    try {
+      closedShift = await apiPost<Shift>(`/shifts/${encodeURIComponent(shiftId)}/close`, closureData);
+    } catch (err) {
+      window.alert(err instanceof ApiClientError ? `Could not close shift: ${err.message}` : 'Could not reach the backend to close this shift.');
+      return;
+    }
 
-    const hasVariance = reconciliationSnapshot.hasAnyDiscrepancy;
-    const generatedExceptionIds: string[] = [];
+    setShifts((prev) => prev.map((s) => (s.id === shiftId ? closedShift : s)));
+    setClosureShiftTarget(null);
 
-    // If there is an auditable discrepancy, automatically register in Exception Ledger
+    const hasVariance = closedShift.reconciliationSnapshot?.hasAnyDiscrepancy;
     if (hasVariance) {
-      const newException = createOperationalExceptionFromVariance({
-        shift: targetShift,
-        snapshot: reconciliationSnapshot,
-        closureData,
-        staff: currentStaff,
-      });
-
-      generatedExceptionIds.push(newException.id);
-      setOperationalExceptions((prev) => [newException, ...prev]);
-
-        const defaultReason: ActivityReasonCode = closureData.cashVariance < 0 ? 'CASH_SHORTAGE' : 'CASH_OVERAGE';
-        const effectiveReason = closureData.reasonCode || defaultReason;
-
-        const varianceEvt: ActivityEvent = {
+      const defaultReason: ActivityReasonCode = closureData.cashVariance < 0 ? 'CASH_SHORTAGE' : 'CASH_OVERAGE';
+      const effectiveReason = closureData.reasonCode || defaultReason;
+      const varianceEvt: ActivityEvent = {
         id: `EVT-VAR-${Date.now()}`,
-        timestamp: closedTimeStr,
+        timestamp: closedShift.closedDateTime || new Date().toISOString().replace('T', ' ').slice(0, 16),
         eventType: 'PAYMENT_VARIANCE_DETECTED',
-        description: `Operational exception ${newException.exceptionNumber} logged for shift tender variance of ${closureData.cashVariance >= 0 ? '+' : ''}$${closureData.cashVariance.toFixed(2)} (${effectiveReason}) on shift #${targetShift.shiftNumber}.`,
+        description: `Shift tender variance of ${closureData.cashVariance >= 0 ? '+' : ''}$${closureData.cashVariance.toFixed(2)} (${effectiveReason}) recorded on shift #${targetShift.shiftNumber}.`,
         staffId: currentStaff.id,
         staffName: currentStaff.name,
         branchId: targetShift.branchId || 'BR-01',
         branchName: targetShift.branchName || 'Main Store Downtown',
         terminalId: targetShift.terminalId || currentTerminalId,
-        referenceDocument: newException.exceptionNumber,
+        referenceDocument: targetShift.shiftNumber,
         amount: closureData.cashVariance,
         reasonCode: effectiveReason,
-        entityType: 'OPERATIONAL_EXCEPTION',
-        entityId: newException.id,
         metadata: {
           shiftId: targetShift.id,
           shiftNumber: targetShift.shiftNumber,
-          exceptionId: newException.id,
-          exceptionNumber: newException.exceptionNumber,
           varianceAmount: closureData.cashVariance,
           tenderReconciliation: closureData.tenderReconciliation,
           cashUpMode: closureData.cashUpMode || 'STANDARD',
@@ -1403,37 +1403,10 @@ export default function App() {
       setActivityEvents((prev) => [varianceEvt, ...prev]);
     }
 
-    // Update shift status and store snapshot
-    setShifts((prev) =>
-      prev.map((s) => {
-        if (s.id === shiftId) {
-          return {
-            ...s,
-            status: 'CLOSED',
-            closedDateTime: closedTimeStr,
-            closingFloat: closureData.closingFloat,
-            countedCash: closureData.countedCash,
-            cashVariance: closureData.cashVariance,
-            closingNotes: closureData.closingNotes,
-            cashUpMode: closureData.cashUpMode || 'STANDARD',
-            tenderReconciliation: closureData.tenderReconciliation,
-            reconciliationSnapshot,
-            exceptionIds: generatedExceptionIds.length > 0 ? generatedExceptionIds : s.exceptionIds,
-            closureReasonCode: closureData.reasonCode,
-            approvedByStaffId: closureData.managerApproved ? currentStaff.id : undefined,
-            approvedByStaffName: closureData.managerApproved ? (closureData.managerApprovedBy || currentStaff.name) : undefined,
-            approvedDateTime: closureData.managerApproved ? closedTimeStr : undefined,
-          };
-        }
-        return s;
-      })
-    );
-    setClosureShiftTarget(null);
-
     // Record Immutable Shift Closed Event
     const shiftCloseEvt: ActivityEvent = {
       id: `EVT-${Date.now()}`,
-      timestamp: closedTimeStr,
+      timestamp: closedShift.closedDateTime || targetShift.openedDateTime,
       eventType: 'SHIFT_CLOSED',
       description: `Shift #${targetShift.shiftNumber} closed by ${currentStaff.name} [Mode: ${closureData.cashUpMode || 'STANDARD'}]. Counted cash: $${closureData.countedCash.toFixed(2)}, Cash Variance: ${closureData.cashVariance >= 0 ? '+' : ''}$${closureData.cashVariance.toFixed(2)}.`,
       staffId: currentStaff.id,

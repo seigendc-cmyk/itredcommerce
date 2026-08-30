@@ -48,6 +48,21 @@ export class ImmutabilityViolationError extends Error {
   }
 }
 
+/**
+ * Throws ImmutabilityViolationError if this UPDATE would touch a row that's
+ * already reached a locked terminal status (DL-006). Exported so multi-row
+ * write paths (applyBatchWithOutbox callers) can run the same check per row
+ * without going through the single-entity applyWithOutbox wrapper.
+ */
+export function assertUpdateAllowed(db: DatabaseSync, table: string, pkColumn: string, pk: string): void {
+  const currentRow = db
+    .prepare(`SELECT * FROM ${table} WHERE ${pkColumn} = ?`)
+    .get(pk) as Record<string, unknown> | undefined;
+  if (violatesImmutabilityGuard(table, 'UPDATE', currentRow)) {
+    throw new ImmutabilityViolationError(table, pk);
+  }
+}
+
 export function applyWithOutbox<T>(params: ApplyWithOutboxParams<T>): T {
   const { db, tenantId, table, pkColumn, pk, operation, payload, originTerminalId, apply } = params;
 
@@ -57,12 +72,7 @@ export function applyWithOutbox<T>(params: ApplyWithOutboxParams<T>): T {
 
   return withTransaction(db, () => {
     if (operation === 'UPDATE') {
-      const currentRow = db
-        .prepare(`SELECT * FROM ${table} WHERE ${pkColumn} = ?`)
-        .get(pk) as Record<string, unknown> | undefined;
-      if (violatesImmutabilityGuard(table, operation, currentRow)) {
-        throw new ImmutabilityViolationError(table, pk);
-      }
+      assertUpdateAllowed(db, table, pkColumn, pk);
     }
 
     const result = apply();
@@ -71,6 +81,58 @@ export function applyWithOutbox<T>(params: ApplyWithOutboxParams<T>): T {
       `INSERT INTO outbox (tenant_id, entity_table, entity_pk, operation, payload, origin_terminal_id)
        VALUES (?, ?, ?, ?, ?, ?)`
     ).run(tenantId, table, pk, operation, JSON.stringify(payload), originTerminalId ?? null);
+
+    return result;
+  });
+}
+
+export interface BatchEntry {
+  table: string;
+  pkColumn: string;
+  pk: string;
+  operation: OutboxOperation;
+  payload: Record<string, unknown>;
+}
+
+export interface ApplyBatchWithOutboxParams<T> {
+  db: DatabaseSync;
+  tenantId: string | null;
+  originTerminalId?: string | null;
+  /**
+   * Performs every live-table write for this atomic unit (e.g. a checkout's
+   * sale + line items + payments + inventory/customer updates) and returns
+   * both the caller's result and the list of outbox entries to record for
+   * it. Entries are built here rather than passed in up front because
+   * autoincrement PKs (e.g. sale_line_items.id) aren't known until their
+   * INSERT runs. Any UPDATE must call assertUpdateAllowed itself before
+   * issuing the UPDATE statement.
+   */
+  apply: () => { result: T; entries: BatchEntry[] };
+}
+
+/**
+ * Multi-row variant of applyWithOutbox (DL-006) for one atomic unit of work
+ * that spans several tables/rows — a single checkout, for instance, which
+ * needs its own outbox row per sale_line_items/sale_payments/etc. entry
+ * rather than one row summarizing the whole sale. withTransaction isn't
+ * reentrant, so this — not N calls to applyWithOutbox — is how a multi-table
+ * write must be composed.
+ */
+export function applyBatchWithOutbox<T>(params: ApplyBatchWithOutboxParams<T>): T {
+  const { db, tenantId, originTerminalId, apply } = params;
+
+  return withTransaction(db, () => {
+    const { result, entries } = apply();
+
+    for (const entry of entries) {
+      // Fail fast on an unregistered table rather than silently syncing
+      // something with no defined conflict-resolution behavior.
+      categoryForTable(entry.table);
+      db.prepare(
+        `INSERT INTO outbox (tenant_id, entity_table, entity_pk, operation, payload, origin_terminal_id)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(tenantId, entry.table, entry.pk, entry.operation, JSON.stringify(entry.payload), originTerminalId ?? null);
+    }
 
     return result;
   });

@@ -18,6 +18,7 @@ import { Modal } from '../../ui/Modal';
 import { Button } from '../../ui/Button';
 import { Input } from '../../ui/Input';
 import { Alert } from '../../ui/Alert';
+import { apiPost, ApiClientError } from '../../../api/client';
 
 export interface CustomerSelectorModalProps {
   isOpen: boolean;
@@ -64,7 +65,9 @@ export const CustomerSelectorModal: React.FC<CustomerSelectorModalProps> = ({
     );
   });
 
-  const handleCreateCustomerSubmit = (e: React.FormEvent) => {
+  const [isSaving, setIsSaving] = useState(false);
+
+  const handleCreateCustomerSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newName.trim()) {
       setFormError('Customer Name is required.');
@@ -75,30 +78,28 @@ export const CustomerSelectorModal: React.FC<CustomerSelectorModalProps> = ({
       return;
     }
 
-    const randId = Math.floor(1000 + Math.random() * 9000);
-    const created: Customer = {
-      id: `CUST-${randId}`,
-      accountNumber: `ACC-${randId}`,
-      name: newName.trim(),
-      companyName: newCompany.trim() || undefined,
-      phone: newPhone.trim(),
-      email: newEmail.trim() || undefined,
-      address: newAddress.trim() || undefined,
-      taxNumber: newTaxNumber.trim() || undefined,
-      status: 'PENDING_APPROVAL', // MANDATORY: Cashier created customers receive Pending Approval
-      isCreditApproved: false,
-      creditLimit: 0,
-      currentBalance: 0,
-      availableCredit: 0,
-      createdDate: new Date().toISOString().slice(0, 10),
-      createdByStaffId: currentStaff.id,
-      notes: newNotes.trim() || `Registered at POS by ${currentStaff.name}. Pending credit approval.`,
-    };
+    setIsSaving(true);
+    setFormError(null);
+    try {
+      const created = await apiPost<Customer>('/customers', {
+        name: newName.trim(),
+        companyName: newCompany.trim() || undefined,
+        phone: newPhone.trim(),
+        email: newEmail.trim() || undefined,
+        address: newAddress.trim() || undefined,
+        taxNumber: newTaxNumber.trim() || undefined,
+        notes: newNotes.trim() || undefined,
+      });
 
-    onAddNewCustomer(created);
-    onSelectCustomer(created);
-    setIsCreatingNew(false);
-    onClose();
+      onAddNewCustomer(created);
+      onSelectCustomer(created);
+      setIsCreatingNew(false);
+      onClose();
+    } catch (err) {
+      setFormError(err instanceof ApiClientError ? err.message : 'Could not reach the backend to register this customer.');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -224,7 +225,7 @@ export const CustomerSelectorModal: React.FC<CustomerSelectorModalProps> = ({
               <Button variant="outline" size="sm" onClick={() => setIsCreatingNew(false)}>
                 Back to List
               </Button>
-              <Button variant="primary" size="sm" type="submit" leftIcon={<CheckCircle2 className="w-4 h-4" />}>
+              <Button variant="primary" size="sm" type="submit" isLoading={isSaving} disabled={isSaving} leftIcon={<CheckCircle2 className="w-4 h-4" />}>
                 Create Account & Select for Cart
               </Button>
             </div>

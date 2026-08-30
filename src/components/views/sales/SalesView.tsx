@@ -49,6 +49,7 @@ import {
 } from '../../../data/mockData';
 import { searchInventoryItems } from '../../../utils/searchUtils';
 import { executeAtomicSaleTransaction, validateSaleEligibility } from '../../../utils/saleTransactionEngine';
+import { apiPost, ApiClientError } from '../../../api/client';
 import { Button } from '../../ui/Button';
 import { Modal } from '../../ui/Modal';
 import { StatusBadge } from '../../ui/StatusBadge';
@@ -123,46 +124,8 @@ export const SalesView: React.FC<SalesViewProps> = ({
     (customers || []).find((c) => c.id === 'CUST-WALKIN') || customers?.[0] || defaultWalkInCustomer
   );
 
-  // Cart State (Initialized with frozen snapshot data)
-  const [cartItems, setCartItems] = useState<CartLineItem[]>(() => {
-    const item1 = inventoryItems?.[0] || INITIAL_INVENTORY_ITEMS?.[0];
-    const item2 = inventoryItems?.[1] || INITIAL_INVENTORY_ITEMS?.[1];
-    const initialList: CartLineItem[] = [];
-
-    if (item1) {
-      initialList.push({
-        id: 'cart-1',
-        item: item1,
-        quantity: 2,
-        unitPrice: item1.retailPrice || 38.5,
-        discountPercent: 0,
-        taxAmount: 11.55,
-        lineTotal: 77.00,
-        itemName: item1.name || item1.description || 'Inventory Item',
-        sku: item1.sku || 'SKU-001',
-        unitCostBasis: item1.unitCost ?? item1.cost ?? 0,
-        taxRate: item1.taxRate ?? 15,
-      });
-    }
-
-    if (item2) {
-      initialList.push({
-        id: 'cart-2',
-        item: item2,
-        quantity: 1,
-        unitPrice: item2.retailPrice || 45.0,
-        discountPercent: 0,
-        taxAmount: 6.75,
-        lineTotal: 45.00,
-        itemName: item2.name || item2.description || 'Inventory Item',
-        sku: item2.sku || 'SKU-002',
-        unitCostBasis: item2.unitCost ?? item2.cost ?? 0,
-        taxRate: item2.taxRate ?? 15,
-      });
-    }
-
-    return initialList;
-  });
+  // Cart State
+  const [cartItems, setCartItems] = useState<CartLineItem[]>([]);
 
   // Catalog Browser & Tolerant Search
   const [barcodeInput, setBarcodeInput] = useState('');
@@ -364,6 +327,28 @@ export const SalesView: React.FC<SalesViewProps> = ({
       throw new Error(result.error || 'Sale transaction validation error.');
     }
 
+    // Persist through the outbox before touching local state — a checkout
+    // that only lives in memory isn't durable. Only the inventory rows this
+    // sale actually touched are sent (result.updatedInventory otherwise
+    // includes every unchanged item too).
+    const changedInventory = (result.updatedInventory || [])
+      .filter((inv) => cartItems.some((c) => c.item.sku === inv.sku))
+      .map((inv) => ({ sku: inv.sku, stockOnHand: inv.stockOnHand, status: inv.status }));
+
+    try {
+      await apiPost('/sales', {
+        sale: result.sale,
+        updatedInventory: changedInventory,
+        newMovements: result.newMovements || [],
+        newActivityEvent: result.newActivityEvent,
+        updatedCustomer: result.updatedCustomer,
+      });
+    } catch (err) {
+      const message = err instanceof ApiClientError ? err.message : 'Could not reach the backend to record this sale.';
+      setAlertNotice({ message: `Sale not saved: ${message}`, type: 'error' });
+      throw err;
+    }
+
     // Call parent handler to update root state in one batch
     if (onRecordCompletedSale) {
       onRecordCompletedSale(result.sale);
@@ -379,8 +364,19 @@ export const SalesView: React.FC<SalesViewProps> = ({
     });
   };
 
+  const cartItemsForApi = () =>
+    cartItems.map((c) => ({
+      sku: c.item.sku,
+      itemName: c.itemName || c.item.name,
+      quantity: c.quantity,
+      unitPrice: c.unitPrice,
+      discountPercent: c.discountPercent,
+      taxAmount: c.taxAmount,
+      lineTotal: c.lineTotal,
+    }));
+
   // Held Sale Confirmation Handler
-  const handleConfirmHeldSale = (data: { expectedSettlementTime: string; notes: string }) => {
+  const handleConfirmHeldSale = async (data: { expectedSettlementTime: string; notes: string }) => {
     const randHeldNum = `HELD-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.floor(100 + Math.random() * 900)}`;
     const newHeld: HeldSale = {
       id: `HS-${Date.now()}`,
@@ -396,6 +392,21 @@ export const SalesView: React.FC<SalesViewProps> = ({
       notes: data.notes,
     };
 
+    try {
+      await apiPost('/held-sales', {
+        customer: selectedCustomer && selectedCustomer.id !== 'CUST-WALKIN' ? { id: selectedCustomer.id, name: selectedCustomer.name } : null,
+        items: cartItemsForApi(),
+        subtotal,
+        grandTotal,
+        expectedSettlementTime: data.expectedSettlementTime,
+        notes: data.notes,
+      });
+    } catch (err) {
+      const message = err instanceof ApiClientError ? err.message : 'Could not reach the backend to hold this sale.';
+      setAlertNotice({ message: `Held sale not saved: ${message}`, type: 'error' });
+      return;
+    }
+
     if (onRecordHeldSale) {
       onRecordHeldSale(newHeld);
     }
@@ -408,7 +419,7 @@ export const SalesView: React.FC<SalesViewProps> = ({
   };
 
   // Park Cart Handler (Held Receipts)
-  const handleConfirmParkCart = (note: string) => {
+  const handleConfirmParkCart = async (note: string) => {
     const randParkId = `PARK-${Math.floor(100 + Math.random() * 900)}`;
     const newPark: HeldReceipt = {
       id: randParkId,
@@ -419,6 +430,19 @@ export const SalesView: React.FC<SalesViewProps> = ({
       note,
       totalAmount: grandTotal,
     };
+
+    try {
+      await apiPost('/held-receipts', {
+        customer: selectedCustomer && selectedCustomer.id !== 'CUST-WALKIN' ? { id: selectedCustomer.id, name: selectedCustomer.name } : null,
+        items: cartItemsForApi(),
+        totalAmount: grandTotal,
+        note,
+      });
+    } catch (err) {
+      const message = err instanceof ApiClientError ? err.message : 'Could not reach the backend to park this cart.';
+      setAlertNotice({ message: `Cart not parked: ${message}`, type: 'error' });
+      return;
+    }
 
     if (onParkCart) {
       onParkCart(newPark);

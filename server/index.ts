@@ -7,6 +7,13 @@ import { seedIfEmpty } from './db/seed';
 import { sessionMiddleware } from './middleware/session';
 import { ApiError } from './lib/http';
 import authRouter from './routes/auth';
+import inventoryRouter from './routes/inventory';
+import customersRouter from './routes/customers';
+import shiftsRouter from './routes/shifts';
+import salesRouter from './routes/sales';
+import heldSalesRouter from './routes/heldSales';
+import heldReceiptsRouter from './routes/heldReceipts';
+import creditNotesRouter from './routes/creditNotes';
 
 runMigrations();
 seedIfEmpty();
@@ -21,6 +28,13 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.use('/api/auth', authRouter);
+app.use('/api/inventory', inventoryRouter);
+app.use('/api/customers', customersRouter);
+app.use('/api/shifts', shiftsRouter);
+app.use('/api/sales', salesRouter);
+app.use('/api/held-sales', heldSalesRouter);
+app.use('/api/held-receipts', heldReceiptsRouter);
+app.use('/api/credit-notes', creditNotesRouter);
 
 // --- Additional route modules are mounted here as milestones land ---
 

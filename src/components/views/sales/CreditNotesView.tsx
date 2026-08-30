@@ -17,6 +17,7 @@ import { Button } from '../../ui/Button';
 import { Modal } from '../../ui/Modal';
 import { Alert } from '../../ui/Alert';
 import { INITIAL_INVENTORY_ITEMS } from '../../../data/mockData';
+import { apiGet, apiPost, ApiClientError } from '../../../api/client';
 
 export interface CreditNotesViewProps {
   creditNotes: CreditNote[];
@@ -62,6 +63,54 @@ export const CreditNotesView: React.FC<CreditNotesViewProps> = ({
       restock: true,
     }
   ]);
+  const [maxQtyBySku, setMaxQtyBySku] = useState<Record<string, number>>({});
+  const [saleLookupStatus, setSaleLookupStatus] = useState<{ message: string; type: 'success' | 'warning' | 'error' } | null>(null);
+  const [isLookingUpSale, setIsLookingUpSale] = useState(false);
+  const [isSubmittingCreditNote, setIsSubmittingCreditNote] = useState(false);
+
+  // Look up what was actually sold on the referenced sale so returnQty can be
+  // capped against real sold quantities instead of trusting free-text entry.
+  const handleLookupSale = async () => {
+    const saleNumber = refSaleNumber.trim();
+    if (!saleNumber) return;
+    setIsLookingUpSale(true);
+    setSaleLookupStatus(null);
+    try {
+      const found = await apiGet<{
+        saleNumber: string;
+        customerId: string | null;
+        customerName: string | null;
+        items: Array<{ sku: string; itemName: string; quantitySold: number; unitPrice: number; taxRate: number }>;
+      }>(`/credit-notes/sale/${encodeURIComponent(saleNumber)}`);
+
+      const caps: Record<string, number> = {};
+      const hydratedLines = found.items.map((line) => {
+        caps[line.sku] = line.quantitySold;
+        const invItem = INITIAL_INVENTORY_ITEMS.find((it) => it.sku === line.sku);
+        return {
+          item: invItem
+            ? { ...invItem, taxRate: line.taxRate }
+            : ({ sku: line.sku, name: line.itemName, description: line.itemName, taxRate: line.taxRate, retailPrice: line.unitPrice } as InventoryItem),
+          returnQty: Math.min(1, line.quantitySold),
+          unitPrice: line.unitPrice,
+          reason: 'Customer return',
+          restock: true,
+        };
+      });
+      setMaxQtyBySku(caps);
+      if (hydratedLines.length > 0) setReturnItems(hydratedLines);
+      if (found.customerId) setSelectedCustomerId(found.customerId);
+      setSaleLookupStatus({ message: `Found sale ${found.saleNumber} — return quantities capped to what was actually sold.`, type: 'success' });
+    } catch (err) {
+      setMaxQtyBySku({});
+      setSaleLookupStatus({
+        message: err instanceof ApiClientError && err.status === 404 ? `No sale found matching "${saleNumber}".` : 'Could not look up that sale.',
+        type: 'error',
+      });
+    } finally {
+      setIsLookingUpSale(false);
+    }
+  };
 
   const filteredNotes = (creditNotes || []).filter((cn) => {
     const q = searchQuery.toLowerCase().trim();
@@ -75,7 +124,12 @@ export const CreditNotesView: React.FC<CreditNotesViewProps> = ({
     );
   });
 
-  const totalRefundAmount = returnItems.reduce((s, it) => s + (it.returnQty * it.unitPrice * 1.15), 0);
+  // Estimate only — the persisted totalRefundAmount is computed authoritatively
+  // server-side from each SKU's real tax_rate (see server/routes/creditNotes.ts).
+  const totalRefundAmount = returnItems.reduce(
+    (s, it) => s + it.returnQty * it.unitPrice * (1 + (it.item.taxRate || 0) / 100),
+    0
+  );
 
   const handleAddReturnLine = () => {
     setReturnItems([
@@ -94,7 +148,7 @@ export const CreditNotesView: React.FC<CreditNotesViewProps> = ({
     setReturnItems(returnItems.filter((_, i) => i !== idx));
   };
 
-  const handleCreateSubmit = (e: React.FormEvent) => {
+  const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const cust = (customers || []).find((c) => c.id === selectedCustomerId) || customers?.[0] || {
       id: 'CUST-001',
@@ -112,27 +166,59 @@ export const CreditNotesView: React.FC<CreditNotesViewProps> = ({
       setActionAlert({ message: 'At least one return item line is required.', type: 'error' });
       return;
     }
+    for (const line of returnItems) {
+      const cap = maxQtyBySku[line.item.sku];
+      if (cap !== undefined && line.returnQty > cap) {
+        setActionAlert({ message: `Return qty for ${line.item.sku} (${line.returnQty}) exceeds what was sold (${cap}).`, type: 'error' });
+        return;
+      }
+    }
 
-    const randId = Math.floor(100 + Math.random() * 900);
-    const newCreditNote: CreditNote = {
-      id: `CN-2026-${randId}`,
-      originalSaleNumber: refSaleNumber.trim() || undefined,
-      customer: cust,
-      cashier: currentStaff,
-      dateTime: new Date().toISOString().replace('T', ' ').slice(0, 16),
-      returnedItems: returnItems,
-      totalRefundAmount,
-      refundMethod,
-      reasonCategory,
-      status: 'ISSUED',
-    };
+    setIsSubmittingCreditNote(true);
+    try {
+      const created = await apiPost<{ id: string; totalRefundAmount: number }>('/credit-notes', {
+        originalSaleNumber: refSaleNumber.trim() || undefined,
+        customerId: cust.id !== 'CUST-001' ? cust.id : undefined,
+        customerName: cust.name,
+        refundMethod,
+        reasonCategory,
+        returnedItems: returnItems.map((line) => ({
+          sku: line.item.sku,
+          itemName: line.item.name || line.item.description,
+          returnQty: line.returnQty,
+          unitPrice: line.unitPrice,
+          reason: line.reason,
+          restock: line.restock,
+        })),
+      });
 
-    onIssueCreditNote(newCreditNote);
-    setActionAlert({
-      message: `Credit Note ${newCreditNote.id} for $${totalRefundAmount.toFixed(2)} issued successfully to ${cust.name}.`,
-      type: 'success',
-    });
-    setIsCreateModalOpen(false);
+      const newCreditNote: CreditNote = {
+        id: created.id,
+        originalSaleNumber: refSaleNumber.trim() || undefined,
+        customer: cust,
+        cashier: currentStaff,
+        dateTime: new Date().toISOString().replace('T', ' ').slice(0, 16),
+        returnedItems: returnItems,
+        totalRefundAmount: created.totalRefundAmount,
+        refundMethod,
+        reasonCategory,
+        status: 'ISSUED',
+      };
+
+      onIssueCreditNote(newCreditNote);
+      setActionAlert({
+        message: `Credit Note ${newCreditNote.id} for $${created.totalRefundAmount.toFixed(2)} issued successfully to ${cust.name}.`,
+        type: 'success',
+      });
+      setIsCreateModalOpen(false);
+    } catch (err) {
+      setActionAlert({
+        message: err instanceof ApiClientError ? `Credit note not saved: ${err.message}` : 'Could not reach the backend to issue this credit note.',
+        type: 'error',
+      });
+    } finally {
+      setIsSubmittingCreditNote(false);
+    }
   };
 
   return (
@@ -290,6 +376,8 @@ export const CreditNotesView: React.FC<CreditNotesViewProps> = ({
                 variant="primary"
                 size="sm"
                 onClick={handleCreateSubmit}
+                isLoading={isSubmittingCreditNote}
+                disabled={isSubmittingCreditNote}
                 leftIcon={<CheckCircle2 className="w-4 h-4" />}
                 className="font-bold"
               >
@@ -325,13 +413,27 @@ export const CreditNotesView: React.FC<CreditNotesViewProps> = ({
                 <label className="text-[11px] font-bold uppercase tracking-wider text-gray-700 block mb-1">
                   Original Invoice / Sale # (Ref)
                 </label>
-                <input
-                  type="text"
-                  value={refSaleNumber}
-                  onChange={(e) => setRefSaleNumber(e.target.value)}
-                  placeholder="e.g. INV-20260815-001"
-                  className="w-full p-2 bg-white border border-gray-300 font-mono text-xs focus:outline-none focus:border-[#FF6B00]"
-                />
+                <div className="flex gap-1.5">
+                  <input
+                    type="text"
+                    value={refSaleNumber}
+                    onChange={(e) => {
+                      setRefSaleNumber(e.target.value);
+                      setMaxQtyBySku({});
+                      setSaleLookupStatus(null);
+                    }}
+                    placeholder="e.g. INV-20260815-001"
+                    className="w-full p-2 bg-white border border-gray-300 font-mono text-xs focus:outline-none focus:border-[#FF6B00]"
+                  />
+                  <Button type="button" variant="outline" size="sm" onClick={handleLookupSale} isLoading={isLookingUpSale} disabled={!refSaleNumber.trim() || isLookingUpSale}>
+                    Look Up
+                  </Button>
+                </div>
+                {saleLookupStatus && (
+                  <p className={`text-[10px] mt-1 font-mono ${saleLookupStatus.type === 'success' ? 'text-emerald-700' : 'text-rose-600'}`}>
+                    {saleLookupStatus.message}
+                  </p>
+                )}
               </div>
 
               <div>
@@ -412,15 +514,21 @@ export const CreditNotesView: React.FC<CreditNotesViewProps> = ({
                         <input
                           type="number"
                           min="1"
+                          max={maxQtyBySku[line.item.sku]}
                           value={line.returnQty}
                           onChange={(e) => {
                             const updated = [...returnItems];
-                            updated[idx].returnQty = parseInt(e.target.value) || 1;
+                            const cap = maxQtyBySku[line.item.sku];
+                            const parsed = parseInt(e.target.value) || 1;
+                            updated[idx].returnQty = cap !== undefined ? Math.min(parsed, cap) : parsed;
                             setReturnItems(updated);
                           }}
                           className="w-full p-1.5 bg-gray-50 border border-gray-300 font-mono text-center text-xs"
                           placeholder="Qty"
                         />
+                        {maxQtyBySku[line.item.sku] !== undefined && (
+                          <div className="text-[9px] text-gray-400 font-mono text-center">of {maxQtyBySku[line.item.sku]} sold</div>
+                        )}
                       </div>
 
                       <div className="sm:col-span-2">
