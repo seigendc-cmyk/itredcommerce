@@ -251,6 +251,112 @@ multiple terminals and multiple app surfaces (DL-002) that all need to
 recognize the same staff member; last-synced local fallback preserves the
 existing offline-capable login behavior.
 
+## OUTBOX SYNC & CONFLICT RESOLUTION ADDENDUM (2026-08-29)
+
+Prompt 2 (event-sourced outbox sync engine) calls for conflict resolution to
+"follow the per-entity rules already defined in the governance doc" — those
+rules didn't exist yet when that prompt was written. This addendum defines
+them now, grounded in the schema built in Prompt 1, before the sync engine
+is implemented against them.
+
+### DL-006: Transactional local write, independently-paced background drain
+
+**Decision**: Every local mutation is written to an outbox table in the same
+SQLite transaction as the mutation itself (the "transactional outbox"
+pattern) — so a mutation and its durable, replayable sync record either both
+land or neither does, even across a crash. A separate background process
+drains the outbox to Supabase only while the connectivity signal (DL-008)
+reports online, processing rows oldest-first, and paces retries per-row via
+exponential backoff with jitter (DL-007 governs what happens when a push is
+rejected as a conflict rather than merely failing). A drain cycle only
+attempts rows whose individual backoff timer has elapsed — connectivity
+flipping online does not itself force-retry every pending row regardless of
+its own backoff state, which is what avoids the thundering-herd/thrashing
+behavior on flaky connections that Prompt 2 explicitly warned against.
+
+**Rationale**: Atomicity between a mutation and its outbox record is what
+makes the log actually durable and replayable — a design where the outbox
+write could fail or succeed independently of the live write would defeat the
+purpose. Per-row backoff (rather than a single global retry clock) means one
+row's repeated failure doesn't block or reset the retry timing of every
+other pending row.
+
+### DL-007: Per-entity conflict resolution categories
+
+Every table gets its conflict-resolution behavior from which of four
+categories it falls into, rather than each table needing a bespoke rule.
+The categories exist because they map to a real structural distinction
+already present in Prompt 1's schema: some tables are insert-once facts,
+others are mutable projections/caches of those facts.
+
+1. **Ledger / insert-once** — `sales_transactions` (+ `sale_line_items`,
+   `sale_payments`), `inventory_movements`, `debtor_transactions`,
+   `creditor_transactions`, `cash_bank_transactions`, `cash_movements`,
+   `activity_events`, `stock_adjustments`, `credit_notes` (+ items),
+   `reorder_recommendations`, `stocktake_lines`, `backups`,
+   `reserve_transfers`. These rows are
+   created once and never updated by the sync engine. **Resolution: idempotent
+   insert.** If Supabase already has a row at that primary key, the push is
+   treated as already-synced, not a conflict — never overwritten. This
+   requires no timestamp comparison at all, because there is nothing to
+   compare: two writers can't disagree about a fact that only one of them
+   could have created (app-generated IDs are unique per origin).
+2. **Cached aggregate on a master record** — `inventory_items.stock_on_hand`
+   (and `.status`), `customers.current_balance`/`available_credit`,
+   `suppliers.current_balance`, `cash_bank_accounts.current_balance`,
+   `business_reserves.current_funded_balance`. These fields are
+   *derived* — the real audit-grade truth for each is the corresponding
+   ledger table above (inventory_movements, debtor_transactions,
+   cash_bank_transactions, reserve_transfers). **Resolution: last-write-wins**,
+   compared using the pushing outbox row's `created_at` against the remote
+   row's `updated_at`. A LWW mismatch here is non-critical by design — since
+   the ledger is authoritative, a drifted cached value is always
+   recomputable from it. (Building that recomputation/reconciliation job is
+   not in scope for Prompt 2 — noted here so it isn't forgotten later.)
+3. **Single-owner workflow record** — `shifts`, `held_sales`,
+   `held_receipts`, `layaway_orders`, `stocktake_sessions`, `stocktakes`,
+   `purchase_memos`,
+   `purchase_orders`, `goods_receipt_notes`, `stock_transfers`,
+   `approval_requests`, `operational_exceptions`. Normally mutated by one
+   actor/workflow at a time (the terminal that opened a shift is the one
+   that closes it, etc.), so genuine concurrent edits are rare.
+   **Resolution: last-write-wins** by the same `created_at`-vs-`updated_at`
+   comparison as category 2.
+4. **Centrally-edited config/master data** — `branches`, `terminals`,
+   `warehouses`, `staff`, `tax_config`, `tax_categories`,
+   `tax_classifications`, `generic_records`, and the non-balance fields of
+   `customers`/`suppliers`. **Resolution: last-write-wins**, same comparison.
+
+**Terminal-state immutability guard**: independent of the categories above,
+a small set of tables must never be pushed as an UPDATE once they reach a
+terminal status — a `COMPLETED` `sales_transactions` row, a `CLOSED` `shifts`
+row (whose `reconciliation_snapshot` is the existing immutable-snapshot
+design from `shiftReconciliation.ts`). The outbox write path rejects such
+updates outright, before they ever reach the drain loop or conflict
+resolution — this isn't a sync-layer conflict-resolution question, it's the
+same "don't mutate history" invariant the app already enforces, just
+enforced one layer lower.
+
+**Rationale**: Treating "which ledger is this a cache of" as the organizing
+question, rather than picking LWW-vs-merge per table in isolation, is what
+keeps this tractable across ~35 tables — new tables added later just need to
+be slotted into one of the four categories, not given a bespoke rule.
+
+### DL-008: Connectivity is an explicit, subscribable signal
+
+**Decision**: Online/offline state is tracked by one connectivity monitor
+with an explicit two-state model (`ONLINE` / `OFFLINE`), driven by an
+injectable probe function, exposing `getState()` and `subscribe(listener)`.
+The outbox drain loop is one subscriber; other app surfaces (e.g. the
+delivery dispatch "create delivery" button being disabled offline, per the
+delivery subsystem prompts) are expected to subscribe to the same signal
+rather than each surface independently guessing at connectivity.
+
+**Rationale**: Prompt 7 already requires a UI element (dispatch creation)
+to react to connectivity state precisely, not queue-and-hope — that only
+works if connectivity is one well-defined, testable signal rather than
+implicit state inferred differently in different places.
+
 ### Open items (explicitly not decided here)
 
 - **Platform super-admin view scope**: referenced in DL-002 but deliberately
