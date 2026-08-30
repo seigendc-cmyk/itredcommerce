@@ -14,6 +14,11 @@ import salesRouter from './routes/sales';
 import heldSalesRouter from './routes/heldSales';
 import heldReceiptsRouter from './routes/heldReceipts';
 import creditNotesRouter from './routes/creditNotes';
+import purchasingRouter from './routes/purchasing';
+import stockTransfersRouter from './routes/stockTransfers';
+import stocktakeRouter from './routes/stocktake';
+import rateConfigRouter from './routes/rateConfig';
+import staffRouter from './routes/staff';
 
 runMigrations();
 seedIfEmpty();
@@ -35,6 +40,11 @@ app.use('/api/sales', salesRouter);
 app.use('/api/held-sales', heldSalesRouter);
 app.use('/api/held-receipts', heldReceiptsRouter);
 app.use('/api/credit-notes', creditNotesRouter);
+app.use('/api/purchasing', purchasingRouter);
+app.use('/api/transfers', stockTransfersRouter);
+app.use('/api/stocktake', stocktakeRouter);
+app.use('/api/rate-config', rateConfigRouter);
+app.use('/api/staff', staffRouter);
 
 // --- Additional route modules are mounted here as milestones land ---
 

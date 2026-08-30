@@ -18,6 +18,7 @@ function rowToPublicStaff(row: any) {
     role: row.role,
     roleTitle: row.role_title,
     department: row.department,
+    accessRole: row.access_role,
     avatarInitials: row.avatar_initials,
     lastLogin: row.last_login,
     permissions: JSON.parse(row.permissions || '[]'),

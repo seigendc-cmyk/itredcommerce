@@ -129,6 +129,23 @@ router.post(
   })
 );
 
+// List for reporting (ReportsCenterView etc.).
+router.get(
+  '/',
+  asyncHandler(async (req, res) => {
+    const { from, to, terminalId, status } = req.query as Record<string, string | undefined>;
+    const clauses: string[] = [];
+    const params: Record<string, string> = {};
+    if (from) { clauses.push('opened_date_time >= @from'); params.from = from; }
+    if (to) { clauses.push('opened_date_time <= @to'); params.to = to; }
+    if (terminalId) { clauses.push('terminal_id = @terminalId'); params.terminalId = terminalId; }
+    if (status) { clauses.push('status = @status'); params.status = status; }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = db.prepare(`SELECT * FROM shifts ${where} ORDER BY opened_date_time DESC LIMIT 1000`).all(params) as any[];
+    res.json(rows.map(rowToShift));
+  })
+);
+
 router.get(
   '/current',
   asyncHandler(async (req, res) => {

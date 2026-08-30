@@ -23,6 +23,9 @@ const LEDGER_TABLES = [
   'stocktake_lines',
   'backups',
   'reserve_transfers',
+  // DL-004 versioned rate config (Prompt 4) — insert-only, never updated;
+  // "current" is always MAX(version). See server/db/migrations/005_rate_config.sql.
+  'rate_config',
 ] as const;
 
 const CACHED_AGGREGATE_TABLES = [

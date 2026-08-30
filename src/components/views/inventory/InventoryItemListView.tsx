@@ -46,6 +46,7 @@ import { QuickPriceUpdateModal } from './QuickPriceUpdateModal';
 import { ItemStockCardModal } from './ItemStockCardModal';
 import { ManualStockAdjustmentModal } from './ManualStockAdjustmentModal';
 import { searchInventoryItems } from '../../../utils/searchUtils';
+import { apiPost, apiPatch } from '../../../api/client';
 
 export interface InventoryItemListViewProps {
   currentStaff: StaffMember;
@@ -165,9 +166,13 @@ export const InventoryItemListView: React.FC<InventoryItemListViewProps> = ({
     if (exists) {
       setItems((prev) => prev.map((i) => (i.sku === savedItem.sku ? savedItem : i)));
       showNotification(`Item ${savedItem.sku} specifications updated successfully.`);
+      apiPatch(`/inventory/items/${encodeURIComponent(savedItem.sku)}`, savedItem).catch((err) =>
+        console.error('Failed to persist item update', err)
+      );
     } else {
       setItems((prev) => [savedItem, ...prev]);
       showNotification(`New item ${savedItem.sku} registered in catalog.`);
+      apiPost('/inventory/items', savedItem).catch((err) => console.error('Failed to persist new item', err));
     }
   };
 
@@ -175,6 +180,10 @@ export const InventoryItemListView: React.FC<InventoryItemListViewProps> = ({
   const handleSaveQuickPrice = (updatedItem: InventoryItem) => {
     setItems((prev) => prev.map((i) => (i.sku === updatedItem.sku ? updatedItem : i)));
     showNotification(`Price revised for SKU ${updatedItem.sku}: Retail $${updatedItem.retailPrice.toFixed(2)}, Cost $${updatedItem.unitCost.toFixed(2)}.`);
+    apiPatch(`/inventory/items/${encodeURIComponent(updatedItem.sku)}`, {
+      retailPrice: updatedItem.retailPrice,
+      unitCost: updatedItem.unitCost,
+    }).catch((err) => console.error('Failed to persist price update', err));
   };
 
   // Handle Stock Adjustment Confirm
@@ -225,6 +234,9 @@ export const InventoryItemListView: React.FC<InventoryItemListViewProps> = ({
     });
     setItems(updated);
     showNotification(`Item ${item.sku} marked as ${!item.isActive ? 'Active' : 'Inactive'}.`);
+    apiPatch(`/inventory/items/${encodeURIComponent(item.sku)}`, { isActive: !item.isActive }).catch((err) =>
+      console.error('Failed to persist active-status toggle', err)
+    );
   };
 
   // Export Catalog
@@ -911,28 +923,18 @@ export const InventoryItemListView: React.FC<InventoryItemListViewProps> = ({
           setManualAdjustmentTargetItem(null);
         }}
         items={items}
-        preselectedItem={manualAdjustmentTargetItem || undefined}
+        defaultItem={manualAdjustmentTargetItem}
         currentStaff={currentStaff}
-        onPostAdjustment={(movement) => {
+        onPostAdjustment={(movement, updatedItem) => {
           setMovements((prev) => [movement, ...prev]);
-          setItems((prev) =>
-            prev.map((itm) => {
-              if (itm.sku === movement.sku) {
-                const newSoh = Math.max(0, itm.stockOnHand + movement.qtyChange);
-                return {
-                  ...itm,
-                  stockOnHand: newSoh,
-                  status: newSoh <= 0 ? 'Out of Stock' : newSoh <= itm.reorderLevel ? 'Low Stock' : 'In Stock',
-                  lastUpdated: new Date().toISOString().replace('T', ' ').slice(0, 16),
-                };
-              }
-              return itm;
-            })
-          );
+          setItems((prev) => prev.map((itm) => (itm.sku === updatedItem.sku ? updatedItem : itm)));
           if (onRecordMovement) {
             onRecordMovement(movement);
           }
-          showNotification(`Audited stock movement [${movement.id}] recorded: ${movement.qtyChange > 0 ? '+' : ''}${movement.qtyChange} ${movement.sku}.`);
+          showNotification(`Audited stock movement [${movement.id}] recorded: ${movement.quantity > 0 ? '+' : ''}${movement.quantity} ${movement.sku}.`);
+          apiPost(`/inventory/items/${encodeURIComponent(movement.sku)}/adjust`, { movement }).catch((err) =>
+            console.error('Failed to persist stock adjustment', err)
+          );
         }}
         onRequestApproval={onRequestApproval}
       />

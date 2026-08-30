@@ -90,6 +90,7 @@ export type ActiveView =
   | 'DEVICES'
   | 'VENDOR_PREFERENCES'
   | 'BACKUP_RESTORE'
+  | 'RATE_CONFIG'
   | 'DATA_PROTECTION'
   | 'RESTORE_DATA'
   | 'DATABASE_INTEGRITY'

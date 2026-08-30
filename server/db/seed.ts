@@ -19,8 +19,8 @@ function insertGeneric(domain: string, id: string, data: unknown) {
 
 function seedStaff() {
   const insert = db.prepare(`
-    INSERT INTO staff (id, code, name, role, role_title, department, pin_hash, avatar_initials, last_login, permissions, terminal_access, is_active)
-    VALUES (@id, @code, @name, @role, @role_title, @department, @pin_hash, @avatar_initials, @last_login, @permissions, @terminal_access, 1)
+    INSERT INTO staff (id, code, name, role, role_title, department, access_role, pin_hash, avatar_initials, last_login, permissions, terminal_access, is_active)
+    VALUES (@id, @code, @name, @role, @role_title, @department, @access_role, @pin_hash, @avatar_initials, @last_login, @permissions, @terminal_access, 1)
   `);
   for (const staff of mock.INITIAL_STAFF_MEMBERS) {
     const pinHash = bcrypt.hashSync(staff.accessCode, 10);
@@ -31,6 +31,7 @@ function seedStaff() {
       role: staff.role,
       role_title: staff.roleTitle,
       department: s(staff.department),
+      access_role: s(staff.accessRole, 'TILL_OPERATOR'),
       pin_hash: pinHash,
       avatar_initials: s(staff.avatarInitials),
       last_login: s(staff.lastLogin),
@@ -728,6 +729,32 @@ function seedGovernance() {
   }
 }
 
+function seedRateConfig() {
+  // One placeholder v1 row so the settings UI and any future fare-engine
+  // consumer never see an empty table on a fresh install — see DL-004 and
+  // server/db/migrations/005_rate_config.sql.
+  db.prepare(
+    `INSERT INTO rate_config (id, version, currency, base_fee, per_km_rate, load_size_surcharge_tiers, ride_type_multipliers, effective_date, created_by_staff_id, created_by_staff_name, created_at, notes)
+     VALUES (@id, 1, @currency, @baseFee, @perKmRate, @loadSizeSurchargeTiers, @rideTypeMultipliers, @effectiveDate, @createdByStaffId, @createdByStaffName, @createdAt, @notes)`
+  ).run({
+    id: generateId('RATE'),
+    currency: 'USD',
+    baseFee: 2.5,
+    perKmRate: 0.75,
+    loadSizeSurchargeTiers: j([
+      { label: 'Small', maxWeightKg: 5, surcharge: 0 },
+      { label: 'Medium', maxWeightKg: 20, surcharge: 1.5 },
+      { label: 'Large', maxWeightKg: null, surcharge: 4 },
+    ]),
+    rideTypeMultipliers: j({ STANDARD: 1.0, EXPRESS: 1.5, SCHEDULED: 0.9 }),
+    effectiveDate: new Date().toISOString().slice(0, 10),
+    createdByStaffId: null,
+    createdByStaffName: 'System Administrator',
+    createdAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
+    notes: 'Initial placeholder rate version — pending real-world rate-card sign-off.',
+  });
+}
+
 function seedGenericDomains() {
   for (const dep of mock.INITIAL_DEPARTMENTS as string[]) {
     insertGeneric('departments', generateId('DEPT'), { name: dep });
@@ -774,6 +801,7 @@ export function seedIfEmpty() {
     seedFinancial();
     seedTaxConfig();
     seedGovernance();
+    seedRateConfig();
     seedGenericDomains();
   });
   console.log('[seed] complete.');

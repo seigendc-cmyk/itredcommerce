@@ -357,6 +357,103 @@ to react to connectivity state precisely, not queue-and-hope — that only
 works if connectivity is one well-defined, testable signal rather than
 implicit state inferred differently in different places.
 
+## HEAD-OFFICE APP ADDENDUM (2026-08-30)
+
+Prompt 4 built the head-office variant of the app — purchasing, inventory
+management (item CRUD, transfers, stocktake, reorder review), a new versioned
+fare/rate configuration, staff administration, and full reporting — sharing
+the same codebase, local SQLite schema, and outbox sync engine as the
+branch-terminal app from Prompt 3. This addendum records how DL-002/DL-005's
+app-surface split actually got realized in code, the new rate-config table's
+sync classification, and a load-bearing platform gap that must not be lost a
+second time.
+
+### DL-009: DL-002/DL-005 app-surface gating realized as `access_role`
+
+**Decision**: `StaffAccessRole` (`TILL_OPERATOR` / `HEAD_OFFICE_STAFF` /
+`EXECUTIVE` / `RIDER` / `PLATFORM_SUPER_ADMIN` — already defined in
+`src/types/index.ts` per DL-002/DL-005, previously unpopulated) is now a real
+`access_role` column on the local SQLite `staff` table
+(`server/db/migrations/004_access_roles.sql`), mirroring the column that
+already existed on Supabase's `staff` table since Prompt 1
+(`supabase/migrations/20260829120200_identity_and_parties.sql`). Enforcement
+has exactly one mechanism on each side, not one gate per feature:
+
+- **Server**: `requireAccessRole(...)` (`server/middleware/auth.ts`, parallel
+  to the existing unused `requireRole`) gates every head-office-only route.
+  `server/lib/accessRoles.ts` mirrors Supabase's `app_is_back_office_role()` /
+  `app_is_branch_scoped_role()` role sets by hand — there's no shared runtime
+  between the two yet.
+- **Client**: `src/utils/accessRoleGate.ts`'s `BRANCH_TERMINAL_VIEWS` set +
+  `canAccessView()` is the single source of truth for what a till-operator
+  session can reach, consumed at four points so it can't be bypassed by any
+  one of them individually: `handleNavigate` (all programmatic navigation),
+  the global keyboard-shortcut effect, `HeaderNav`'s menu filtering
+  (discoverability), and `renderActiveView`'s top-of-function guard (defense
+  in depth, renders `AccessRestrictedView` if somehow reached anyway).
+  `SettingsView`'s Roles & Rights tab renders its "Access Scope" table
+  directly from `BRANCH_TERMINAL_VIEWS`, so that display can never drift from
+  what's actually enforced.
+
+**Known follow-up**: the local `access_role` column stores values in
+UPPER_SNAKE_CASE (`TILL_OPERATOR`) to match this codebase's existing
+enum-storage convention (e.g. `shifts.status`), while Postgres's
+`app_staff_role` enum uses lowercase (`till_operator`). Reconciling that
+casing difference is deferred to whichever prompt builds the real Supabase
+push adapter (`server/sync/drainLoop.ts`'s `RemoteSyncClient` is still an
+injected, unimplemented interface — no live sync exists yet regardless).
+
+**Rationale**: DL-002/DL-005 already specified this exact role vocabulary and
+its purpose; the only gap was that nothing populated or enforced it. Reusing
+the existing type rather than inventing a parallel concept, and routing every
+enforcement point through one shared predicate rather than ad hoc per-view
+checks, is what keeps the gate auditable as more head-office views get added.
+
+### DL-010: `rate_config` is an insert-only ledger, never LWW config
+
+**Decision**: The new versioned fare/rate table (`rate_config` — base fee,
+per-km rate, load-size surcharge tiers, ride-type multipliers; see
+`server/db/migrations/005_rate_config.sql` and the matching Supabase
+migration) is classified DL-007 category 1 (LEDGER / insert-once) in
+`server/sync/entityRules.ts`, not category 4 (CONFIG / last-write-wins) like
+`tax_config`. Publishing a new rate is always `version = MAX(version) + 1`,
+always an `INSERT`, never an `UPDATE` — there is no status/active flag and no
+UPDATE code path anywhere in `server/routes/rateConfig.ts`. The Supabase
+migration reinforces this at the RLS layer too: it defines an `insert` policy
+and deliberately no `update` policy at all.
+
+**Rationale**: DL-004 requires that changing a rate must never retroactively
+alter a fare/price already quoted or completed against an earlier version.
+An insert-only ledger makes that structurally true rather than a convention
+someone could violate with a future UPDATE statement — "current" is always
+`ORDER BY version DESC LIMIT 1`, and every past row is permanently
+inspectable exactly as it was published.
+
+### Second Tauri flag — still not resolved, now flagged twice
+
+Prompt 3's plan flagged that the branch-terminal app was built against the
+single Express+SQLite browser prototype from the Section 1 baseline instead
+of a real per-desk Tauri install, and deferred fixing it. **That gap is still
+unresolved.** Prompt 4's full head-office feature set — purchasing, inventory
+management, rate config, staff admin, reporting — was built on the exact same
+shared Express+SQLite backend. Concretely, today:
+
+- There is still no `src-tauri`, no Tauri dependency anywhere in the repo.
+- "Branch terminal" vs. "head office" is *only* a client-side `access_role`
+  gate inside one shared web app talking to one shared local SQLite file
+  through one shared Express process — not the two-independent-installs
+  model DL-002 specifies (separate local SQLite per desk, independent
+  Supabase sync connection per desk, no shared server between desks).
+- A real multi-desk deployment today would mean multiple browser sessions
+  hitting one Express process and one SQLite file concurrently — the exact
+  LAN-coordination anti-pattern DL-002 and this prompt's own text explicitly
+  rule out.
+
+This must be resolved — real per-desk Tauri packaging, with genuinely
+separate local SQLite files and independent sync connections per install —
+before any multi-desk production rollout. Carried over and re-flagged a
+second time so it can't quietly disappear a third time.
+
 ### Open items (explicitly not decided here)
 
 - **Platform super-admin view scope**: referenced in DL-002 but deliberately

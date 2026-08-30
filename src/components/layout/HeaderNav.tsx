@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Folder, 
   ShoppingCart, 
@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import { StaffMember, ActiveView, MenuGroup, MenuItem } from '../../types';
 import { APPLICATION_MENU_GROUPS } from '../../data/mockData';
+import { filterMenuGroupsForRole } from '../../utils/accessRoleGate';
 
 export interface HeaderNavProps {
   currentStaff: StaffMember;
@@ -56,6 +57,14 @@ export const HeaderNav: React.FC<HeaderNavProps> = ({
   const [currentTime, setCurrentTime] = useState<string>('');
   const menuContainerRef = useRef<HTMLDivElement>(null);
   const drawerSearchInputRef = useRef<HTMLInputElement>(null);
+
+  // DL-002/DL-005: hide head-office-only modules from a till-operator
+  // session's menus entirely, rather than just relying on the deeper
+  // App.tsx-level navigation gate. See src/utils/accessRoleGate.ts.
+  const menuGroups = useMemo(
+    () => filterMenuGroupsForRole(APPLICATION_MENU_GROUPS, currentStaff.accessRole),
+    [currentStaff.accessRole]
+  );
 
   useEffect(() => {
     const updateTime = () => {
@@ -122,7 +131,7 @@ export const HeaderNav: React.FC<HeaderNavProps> = ({
 
   const expandAllGroups = () => {
     const updated: Record<string, boolean> = {};
-    APPLICATION_MENU_GROUPS.forEach(g => {
+    menuGroups.forEach(g => {
       updated[g.name] = true;
     });
     setExpandedGroups(updated);
@@ -130,7 +139,7 @@ export const HeaderNav: React.FC<HeaderNavProps> = ({
 
   const collapseAllGroups = () => {
     const updated: Record<string, boolean> = {};
-    APPLICATION_MENU_GROUPS.forEach(g => {
+    menuGroups.forEach(g => {
       updated[g.name] = false;
     });
     setExpandedGroups(updated);
@@ -158,7 +167,7 @@ export const HeaderNav: React.FC<HeaderNavProps> = ({
 
   // Filter modules based on search text
   const trimmedFilter = searchFilter.trim().toLowerCase();
-  const filteredGroups = APPLICATION_MENU_GROUPS.map(group => {
+  const filteredGroups = menuGroups.map(group => {
     const matchingItems = group.items.filter(item => {
       if (!trimmedFilter) return true;
       return (
@@ -175,7 +184,7 @@ export const HeaderNav: React.FC<HeaderNavProps> = ({
     };
   }).filter(group => !trimmedFilter || group.items.length > 0);
 
-  const totalModuleCount = APPLICATION_MENU_GROUPS.reduce((acc, g) => acc + g.items.length, 0);
+  const totalModuleCount = menuGroups.reduce((acc, g) => acc + g.items.length, 0);
 
   return (
     <>
@@ -321,9 +330,9 @@ export const HeaderNav: React.FC<HeaderNavProps> = ({
 
           {/* Category Dropdowns */}
           <div className="flex items-center space-x-1 sm:space-x-4 overflow-visible">
-            {APPLICATION_MENU_GROUPS.map((group, groupIdx) => {
+            {menuGroups.map((group, groupIdx) => {
               const isOpen = openMenu === group.name;
-              const isRightAligned = groupIdx >= APPLICATION_MENU_GROUPS.length - 3;
+              const isRightAligned = groupIdx >= menuGroups.length - 3;
               return (
                 <div key={group.name} className="relative h-full flex items-center">
                   <button

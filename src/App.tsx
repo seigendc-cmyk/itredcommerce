@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { apiGet, apiPost, ApiClientError } from './api/client';
+import { apiGet, apiPost, apiPatch, apiPut, ApiClientError } from './api/client';
 import { 
   AppStage, 
   ActiveView, 
@@ -153,6 +153,8 @@ import { DataProtectionBackupView } from './components/views/system/DataProtecti
 import { RestoreDataView } from './components/views/system/RestoreDataView';
 import { DatabaseIntegrityView } from './components/views/system/DatabaseIntegrityView';
 import { InventoryAttentionCenterView } from './components/views/inventory/InventoryAttentionCenterView';
+import { AccessRestrictedView } from './components/common/AccessRestrictedView';
+import { canAccessView, isBackOfficeAccessRole } from './utils/accessRoleGate';
 import { 
   generateReorderRecommendations, 
   evaluateStocktakeRiskSignals, 
@@ -160,7 +162,8 @@ import {
   computeOperationalReadinessSnapshot 
 } from './utils/deterministicRulesEngine';
 import { 
-  ReorderRecommendation, 
+  ReorderRecommendation,
+  ReorderRecommendationStatus,
   StocktakeRiskSignal, 
   OperationalReadinessSnapshot 
 } from './types';
@@ -207,6 +210,7 @@ export default function App() {
   const [isShiftOpeningModalOpen, setIsShiftOpeningModalOpen] = useState<boolean>(false);
   const [closureShiftTarget, setClosureShiftTarget] = useState<Shift | null>(null);
   const [hasCheckedShiftOnEntry, setHasCheckedShiftOnEntry] = useState<boolean>(false);
+  const [hasFetchedBackOfficeData, setHasFetchedBackOfficeData] = useState<boolean>(false);
 
   // Phase 6 Financial Control & Treasury State
   const [suppliers, setSuppliers] = useState<Supplier[]>(INITIAL_SUPPLIERS);
@@ -334,34 +338,29 @@ export default function App() {
     lastBackupTime
   );
 
-  const handleUpdateReorderStatus = (
-    recId: string, 
-    newStatus: 'NEW' | 'APPROVED' | 'SUPPRESSED' | 'DISMISSED', 
-    notes?: string
-  ) => {
-    const mappedStatus = newStatus === 'APPROVED' ? 'ACCEPTED' : (newStatus === 'DISMISSED' || newStatus === 'SUPPRESSED') ? 'IGNORED' : 'REVIEWED';
+  const handleUpdateReorderStatus = (recId: string, newStatus: ReorderRecommendationStatus, notes?: string) => {
+    const targetRec = reorderRecommendations.find(r => r.id === recId);
+    const reviewedAt = new Date().toISOString().replace('T', ' ').slice(0, 16);
+
     setReorderRecommendations((prev) =>
-      prev.map((rec) => {
-        if (rec.id === recId) {
-          return {
-            ...rec,
-            status: mappedStatus,
-            decisionNotes: notes || rec.decisionNotes,
-            reviewedByStaffName: currentStaff.name,
-            reviewedAt: new Date().toISOString().replace('T', ' ').slice(0, 16),
-          };
-        }
-        return rec;
-      })
+      prev.map((rec) =>
+        rec.id === recId
+          ? { ...rec, status: newStatus, decisionNotes: notes || rec.decisionNotes, reviewedByStaffName: currentStaff.name, reviewedAt }
+          : rec
+      )
     );
 
-    // Record Activity Event
-    const targetRec = reorderRecommendations.find(r => r.id === recId);
     if (targetRec) {
+      apiPatch(`/inventory/reorder-recommendations/${encodeURIComponent(recId)}`, {
+        recommendation: targetRec,
+        status: newStatus,
+        decisionNotes: notes,
+      }).catch((err) => console.error('Failed to persist reorder recommendation decision', err));
+
       const event: ActivityEvent = {
         id: `EVT-${Date.now()}`,
-        timestamp: new Date().toISOString().replace('T', ' ').slice(0, 16),
-        eventType: newStatus === 'APPROVED' ? 'REORDER_RECOMMENDATION_ACCEPTED' : 'REORDER_RECOMMENDATION_IGNORED',
+        timestamp: reviewedAt,
+        eventType: newStatus === 'ACCEPTED' ? 'REORDER_RECOMMENDATION_ACCEPTED' : 'REORDER_RECOMMENDATION_IGNORED',
         description: `Reorder recommendation for ${targetRec.sku} (${targetRec.itemName}) marked as ${newStatus} by ${currentStaff.name}. ${notes || ''}`,
         staffId: currentStaff.id,
         staffName: currentStaff.name,
@@ -397,10 +396,10 @@ export default function App() {
       })),
     };
 
-    setPurchaseMemos((prev) => [newMemo, ...prev]);
-    
-    // Mark recommendations as APPROVED
-    selectedRecs.forEach(r => handleUpdateReorderStatus(r.id, 'APPROVED', `Converted to Memo ${memoNumber}`));
+    handleCreatePurchaseMemo(newMemo);
+
+    // Mark recommendations as accepted/converted
+    selectedRecs.forEach(r => handleUpdateReorderStatus(r.id, 'ACCEPTED', `Converted to Memo ${memoNumber}`));
 
     // Emit event
     const totalEst = selectedRecs.reduce((acc, r) => acc + (r.suggestedReorderQty * r.lastCost), 0);
@@ -421,9 +420,18 @@ export default function App() {
     handleNavigate('PURCHASE_MEMO');
   };
 
-  const handleCreatePOFromReorders = (selectedRecs: ReorderRecommendation[], supplierId: string) => {
+  const handleCreatePOFromReorders = (selectedRecs: ReorderRecommendation[]) => {
     const poNumber = `PO-${Date.now().toString().slice(-4)}`;
-    const supplier = (suppliers || []).find(s => s.id === supplierId) || suppliers?.[0] || { id: 'SUP-101', name: 'Standard Supplier', code: 'SUP-101', paymentTerms: 'Net 30 Days' };
+    // Reorder recommendations already carry their own preferred-supplier
+    // fields (per-SKU) — with a mixed-supplier selection this collapses to
+    // the first item's supplier, matching this being a single-supplier PO.
+    const firstRec = selectedRecs[0];
+    const matchedSupplier = (suppliers || []).find((s) => s.code === firstRec?.preferredSupplierCode);
+    const supplier = matchedSupplier || {
+      name: firstRec?.preferredSupplierName || 'Standard Supplier',
+      code: firstRec?.preferredSupplierCode || 'SUP-101',
+      paymentTerms: 'Net 30 Days',
+    };
     const totalAmount = selectedRecs.reduce((acc, r) => acc + (r.suggestedReorderQty * r.lastCost), 0);
 
     const newPO: PurchaseOrder = {
@@ -452,10 +460,10 @@ export default function App() {
       })),
     };
 
-    setPurchaseOrders((prev) => [newPO, ...prev]);
+    handleCreatePurchaseOrder(newPO);
 
-    // Mark recommendations as APPROVED
-    selectedRecs.forEach(r => handleUpdateReorderStatus(r.id, 'APPROVED', `Converted to PO ${poNumber}`));
+    // Mark recommendations as accepted/converted
+    selectedRecs.forEach(r => handleUpdateReorderStatus(r.id, 'ACCEPTED', `Converted to PO ${poNumber}`));
 
     const event: ActivityEvent = {
       id: `EVT-${Date.now()}`,
@@ -474,10 +482,10 @@ export default function App() {
     handleNavigate('PO_LIST');
   };
 
-  const handleInitiateStocktakeForRiskItems = (skus: string[], sessionName?: string) => {
+  const handleInitiateStocktakeForRiskItems = async (skus: string[], sessionName?: string) => {
     const targetItems = inventoryItems.filter(i => skus.includes(i.sku));
     const newSessionId = `ST-${Date.now()}`;
-    const newSession: StocktakeSession = {
+    const draftSession: StocktakeSession = {
       id: newSessionId,
       sessionNumber: `STK-${Date.now().toString().slice(-4)}`,
       title: sessionName || `Risk-weighted priority count for ${skus.length} targeted items`,
@@ -509,20 +517,13 @@ export default function App() {
       totalVarianceValuation: 0,
     };
 
-    setStocktakeSessions((prev) => [newSession, ...prev]);
-
-    const event: ActivityEvent = {
-      id: `EVT-${Date.now()}`,
-      timestamp: new Date().toISOString().replace('T', ' ').slice(0, 16),
-      eventType: 'STOCKTAKE_STARTED',
-      description: `Risk-weighted priority stocktake initiated for ${skus.length} items (${newSession.sessionNumber}) by ${currentStaff.name}.`,
-      staffId: currentStaff.id,
-      staffName: currentStaff.name,
-      branchId: 'BR-01',
-      branchName: 'Main Store',
-      referenceDocument: newSession.sessionNumber,
-    };
-    setActivityEvents((prev) => [event, ...prev]);
+    try {
+      const saved = await apiPost<StocktakeSession>('/stocktake/sessions', draftSession);
+      setStocktakeSessions((prev) => [saved, ...prev]);
+    } catch (err) {
+      console.error('Failed to create stocktake session', err);
+      setStocktakeSessions((prev) => [draftSession, ...prev]);
+    }
 
     handleNavigate('STOCKTAKE');
   };
@@ -645,6 +646,48 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appStage, hasCheckedShiftOnEntry, currentTerminalId]);
 
+  // Head-office-only data: fetched once per session, only for a back-office
+  // accessRole (DL-002/DL-005) — a till-operator session never needs these
+  // and the routes are gated server-side anyway, so skipping the fetch for
+  // them avoids a guaranteed-403 round trip on every login.
+  useEffect(() => {
+    if (appStage !== 'MAIN_APP' || hasFetchedBackOfficeData || !isBackOfficeAccessRole(currentStaff.accessRole)) return;
+    setHasFetchedBackOfficeData(true);
+
+    (async () => {
+      try {
+        const [memos, orders, transfers, sessions, allItems, salesHistory, shiftsHistory] = await Promise.all([
+          apiGet<PurchaseMemo[]>('/purchasing/memos'),
+          apiGet<PurchaseOrder[]>('/purchasing/orders'),
+          apiGet<StockTransfer[]>('/transfers'),
+          apiGet<StocktakeSession[]>('/stocktake/sessions'),
+          // Head office needs inactive/discontinued items too (to review and
+          // reactivate them) — the till's own fetch omits this deliberately.
+          apiGet<InventoryItem[]>('/inventory/items?includeInactive=true'),
+          // Full history for Reports Center (REPORTS_CENTER is head-office-only).
+          apiGet<SaleTransaction[]>('/sales'),
+          apiGet<Shift[]>('/shifts'),
+        ]);
+        setPurchaseMemos(memos);
+        setPurchaseOrders(orders);
+        setStockTransfers(transfers);
+        setStocktakeSessions(sessions);
+        setInventoryItems(allItems);
+        setSalesTransactions(salesHistory);
+        // Preserve whichever shift the shift-check effect established for
+        // this terminal; backfill full cross-terminal history around it.
+        setShifts((prev) => {
+          const currentTerminalShift = prev.find((s) => s.terminalId === currentTerminalId);
+          const rest = shiftsHistory.filter((s) => s.terminalId !== currentTerminalId);
+          return currentTerminalShift ? [currentTerminalShift, ...rest] : rest;
+        });
+      } catch (err) {
+        console.error('Failed to fetch head-office data', err);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appStage, hasFetchedBackOfficeData, currentStaff.accessRole]);
+
   // Global Keyboard Shortcuts
   useEffect(() => {
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
@@ -662,42 +705,51 @@ export default function App() {
 
       if (e.key === 'F1') {
         e.preventDefault();
-        setActiveView('SALES_CASH');
+        handleNavigate('SALES_CASH');
       } else if (e.key === 'F2') {
         e.preventDefault();
-        setActiveView('SALES_CREDIT');
+        handleNavigate('SALES_CREDIT');
       } else if (e.key === 'F3') {
         e.preventDefault();
-        setActiveView('HELD_SALES');
+        handleNavigate('HELD_SALES');
       } else if (e.key === 'F7') {
         e.preventDefault();
-        setActiveView('SALES_RETURN');
+        handleNavigate('SALES_RETURN');
       } else if (e.key === 'F8') {
         e.preventDefault();
-        setActiveView('LAYAWAY');
+        handleNavigate('LAYAWAY');
       } else if (e.key === 'F12') {
         e.preventDefault();
-        setActiveView('EOD_REPORT');
+        handleNavigate('EOD_REPORT');
       } else if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'b') {
         e.preventDefault();
-        setActiveView('BI_ACTIVITY');
+        handleNavigate('BI_ACTIVITY');
       } else if (e.ctrlKey && e.key.toLowerCase() === 'r') {
         e.preventDefault();
-        setActiveView('REPORTS_CENTER');
+        handleNavigate('REPORTS_CENTER');
       } else if (e.ctrlKey && e.key.toLowerCase() === 'p') {
         e.preventDefault();
-        setActiveView('PURCHASE_ORDER');
+        handleNavigate('PURCHASE_ORDER');
       } else if (e.ctrlKey && e.key.toLowerCase() === 'b') {
         e.preventDefault();
-        setActiveView('BACKUP_RESTORE');
+        handleNavigate('BACKUP_RESTORE');
       }
     };
 
     window.addEventListener('keydown', handleGlobalKeyDown);
     return () => window.removeEventListener('keydown', handleGlobalKeyDown);
-  }, [appStage]);
+    // currentStaff.accessRole is a dep (not just appStage) so a mid-session
+    // "Switch Operator" re-subscribes hotkeys against the new role's gate
+    // instead of keeping a stale closure over the previous operator's role.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appStage, currentStaff.accessRole]);
 
   const handleNavigate = (view: ActiveView, params?: any) => {
+    // DL-002/DL-005 app-surface gate — every user-initiated navigation
+    // (menu clicks, hotkeys, in-view "back to X" buttons) funnels through
+    // here, so this is the single point that keeps a till-operator session
+    // out of head-office-only views. See src/utils/accessRoleGate.ts.
+    if (!canAccessView(currentStaff.accessRole, view)) return;
     setActiveView(view);
     setNavigationParams(params || null);
     window.scrollTo({ top: 0, behavior: 'instant' });
@@ -1064,222 +1116,139 @@ export default function App() {
     setTerminals((prev) => [...prev, term]);
   };
 
-  const handleCreateTransfer = (transfer: StockTransfer) => {
-    setStockTransfers((prev) => [transfer, ...prev]);
+  const handleCreateTransfer = async (transfer: StockTransfer) => {
+    try {
+      const saved = await apiPost<StockTransfer>('/transfers', transfer);
+      setStockTransfers((prev) => [saved, ...prev]);
+    } catch (err) {
+      console.error('Failed to create stock transfer', err);
+      setStockTransfers((prev) => [transfer, ...prev]);
+    }
   };
 
-  const handleApproveTransfer = (transferId: string) => {
-    setStockTransfers((prev) =>
-      prev.map((t) => (t.id === transferId ? { ...t, status: 'Approved' } : t))
-    );
+  const handleApproveTransfer = async (transferId: string) => {
+    try {
+      const saved = await apiPost<StockTransfer>(`/transfers/${encodeURIComponent(transferId)}/approve`);
+      setStockTransfers((prev) => prev.map((t) => (t.id === transferId ? saved : t)));
+    } catch (err) {
+      console.error('Failed to approve stock transfer', err);
+    }
   };
 
-  const handleDispatchTransfer = (transferId: string) => {
-    setStockTransfers((prev) =>
-      prev.map((t) => {
-        if (t.id === transferId) {
-          // Log Outbound Movement
-          t.items.forEach((item) => {
-            const mov: InventoryMovement = {
-              id: `MOV-TRF-OUT-${Date.now()}-${item.sku}`,
-              timestamp: new Date().toISOString().replace('T', ' ').slice(0, 16),
-              movementType: 'Transfer Out',
-              sku: item.sku,
-              itemName: item.description,
-              quantity: -item.requestedQty,
-              unitCost: item.unitCost,
-              totalValue: item.requestedQty * item.unitCost,
-              sourceLocationId: t.originLocationId,
-              sourceLocationName: t.originLocationName,
-              destinationLocationId: t.destinationLocationId,
-              destinationLocationName: t.destinationLocationName,
-              referenceDocument: t.transferNumber,
-              staffId: currentStaff.id,
-              staffName: currentStaff.name,
-            };
-            setInventoryMovements((mPrev) => [mov, ...mPrev]);
-          });
-
-          return {
-            ...t,
-            status: 'Dispatched',
-            dispatchedDate: new Date().toISOString().split('T')[0],
-            items: t.items.map((i) => ({ ...i, dispatchedQty: i.requestedQty }))
-          };
-        }
-        return t;
-      })
-    );
+  const handleDispatchTransfer = async (transferId: string) => {
+    try {
+      const saved = await apiPost<StockTransfer>(`/transfers/${encodeURIComponent(transferId)}/dispatch`);
+      setStockTransfers((prev) => prev.map((t) => (t.id === transferId ? saved : t)));
+    } catch (err) {
+      console.error('Failed to dispatch stock transfer', err);
+    }
   };
 
-  const handleReceiveTransfer = (transferId: string) => {
-    const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 16);
-    setStockTransfers((prev) =>
-      prev.map((t) => {
-        if (t.id === transferId) {
-          // Log Inbound Movement
-          t.items.forEach((item) => {
-            const mov: InventoryMovement = {
-              id: `MOV-TRF-IN-${Date.now()}-${item.sku}`,
-              timestamp: timestampStr,
-              movementType: 'Transfer In',
-              sku: item.sku,
-              itemName: item.description,
-              quantity: item.dispatchedQty || item.requestedQty,
-              unitCost: item.unitCost,
-              totalValue: (item.dispatchedQty || item.requestedQty) * item.unitCost,
-              sourceLocationId: t.originLocationId,
-              sourceLocationName: t.originLocationName,
-              destinationLocationId: t.destinationLocationId,
-              destinationLocationName: t.destinationLocationName,
-              referenceDocument: t.transferNumber,
-              staffId: currentStaff.id,
-              staffName: currentStaff.name,
-            };
-            setInventoryMovements((mPrev) => [mov, ...mPrev]);
-
-            // Check for Transfer Discrepancies
-            const dispatched = item.dispatchedQty ?? item.requestedQty;
-            const received = item.receivedQty ?? dispatched;
-            if (received !== dispatched) {
-              const discQty = received - dispatched;
-              const discVal = Math.abs(discQty * item.unitCost);
-              const excNum = `EXC-TRF-${Date.now().toString().slice(-4)}`;
-              const exc: OperationalException = {
-                id: `EXC-TRF-${Date.now()}-${item.sku}`,
-                exceptionNumber: excNum,
-                title: `Stock Transfer Discrepancy: ${item.sku}`,
-                category: 'TRANSFER_DISCREPANCY',
-                dateTime: timestampStr,
-                branchId: t.destinationLocationId,
-                branchName: t.destinationLocationName,
-                terminalId: 'LOGISTICS-HUB',
-                staffId: currentStaff.id,
-                staffName: currentStaff.name,
-                relatedTransactionRef: t.transferNumber,
-                severity: discVal > 100 ? 'HIGH' : 'MEDIUM',
-                status: 'OPEN',
-                varianceAmount: discVal,
-                varianceUnits: discQty,
-                details: `Transfer #${t.transferNumber} received ${received} units vs dispatched ${dispatched} units (${discQty > 0 ? '+' : ''}${discQty} discrepancy, Valuation delta: $${discVal.toFixed(2)}).`,
-                openedAt: timestampStr,
-              };
-              setOperationalExceptions((ePrev) => [exc, ...ePrev]);
-
-              const trfEvt: ActivityEvent = {
-                id: `EVT-${Date.now()}`,
-                timestamp: timestampStr,
-                eventType: 'TRANSFER_DISCREPANCY',
-                description: `Discrepancy recorded on transfer #${t.transferNumber} for SKU ${item.sku}: ${received} received vs ${dispatched} dispatched.`,
-                staffId: currentStaff.id,
-                staffName: currentStaff.name,
-                branchId: t.destinationLocationId,
-                branchName: t.destinationLocationName,
-                referenceDocument: t.transferNumber,
-                amount: discVal,
-                quantity: discQty,
-              };
-              setActivityEvents((aPrev) => [trfEvt, ...aPrev]);
-            }
-          });
-
-          return {
-            ...t,
-            status: 'Received',
-            receivedDate: new Date().toISOString().split('T')[0],
-            receivedByStaffName: currentStaff.name,
-            items: t.items.map((i) => ({ ...i, receivedQty: i.dispatchedQty || i.requestedQty }))
-          };
-        }
-        return t;
-      })
-    );
+  const handleReceiveTransfer = async (transferId: string) => {
+    try {
+      const saved = await apiPost<StockTransfer>(`/transfers/${encodeURIComponent(transferId)}/receive`);
+      setStockTransfers((prev) => prev.map((t) => (t.id === transferId ? saved : t)));
+    } catch (err) {
+      console.error('Failed to receive stock transfer', err);
+    }
   };
 
-  const handleRejectTransfer = (transferId: string, reason: string) => {
-    setStockTransfers((prev) =>
-      prev.map((t) => (t.id === transferId ? { ...t, status: 'Rejected', notes: `${t.notes || ''} [Rejected: ${reason}]` } : t))
-    );
+  const handleRejectTransfer = async (transferId: string, reason: string) => {
+    try {
+      const saved = await apiPost<StockTransfer>(`/transfers/${encodeURIComponent(transferId)}/reject`, { reason });
+      setStockTransfers((prev) => prev.map((t) => (t.id === transferId ? saved : t)));
+    } catch (err) {
+      console.error('Failed to reject stock transfer', err);
+    }
   };
 
-  const handleCreatePurchaseMemo = (memo: PurchaseMemo) => {
-    setPurchaseMemos((prev) => [memo, ...prev]);
+  const handleCreatePurchaseMemo = async (memo: PurchaseMemo) => {
+    try {
+      const saved = await apiPost<PurchaseMemo>('/purchasing/memos', memo);
+      setPurchaseMemos((prev) => [saved, ...prev]);
+    } catch (err) {
+      console.error('Failed to create purchase memo', err);
+      setPurchaseMemos((prev) => [memo, ...prev]);
+    }
   };
 
-  const handleCreatePurchaseOrder = (po: PurchaseOrder) => {
-    setPurchaseOrders((prev) => [po, ...prev]);
+  const handleCreatePurchaseOrder = async (po: PurchaseOrder) => {
+    try {
+      const saved = await apiPost<PurchaseOrder>('/purchasing/orders', po);
+      setPurchaseOrders((prev) => [saved, ...prev]);
+    } catch (err) {
+      console.error('Failed to create purchase order', err);
+      setPurchaseOrders((prev) => [po, ...prev]);
+    }
   };
 
-  const handleConvertMemoToPO = (memo: PurchaseMemo) => {
-    setPurchaseMemos((prev) =>
-      prev.map((m) => (m.id === memo.id ? { ...m, status: 'CONVERTED' } : m))
-    );
-    handleNavigate('PURCHASING', { memoToConvert: memo });
+  const handleApproveMemo = async (memoId: string) => {
+    try {
+      const saved = await apiPatch<PurchaseMemo>(`/purchasing/memos/${encodeURIComponent(memoId)}`, {
+        status: 'Approved',
+        approvedByStaffName: currentStaff.name,
+        approvalDate: new Date().toISOString().split('T')[0],
+      });
+      setPurchaseMemos((prev) => prev.map((m) => (m.id === memoId ? saved : m)));
+    } catch (err) {
+      console.error('Failed to approve purchase memo', err);
+    }
   };
 
-  const handleReceiveStockFromSupplier = (grn: GoodsReceiptNote) => {
-    const timestampStr = new Date().toISOString().replace('T', ' ').slice(0, 16);
-    // Record Inventory Movements for goods received into warehouse
-    grn.items.forEach((item) => {
-      const mov: InventoryMovement = {
-        id: `MOV-GRN-${Date.now()}-${item.sku}`,
-        timestamp: timestampStr,
-        movementType: 'Supplier Receipt',
-        sku: item.sku,
-        itemName: item.description,
-        quantity: item.receivedQty,
-        unitCost: item.unitCost,
-        totalValue: item.receivedQty * item.unitCost,
-        destinationLocationId: grn.destinationWarehouseId,
-        destinationLocationName: grn.destinationWarehouseName,
-        referenceDocument: `${grn.grnNumber} (PO: ${grn.poNumber})`,
-        staffId: currentStaff.id,
-        staffName: currentStaff.name,
-      };
-      setInventoryMovements((prev) => [mov, ...prev]);
+  const handleRejectMemo = async (memoId: string, reason: string) => {
+    try {
+      const saved = await apiPatch<PurchaseMemo>(`/purchasing/memos/${encodeURIComponent(memoId)}`, {
+        status: 'Rejected',
+        rejectionReason: reason,
+      });
+      setPurchaseMemos((prev) => prev.map((m) => (m.id === memoId ? saved : m)));
+    } catch (err) {
+      console.error('Failed to reject purchase memo', err);
+    }
+  };
 
-      // Check for Supplier Receiving Variance (Ordered vs Received)
-      if (item.receivedQty !== item.orderedQty) {
-        const varQty = item.receivedQty - item.orderedQty;
-        const varVal = Math.abs(varQty * item.unitCost);
-        const excNum = `EXC-GRN-${Date.now().toString().slice(-4)}`;
-        const exc: OperationalException = {
-          id: `EXC-GRN-${Date.now()}-${item.sku}`,
-          exceptionNumber: excNum,
-          title: `Supplier Delivery Variance: ${item.sku}`,
-          category: 'SUPPLIER_RECEIVING_VARIANCE',
-          dateTime: timestampStr,
-          branchId: grn.destinationWarehouseId,
-          branchName: grn.destinationWarehouseName,
-          terminalId: 'WAREHOUSE-GRN',
-          staffId: currentStaff.id,
-          staffName: currentStaff.name,
-          relatedTransactionRef: grn.grnNumber,
-          severity: varVal > 150 ? 'HIGH' : 'MEDIUM',
-          status: 'OPEN',
-          varianceAmount: varVal,
-          varianceUnits: varQty,
-          details: `GRN #${grn.grnNumber} (PO #${grn.poNumber}): Received ${item.receivedQty} units vs ${item.orderedQty} ordered (${varQty > 0 ? '+' : ''}${varQty} units variance, Valuation: $${varVal.toFixed(2)}).`,
-          openedAt: timestampStr,
-        };
-        setOperationalExceptions((ePrev) => [exc, ...ePrev]);
+  const handleConvertMemoToPO = async (memo: PurchaseMemo) => {
+    try {
+      const saved = await apiPatch<PurchaseMemo>(`/purchasing/memos/${encodeURIComponent(memo.id)}`, { status: 'CONVERTED' });
+      setPurchaseMemos((prev) => prev.map((m) => (m.id === memo.id ? saved : m)));
+      handleNavigate('PURCHASING', { memoToConvert: saved });
+    } catch (err) {
+      console.error('Failed to mark purchase memo as converted', err);
+      setPurchaseMemos((prev) => prev.map((m) => (m.id === memo.id ? { ...m, status: 'CONVERTED' } : m)));
+      handleNavigate('PURCHASING', { memoToConvert: memo });
+    }
+  };
 
-        const grnEvt: ActivityEvent = {
-          id: `EVT-${Date.now()}`,
-          timestamp: timestampStr,
-          eventType: 'SUPPLIER_RECEIVING_VARIANCE',
-          description: `Supplier delivery variance on ${grn.grnNumber} for SKU ${item.sku}: ${item.receivedQty} received vs ${item.orderedQty} ordered.`,
-          staffId: currentStaff.id,
-          staffName: currentStaff.name,
-          branchId: grn.destinationWarehouseId,
-          branchName: grn.destinationWarehouseName,
-          referenceDocument: grn.grnNumber,
-          amount: varVal,
-          quantity: varQty,
-        };
-        setActivityEvents((aPrev) => [grnEvt, ...aPrev]);
-      }
-    });
+  const handleReceiveStockFromSupplier = async (
+    poNumber: string | null,
+    warehouseId: string,
+    lines: Array<{
+      sku: string;
+      itemName: string;
+      qtyReceiving: number;
+      unitCost: number;
+      batchNumber?: string;
+      serialNumber?: string;
+      expiryDate?: string;
+      binLocation?: string;
+    }>,
+    notes: string
+  ) => {
+    try {
+      const grn = await apiPost<GoodsReceiptNote>('/purchasing/receipts', { poNumber, warehouseId, lines, notes });
+      // Reflect the server's authoritative stock levels and PO status rather
+      // than re-deriving them from the request we just sent.
+      const [items, orders] = await Promise.all([
+        apiGet<InventoryItem[]>('/inventory/items'),
+        apiGet<PurchaseOrder[]>('/purchasing/orders'),
+      ]);
+      setInventoryItems(items);
+      setPurchaseOrders(orders);
+      return grn;
+    } catch (err) {
+      console.error('Failed to record goods receipt', err);
+      return null;
+    }
   };
 
   const handleCreateStockAdjustment = (adj: StockAdjustmentRecord) => {
@@ -1434,84 +1403,27 @@ export default function App() {
     setEodReports((prev) => [report, ...prev.filter((r) => r.id !== report.id)]);
   };
 
-  const handleSaveStocktakeSession = (session: StocktakeSession) => {
-    setStocktakeSessions((prev) => [session, ...prev.filter((s) => s.id !== session.id)]);
+  const handleSaveStocktakeSession = async (session: StocktakeSession) => {
+    try {
+      const saved = await apiPut<StocktakeSession>(`/stocktake/sessions/${encodeURIComponent(session.id)}`, session);
+      setStocktakeSessions((prev) => [saved, ...prev.filter((s) => s.id !== session.id)]);
+    } catch (err) {
+      console.error('Failed to save stocktake session', err);
+      setStocktakeSessions((prev) => [session, ...prev.filter((s) => s.id !== session.id)]);
+    }
   };
 
-  const handlePostStocktakeAdjustments = (session: StocktakeSession, extraMovements?: InventoryMovement[]) => {
-    const postTimeStr = new Date().toISOString().replace('T', ' ').slice(0, 16);
-    const updatedSession: StocktakeSession = {
-      ...session,
-      status: 'POSTED',
-      approvedByStaffName: currentStaff.name,
-      approvedDateTime: postTimeStr,
-      completedDateTime: postTimeStr,
-    };
-    setStocktakeSessions((prev) => [updatedSession, ...prev.filter((s) => s.id !== session.id)]);
-
-    // Generate inventory movements and adjust item stock levels
-    if (extraMovements && extraMovements.length > 0) {
-      setInventoryMovements((prev) => [...extraMovements, ...prev]);
-    } else {
-      session.items.forEach((item) => {
-        if (item.countedQty !== null && item.varianceQty !== 0) {
-          const mov: InventoryMovement = {
-            id: `MOV-STK-${Date.now()}-${item.sku}`,
-            timestamp: postTimeStr,
-            movementType: 'Stocktake Adjustment',
-            sku: item.sku,
-            itemName: item.name,
-            quantity: item.varianceQty,
-            unitCost: item.unitCost,
-            totalValue: item.varianceValuation,
-            sourceLocationId: session.locationId,
-            sourceLocationName: session.locationName,
-            referenceDocument: session.sessionNumber,
-            staffId: currentStaff.id,
-            staffName: currentStaff.name,
-            reason: `Stocktake ${session.sessionNumber} variance reconciliation`,
-            approvalRef: `APPR-${session.sessionNumber}`,
-            notes: `Stocktake ${session.sessionNumber} variance adjustment.`,
-          };
-          setInventoryMovements((prev) => [mov, ...prev]);
-        }
-      });
+  const handlePostStocktakeAdjustments = async (session: StocktakeSession) => {
+    try {
+      const saved = await apiPost<StocktakeSession>(`/stocktake/sessions/${encodeURIComponent(session.id)}/post-adjustments`);
+      setStocktakeSessions((prev) => [saved, ...prev.filter((s) => s.id !== session.id)]);
+      // Reflect the server's authoritative stock levels rather than
+      // re-deriving them from the pre-post session snapshot.
+      const items = await apiGet<InventoryItem[]>('/inventory/items');
+      setInventoryItems(items);
+    } catch (err) {
+      console.error('Failed to post stocktake adjustments', err);
     }
-
-    // Update actual item stockOnHand counts
-    session.items.forEach((item) => {
-      if (item.countedQty !== null) {
-        setInventoryItems((prev) =>
-          prev.map((i) => {
-            if (i.sku === item.sku) {
-              const newQty = item.countedQty!;
-              return {
-                ...i,
-                stockOnHand: newQty,
-                status: newQty <= 0 ? 'Out of Stock' : newQty <= i.reorderLevel ? 'Low Stock' : 'In Stock',
-              };
-            }
-            return i;
-          })
-        );
-      }
-    });
-
-    // Record Stocktake Completed Activity Event
-    const stocktakeEvt: ActivityEvent = {
-      id: `EVT-${Date.now()}`,
-      timestamp: postTimeStr,
-      eventType: 'STOCKTAKE_COMPLETED',
-      description: `Stocktake session #${session.sessionNumber} posted by ${currentStaff.name}. ${session.totalVarianceUnits} units variance reconciled (Net valuation delta: $${session.totalVarianceValuation.toFixed(2)}).`,
-      staffId: currentStaff.id,
-      staffName: currentStaff.name,
-      branchId: session.locationId,
-      branchName: session.locationName,
-      referenceDocument: session.sessionNumber,
-      amount: session.totalVarianceValuation,
-      quantity: session.totalVarianceUnits,
-    };
-    setActivityEvents((prev) => [stocktakeEvt, ...prev]);
   };
 
   const handleApprovalDecision = (requestId: string, status: 'APPROVED' | 'REJECTED', notes: string) => {
@@ -1662,6 +1574,13 @@ export default function App() {
 
   // Render view router for MAIN_APP stage
   const renderActiveView = () => {
+    // Defense-in-depth: handleNavigate and HeaderNav's menu filtering already
+    // keep activeView from ever being set to a head-office-only view for a
+    // non-back-office session, but this catches it if it somehow happens
+    // anyway (e.g. a stale navigationParams-driven deep link).
+    if (!canAccessView(currentStaff.accessRole, activeView)) {
+      return <AccessRestrictedView onBackToLanding={() => handleNavigate('LANDING')} />;
+    }
     switch (activeView) {
       case 'LANDING':
         return (
@@ -1791,10 +1710,13 @@ export default function App() {
         return (
           <PurchaseMemoView
             memos={purchaseMemos}
+            warehouses={warehouses}
             inventoryItems={inventoryItems}
             currentStaff={currentStaff}
-            onBackToPurchasing={() => handleNavigate('PURCHASING')}
+            onBackToLanding={() => handleNavigate('PURCHASING')}
             onCreateMemo={handleCreatePurchaseMemo}
+            onApproveMemo={handleApproveMemo}
+            onRejectMemo={handleRejectMemo}
             onConvertToPO={handleConvertMemoToPO}
           />
         );
@@ -1802,10 +1724,13 @@ export default function App() {
       case 'RECEIVE_STOCK':
         return (
           <ReceiveStockView
+            purchaseOrders={purchaseOrders}
             warehouses={warehouses}
+            inventoryItems={inventoryItems}
             currentStaff={currentStaff}
-            onBackToPurchasing={() => handleNavigate('PURCHASING')}
-            onConfirmReceipt={handleReceiveStockFromSupplier}
+            initialPoNumber={navigationParams?.poNumber}
+            onBackToLanding={() => handleNavigate('PURCHASING')}
+            onConfirmReceiving={handleReceiveStockFromSupplier}
           />
         );
 
@@ -2011,6 +1936,7 @@ export default function App() {
       case 'ROLES_RIGHTS':
       case 'VENDOR_PREFERENCES':
       case 'BACKUP_RESTORE':
+      case 'RATE_CONFIG':
         return (
           <SettingsView
             initialTab={
@@ -2018,6 +1944,7 @@ export default function App() {
               : activeView === 'ROLES_RIGHTS' ? 'roles'
               : activeView === 'BACKUP_RESTORE' ? 'backup'
               : activeView === 'VENDOR_PREFERENCES' ? 'vendor'
+              : activeView === 'RATE_CONFIG' ? 'rates'
               : 'staff'
             }
             currentStaff={currentStaff}

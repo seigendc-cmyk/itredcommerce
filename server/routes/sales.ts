@@ -371,6 +371,43 @@ router.post(
   })
 );
 
+// List for reporting (ReportsCenterView etc.) — filterable, capped absent a
+// narrow filter so a full-history fetch can't return an unbounded result.
+router.get(
+  '/',
+  asyncHandler(async (req, res) => {
+    const { from, to, terminalId, shiftId, customerId } = req.query as Record<string, string | undefined>;
+    const clauses: string[] = [];
+    const params: Record<string, string> = {};
+    if (from) { clauses.push('date_time >= @from'); params.from = from; }
+    if (to) { clauses.push('date_time <= @to'); params.to = to; }
+    if (terminalId) { clauses.push('terminal_id = @terminalId'); params.terminalId = terminalId; }
+    if (shiftId) { clauses.push('shift_id = @shiftId'); params.shiftId = shiftId; }
+    if (customerId) { clauses.push('customer_id = @customerId'); params.customerId = customerId; }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const limit = clauses.length ? 5000 : 500;
+
+    const saleRows = db
+      .prepare(`SELECT * FROM sales_transactions ${where} ORDER BY date_time DESC LIMIT ${limit}`)
+      .all(params) as any[];
+    const itemsBySale = new Map<string, any[]>();
+    const paymentsBySale = new Map<string, any[]>();
+    if (saleRows.length > 0) {
+      const ids = saleRows.map((r) => r.sale_id);
+      const placeholders = ids.map(() => '?').join(',');
+      for (const r of db.prepare(`SELECT * FROM sale_line_items WHERE sale_id IN (${placeholders})`).all(...ids) as any[]) {
+        if (!itemsBySale.has(r.sale_id)) itemsBySale.set(r.sale_id, []);
+        itemsBySale.get(r.sale_id)!.push(r);
+      }
+      for (const r of db.prepare(`SELECT * FROM sale_payments WHERE sale_id IN (${placeholders})`).all(...ids) as any[]) {
+        if (!paymentsBySale.has(r.sale_id)) paymentsBySale.set(r.sale_id, []);
+        paymentsBySale.get(r.sale_id)!.push(r);
+      }
+    }
+    res.json(saleRows.map((r) => rowToSale(r, itemsBySale.get(r.sale_id) ?? [], paymentsBySale.get(r.sale_id) ?? [])));
+  })
+);
+
 router.get(
   '/:saleNumber',
   asyncHandler(async (req, res) => {
