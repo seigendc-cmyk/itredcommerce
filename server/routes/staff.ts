@@ -5,7 +5,8 @@ import { asyncHandler, ApiError } from '../lib/http';
 import { requireAuth, requireAccessRole } from '../middleware/auth';
 import { BACK_OFFICE_WRITE_ROLES } from '../lib/accessRoles';
 import { generateId } from '../lib/ids';
-import { applyWithOutbox } from '../sync/outboxWriter';
+import { getSupabaseAdmin } from '../lib/supabaseAdmin';
+import { env } from '../env';
 
 const router = Router();
 router.use(requireAuth);
@@ -14,7 +15,55 @@ router.use(requireAuth);
 // head-office only. Never returns pin_hash.
 router.use(requireAccessRole(...BACK_OFFICE_WRITE_ROLES));
 
+// Trivially-guessable PINs rejected at creation/reset time (DL-011 security
+// review item #5). This is a denylist, not a strength requirement — a 4-6
+// digit PIN has limited entropy no matter what (see DL-011's PIN-strength
+// notes), so this only closes off the handful of patterns real people
+// actually pick under time pressure at a till.
+const WEAK_PINS = new Set([
+  '0000', '1111', '2222', '3333', '4444', '5555', '6666', '7777', '8888', '9999',
+  '1234', '2345', '3456', '4567', '5678', '6789', '0123',
+  '4321', '9876', '8765', '7654', '6543', '5432',
+  '000000', '111111', '123456', '654321', '121212', '112233',
+]);
+
+function assertStrongPin(pin: string) {
+  if (!/^\d{4,6}$/.test(pin)) throw new ApiError(400, 'pin must be 4-6 digits');
+  if (WEAK_PINS.has(pin)) throw new ApiError(400, 'That PIN is too easy to guess — choose a less predictable one', 'WEAK_PIN');
+}
+
+// DL-011: staff administration under DL-005 writes directly to Supabase
+// (the source of truth) when reachable, and is simply unavailable when not
+// — unlike the rest of this app's data, staff/PIN changes are NOT queued
+// through the local outbox for later push. You shouldn't be able to mint a
+// credential offline and have it trusted later without ever having been
+// checked against the tenant's real staff record.
+function requireSupabase() {
+  const client = getSupabaseAdmin();
+  if (!client) {
+    throw new ApiError(503, 'Staff administration requires a live connection to Supabase', 'SUPABASE_UNAVAILABLE');
+  }
+  return client;
+}
+
 function rowToStaff(row: any) {
+  return {
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    role: row.role,
+    roleTitle: row.role_title,
+    department: row.department,
+    accessRole: typeof row.access_role === 'string' ? row.access_role.toUpperCase() : row.access_role,
+    avatarInitials: row.avatar_initials,
+    lastLogin: row.last_login,
+    permissions: row.permissions ?? [],
+    terminalAccess: row.terminal_access ?? [],
+    isActive: !!row.is_active,
+  };
+}
+
+function localRowToStaff(row: any) {
   return {
     id: row.id,
     code: row.code,
@@ -34,8 +83,21 @@ function rowToStaff(row: any) {
 router.get(
   '/',
   asyncHandler(async (_req, res) => {
+    const client = getSupabaseAdmin();
+    if (client) {
+      const { data, error } = await client
+        .from('staff')
+        .select('id, code, name, role, role_title, department, access_role, avatar_initials, last_login, permissions, terminal_access, is_active')
+        .eq('tenant_id', env.tenantId)
+        .order('name', { ascending: true });
+      if (!error && data) {
+        res.json(data.map(rowToStaff));
+        return;
+      }
+      console.error('[staff] GET / Supabase query failed, falling back to local cache (read-only):', error);
+    }
     const rows = db.prepare('SELECT * FROM staff ORDER BY name ASC').all() as any[];
-    res.json(rows.map(rowToStaff));
+    res.json(rows.map(localRowToStaff));
   })
 );
 
@@ -59,50 +121,40 @@ router.post(
     if (!body?.code || !body.name || !body.role || !body.accessRole || !body.pin) {
       throw new ApiError(400, 'code, name, role, accessRole and pin are required');
     }
-    if (!/^\d{4,6}$/.test(body.pin)) {
-      throw new ApiError(400, 'pin must be 4-6 digits');
-    }
+    assertStrongPin(body.pin);
 
+    const client = requireSupabase();
     const id = generateId('STF');
-    const pinHash = bcrypt.hashSync(body.pin, 10);
+    const pinHash = bcrypt.hashSync(body.pin, 12);
 
-    try {
-      applyWithOutbox({
-        db,
-        tenantId: null,
-        table: 'staff',
-        pkColumn: 'id',
-        pk: id,
-        operation: 'INSERT',
-        payload: { id, code: body.code, name: body.name, role: body.role, accessRole: body.accessRole },
-        apply: () => {
-          db.prepare(
-            `INSERT INTO staff (id, code, name, role, role_title, department, access_role, pin_hash, avatar_initials, permissions, terminal_access, is_active)
-             VALUES (@id, @code, @name, @role, @roleTitle, @department, @accessRole, @pinHash, @avatarInitials, @permissions, @terminalAccess, 1)`
-          ).run({
-            id,
-            code: body.code,
-            name: body.name,
-            role: body.role,
-            roleTitle: body.roleTitle ?? body.role,
-            department: body.department ?? null,
-            accessRole: body.accessRole,
-            pinHash,
-            avatarInitials: body.avatarInitials ?? body.name.split(' ').map((p) => p[0]).slice(0, 2).join('').toUpperCase(),
-            permissions: JSON.stringify(body.permissions ?? []),
-            terminalAccess: JSON.stringify(body.terminalAccess ?? []),
-          });
-        },
-      });
-    } catch (err: any) {
-      if (typeof err?.message === 'string' && err.message.includes('UNIQUE') && err.message.includes('staff.code')) {
+    const { data, error } = await client
+      .from('staff')
+      .insert({
+        id,
+        tenant_id: env.tenantId,
+        code: body.code,
+        name: body.name,
+        role: body.role,
+        role_title: body.roleTitle ?? body.role,
+        department: body.department ?? null,
+        access_role: body.accessRole.toLowerCase(),
+        pin_hash: pinHash,
+        avatar_initials: body.avatarInitials ?? body.name.split(' ').map((p) => p[0]).slice(0, 2).join('').toUpperCase(),
+        permissions: body.permissions ?? [],
+        terminal_access: body.terminalAccess ?? [],
+        is_active: true,
+      })
+      .select('id, code, name, role, role_title, department, access_role, avatar_initials, last_login, permissions, terminal_access, is_active')
+      .single();
+
+    if (error) {
+      if (error.code === '23505') {
         throw new ApiError(409, `Staff code ${body.code} is already in use`, 'STAFF_CODE_TAKEN');
       }
-      throw err;
+      throw new ApiError(502, 'Failed to create staff member in Supabase', 'SUPABASE_WRITE_FAILED');
     }
 
-    const row = db.prepare('SELECT * FROM staff WHERE id = ?').get(id);
-    res.status(201).json(rowToStaff(row));
+    res.status(201).json(rowToStaff(data));
   })
 );
 
@@ -119,92 +171,87 @@ interface UpdateBody {
 router.patch(
   '/:id',
   asyncHandler(async (req, res) => {
-    const existing = db.prepare('SELECT * FROM staff WHERE id = ?').get(req.params.id) as any;
-    if (!existing) throw new ApiError(404, 'Staff member not found');
+    const client = requireSupabase();
     const body = req.body as UpdateBody;
 
-    applyWithOutbox({
-      db,
-      tenantId: null,
-      table: 'staff',
-      pkColumn: 'id',
-      pk: existing.id,
-      operation: 'UPDATE',
-      payload: { id: existing.id, ...body },
-      apply: () => {
-        db.prepare(
-          `UPDATE staff SET name = ?, role_title = ?, department = ?, access_role = ?, permissions = ?, terminal_access = ?, is_active = ? WHERE id = ?`
-        ).run(
-          body.name ?? existing.name,
-          body.roleTitle ?? existing.role_title,
-          body.department ?? existing.department,
-          body.accessRole ?? existing.access_role,
-          body.permissions ? JSON.stringify(body.permissions) : existing.permissions,
-          body.terminalAccess ? JSON.stringify(body.terminalAccess) : existing.terminal_access,
-          body.isActive === undefined ? existing.is_active : body.isActive ? 1 : 0,
-          existing.id
-        );
-      },
-    });
+    const patch: Record<string, unknown> = {};
+    if (body.name !== undefined) patch.name = body.name;
+    if (body.roleTitle !== undefined) patch.role_title = body.roleTitle;
+    if (body.department !== undefined) patch.department = body.department;
+    if (body.accessRole !== undefined) patch.access_role = body.accessRole.toLowerCase();
+    if (body.permissions !== undefined) patch.permissions = body.permissions;
+    if (body.terminalAccess !== undefined) patch.terminal_access = body.terminalAccess;
+    if (body.isActive !== undefined) patch.is_active = body.isActive;
 
-    const row = db.prepare('SELECT * FROM staff WHERE id = ?').get(existing.id);
-    res.json(rowToStaff(row));
+    const { data, error } = await client
+      .from('staff')
+      .update(patch)
+      .eq('tenant_id', env.tenantId)
+      .eq('id', req.params.id)
+      .select('id, code, name, role, role_title, department, access_role, avatar_initials, last_login, permissions, terminal_access, is_active')
+      .single();
+
+    if (error || !data) {
+      if (error?.code === 'PGRST116') throw new ApiError(404, 'Staff member not found');
+      throw new ApiError(502, 'Failed to update staff member in Supabase', 'SUPABASE_WRITE_FAILED');
+    }
+
+    res.json(rowToStaff(data));
   })
 );
 
 router.post(
   '/:id/reset-pin',
   asyncHandler(async (req, res) => {
-    const existing = db.prepare('SELECT * FROM staff WHERE id = ?').get(req.params.id) as any;
-    if (!existing) throw new ApiError(404, 'Staff member not found');
+    const client = requireSupabase();
     const { pin } = req.body as { pin?: string };
-    if (!pin || !/^\d{4,6}$/.test(pin)) throw new ApiError(400, 'pin must be 4-6 digits');
+    if (!pin) throw new ApiError(400, 'pin is required');
+    assertStrongPin(pin);
 
-    const pinHash = bcrypt.hashSync(pin, 10);
-    applyWithOutbox({
-      db,
-      tenantId: null,
-      table: 'staff',
-      pkColumn: 'id',
-      pk: existing.id,
-      operation: 'UPDATE',
-      payload: { id: existing.id, pinReset: true },
-      apply: () => {
-        db.prepare('UPDATE staff SET pin_hash = ? WHERE id = ?').run(pinHash, existing.id);
-      },
-    });
+    const pinHash = bcrypt.hashSync(pin, 12);
+    const { error } = await client
+      .from('staff')
+      // Also clear any lockout so a PIN reset doesn't leave the account
+      // stuck locked out under the credential that was just replaced.
+      .update({ pin_hash: pinHash, failed_attempts: 0, locked_until: null })
+      .eq('tenant_id', env.tenantId)
+      .eq('id', req.params.id);
 
+    if (error) throw new ApiError(502, 'Failed to reset PIN in Supabase', 'SUPABASE_WRITE_FAILED');
     res.status(204).send();
   })
 );
 
+async function setActive(tenantId: string, staffId: string, isActive: boolean, client: ReturnType<typeof requireSupabase>) {
+  const { data, error } = await client
+    .from('staff')
+    .update({ is_active: isActive })
+    .eq('tenant_id', tenantId)
+    .eq('id', staffId)
+    .select('id, code, name, role, role_title, department, access_role, avatar_initials, last_login, permissions, terminal_access, is_active')
+    .single();
+  if (error || !data) {
+    if (error?.code === 'PGRST116') throw new ApiError(404, 'Staff member not found');
+    throw new ApiError(502, 'Failed to update staff member in Supabase', 'SUPABASE_WRITE_FAILED');
+  }
+  return data;
+}
+
 router.post(
   '/:id/deactivate',
   asyncHandler(async (req, res) => {
-    const existing = db.prepare('SELECT * FROM staff WHERE id = ?').get(req.params.id) as any;
-    if (!existing) throw new ApiError(404, 'Staff member not found');
-    applyWithOutbox({
-      db, tenantId: null, table: 'staff', pkColumn: 'id', pk: existing.id, operation: 'UPDATE',
-      payload: { id: existing.id, isActive: false },
-      apply: () => db.prepare('UPDATE staff SET is_active = 0 WHERE id = ?').run(existing.id),
-    });
-    const row = db.prepare('SELECT * FROM staff WHERE id = ?').get(existing.id);
-    res.json(rowToStaff(row));
+    const client = requireSupabase();
+    const data = await setActive(env.tenantId, req.params.id, false, client);
+    res.json(rowToStaff(data));
   })
 );
 
 router.post(
   '/:id/reactivate',
   asyncHandler(async (req, res) => {
-    const existing = db.prepare('SELECT * FROM staff WHERE id = ?').get(req.params.id) as any;
-    if (!existing) throw new ApiError(404, 'Staff member not found');
-    applyWithOutbox({
-      db, tenantId: null, table: 'staff', pkColumn: 'id', pk: existing.id, operation: 'UPDATE',
-      payload: { id: existing.id, isActive: true },
-      apply: () => db.prepare('UPDATE staff SET is_active = 1 WHERE id = ?').run(existing.id),
-    });
-    const row = db.prepare('SELECT * FROM staff WHERE id = ?').get(existing.id);
-    res.json(rowToStaff(row));
+    const client = requireSupabase();
+    const data = await setActive(env.tenantId, req.params.id, true, client);
+    res.json(rowToStaff(data));
   })
 );
 

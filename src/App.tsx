@@ -1935,14 +1935,12 @@ export default function App() {
       case 'STAFF_MANAGEMENT':
       case 'ROLES_RIGHTS':
       case 'VENDOR_PREFERENCES':
-      case 'BACKUP_RESTORE':
       case 'RATE_CONFIG':
         return (
           <SettingsView
             initialTab={
               activeView === 'STAFF_MANAGEMENT' ? 'staff'
               : activeView === 'ROLES_RIGHTS' ? 'roles'
-              : activeView === 'BACKUP_RESTORE' ? 'backup'
               : activeView === 'VENDOR_PREFERENCES' ? 'vendor'
               : activeView === 'RATE_CONFIG' ? 'rates'
               : 'staff'

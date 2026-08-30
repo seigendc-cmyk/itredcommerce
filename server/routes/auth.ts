@@ -3,9 +3,18 @@ import bcrypt from 'bcryptjs';
 import { db } from '../db/connection';
 import { asyncHandler, ApiError } from '../lib/http';
 import { requireAuth } from '../middleware/auth';
+import { getSupabaseAdmin } from '../lib/supabaseAdmin';
+import { verifyPinAgainstSupabase, type VerifiedStaff } from '../lib/staffAuth';
+import { env } from '../env';
 
 const router = Router();
 
+// Local circuit breaker — only consulted when Supabase itself couldn't be
+// reached (see verifyPinAgainstSupabase's UNREACHABLE outcome). Real,
+// centrally-enforced lockout now lives in Postgres (failed_attempts/
+// locked_until on staff, checked inside verify_staff_pin) precisely because
+// an in-process Map like this one doesn't stop an attacker from spreading
+// guesses across desks, and resets on every restart — DL-011.
 const MAX_ATTEMPTS = 5;
 const LOCKOUT_MS = 60 * 1000;
 const failedAttempts = new Map<string, { count: number; lockedUntil?: number }>();
@@ -18,7 +27,10 @@ function rowToPublicStaff(row: any) {
     role: row.role,
     roleTitle: row.role_title,
     department: row.department,
-    accessRole: row.access_role,
+    // Normalizes whichever casing the source row uses — local SQLite is
+    // already UPPER_SNAKE_CASE (no-op), Supabase's app_staff_role enum is
+    // lowercase (see DL-009/DL-011).
+    accessRole: typeof row.access_role === 'string' ? row.access_role.toUpperCase() : row.access_role,
     avatarInitials: row.avatar_initials,
     lastLogin: row.last_login,
     permissions: JSON.parse(row.permissions || '[]'),
@@ -26,10 +38,47 @@ function rowToPublicStaff(row: any) {
   };
 }
 
+function verifiedStaffToPublic(staff: VerifiedStaff) {
+  return {
+    id: staff.id,
+    code: staff.code,
+    name: staff.name,
+    role: staff.role,
+    roleTitle: staff.roleTitle,
+    department: staff.department,
+    accessRole: staff.accessRole,
+    avatarInitials: staff.avatarInitials,
+    lastLogin: staff.lastLogin,
+    permissions: staff.permissions,
+    terminalAccess: staff.terminalAccess,
+  };
+}
+
 router.get(
   '/staff',
   asyncHandler(async (_req, res) => {
     // Public roster for the PIN-entry screen — never includes pin_hash.
+    // Prefers Supabase (freshest roster); falls back to the last-synced
+    // local cache when Supabase is unconfigured or unreachable (DL-005).
+    const client = getSupabaseAdmin();
+    if (client) {
+      try {
+        const { data, error } = await client
+          .from('staff')
+          .select('id, code, name, role, role_title, department, access_role, avatar_initials, permissions, terminal_access, last_login')
+          .eq('tenant_id', env.tenantId)
+          .eq('is_active', true)
+          .order('name', { ascending: true });
+        if (!error && data) {
+          res.json(data.map(rowToPublicStaff));
+          return;
+        }
+        console.error('[auth] GET /staff Supabase query failed, falling back to local cache:', error);
+      } catch (err) {
+        console.error('[auth] GET /staff Supabase call failed, falling back to local cache:', err);
+      }
+    }
+
     const rows = db
       .prepare('SELECT * FROM staff WHERE is_active = 1 ORDER BY name ASC')
       .all() as any[];
@@ -45,6 +94,25 @@ router.post(
       throw new ApiError(400, 'staffId and pin are required');
     }
 
+    const supaResult = await verifyPinAgainstSupabase(staffId, pin);
+
+    if (supaResult.outcome === 'LOCKED_OUT') {
+      throw new ApiError(429, 'Too many failed attempts. Try again shortly.', 'LOCKED_OUT');
+    }
+    if (supaResult.outcome === 'INVALID') {
+      throw new ApiError(401, 'Invalid staff PIN', 'INVALID_CREDENTIALS');
+    }
+    if (supaResult.outcome === 'SUCCESS') {
+      req.session.staffId = supaResult.staff.id;
+      req.session.staffCode = supaResult.staff.code;
+      req.session.loginAt = Date.now();
+      res.json({ staff: verifiedStaffToPublic(supaResult.staff) });
+      return;
+    }
+
+    // outcome === 'UNREACHABLE' — Supabase couldn't be consulted at all;
+    // fall back to bcrypt against the last-synced local cache (DL-005's
+    // offline requirement), gated by the local circuit-breaker lockout.
     const lockKey = staffId;
     const attempt = failedAttempts.get(lockKey);
     if (attempt?.lockedUntil && attempt.lockedUntil > Date.now()) {

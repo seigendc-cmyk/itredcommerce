@@ -19,9 +19,23 @@ import stockTransfersRouter from './routes/stockTransfers';
 import stocktakeRouter from './routes/stocktake';
 import rateConfigRouter from './routes/rateConfig';
 import staffRouter from './routes/staff';
+import { isSupabaseConfigured } from './env';
+import { pullStaffFromSupabase } from './sync/staffPull';
 
 runMigrations();
 seedIfEmpty();
+
+// DL-005/DL-011: refresh the local staff/PIN offline-fallback cache from
+// Supabase at startup and periodically thereafter. Best-effort — a failed
+// pull just means the cache stays at its last-known-good state, which is
+// exactly the offline-fallback behavior this cache exists for.
+const STAFF_PULL_INTERVAL_MS = 5 * 60 * 1000;
+if (isSupabaseConfigured) {
+  void pullStaffFromSupabase();
+  setInterval(() => void pullStaffFromSupabase(), STAFF_PULL_INTERVAL_MS);
+} else {
+  console.log('[server] Supabase not configured (SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY/TENANT_ID) — running fully offline against local SQLite staff cache.');
+}
 
 const app = express();
 

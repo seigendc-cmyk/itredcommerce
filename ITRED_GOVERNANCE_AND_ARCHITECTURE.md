@@ -454,6 +454,116 @@ separate local SQLite files and independent sync connections per install —
 before any multi-desk production rollout. Carried over and re-flagged a
 second time so it can't quietly disappear a third time.
 
+## SUPABASE-SOURCED STAFF/PIN AUTH ADDENDUM (2026-08-30)
+
+Prompt 5 implements the "Prompt 5's job" work that DL-005 and the Prompt-1
+Supabase migrations explicitly deferred: the actual PIN-verification flow,
+JWT claim population groundwork, and a PIN-hash security review. Dev/tenant
+data note: the tenant seeded for local development is `TENANT-NYAMUTSAMBA`
+("L Nyamutsamba") — see `supabase/seed.sql`.
+
+### DL-011: `verify_staff_pin` is the one place a PIN is ever compared
+
+**Decision**: `verify_staff_pin(tenant_id, staff_id, pin)` — a Postgres
+`SECURITY DEFINER` function (`supabase/migrations/20260830150000_staff_pin_verification.sql`)
+— is the single place `pin_hash` is ever read or compared, for both current
+and future callers:
+
+- **Today**: the Express backend behind the Tauri branch-terminal/head-office
+  apps (`server/routes/auth.ts`) calls it via a service-role Supabase client
+  (`server/lib/supabaseAdmin.ts`) when reachable, and keeps issuing its own
+  existing Express cookie session on success — no Supabase Auth session is
+  needed for this path, since the Tauri apps never talk to Supabase directly.
+  When Supabase can't be reached (`server/lib/staffAuth.ts`'s `UNREACHABLE`
+  outcome — network failure/timeout, never an actual "PIN is wrong" verdict),
+  it falls back to `bcrypt.compare` against the last-synced local SQLite
+  cache, exactly as the pre-Prompt-5 implementation did. Only Postgres's own
+  authoritative `INVALID`/`LOCKED_OUT` verdicts are ever treated as a real
+  auth outcome — a network-level failure is never conflated with "wrong PIN,"
+  which is what stops an attacker from forcing a downgrade to the
+  less-centrally-rate-limited local path by interfering with connectivity.
+- **Future (Executive/Rider PWA, later prompts)**: the same function is
+  designed to be called from a Supabase Edge Function that additionally mints
+  a real Supabase Auth session, since those PWAs have no backend of their own
+  and read Supabase directly. **That Edge Function is explicitly NOT built by
+  this prompt** — it depends on a design decision only the PWA prompt can
+  make (how a staff row gets linked to a real `auth.users` identity in the
+  first place), so building it now would be speculative. What Prompt 5 does
+  ship, ready for that later work: an `auth_user_id` column on `staff`
+  (nullable, unpopulated) and an `access_token_hook()` Postgres function that
+  injects `tenant_id`/`branch_id`/`staff_role`/`staff_id` JWT claims once a
+  staff row's `auth_user_id` is set and the hook is registered in the
+  Supabase dashboard (Auth Hooks aren't something a SQL migration can
+  register on its own). Until then it has no effect on anything.
+
+**Centralized lockout**: `staff.failed_attempts`/`locked_until` (same
+migration) replace the pre-Prompt-5 in-process `Map` for the Supabase path —
+enforced inside `verify_staff_pin` itself, so it's shared across every
+terminal/desk hitting the same tenant, not reset by an Express restart. The
+in-process `Map` in `server/routes/auth.ts` still exists, but only as a local
+circuit breaker for the offline-fallback branch specifically.
+
+**Rationale**: the schema's own comments ("reading `pin_hash` back... is
+Prompt 5's job via a SECURITY DEFINER function or edge function, never a
+plain SELECT") already specified this shape. One shared primitive for both
+callers avoids duplicating the bcrypt-compare-plus-lockout logic in two
+places that could drift apart.
+
+### DL-012: staff is a pull-only cache locally, not outbox-synced
+
+**Decision**: `server/routes/staff.ts`'s CRUD (create/update/reset-PIN/
+deactivate/reactivate) writes directly to Supabase via the service-role
+client and returns `503 SUPABASE_UNAVAILABLE` when Supabase can't be
+reached — it does **not** fall back to writing local SQLite + queuing an
+outbox push, unlike every other synced table in this app. A new pull-only
+job (`server/sync/staffPull.ts`) refreshes local SQLite's `staff` table
+(including `pin_hash`, needed for the offline PIN-fallback path) from
+Supabase at server startup and every 5 minutes thereafter
+(`server/index.ts`) whenever Supabase is configured.
+
+**Rationale**: staff administration is inherently a connected, back-office
+operation — minting a new credential, resetting a PIN, or deactivating an
+account while offline and trusting it locally until a later sync would mean
+a stolen/compromised till could silently create or resurrect credentials
+with no live check against the tenant's real staff record. Every other
+table's push-then-reconcile model is fine because DL-007's conflict
+categories give a defined resolution; "trust an offline-created staff
+credential until it eventually syncs" has no safe resolution, so the right
+answer is "unavailable," not "queued."
+
+### DL-011 security review — decisions made, and what's explicitly deferred
+
+Reviewed against the security considerations flagged in the pre-implementation
+plan (see chat history for the full review); decisions made:
+
+- **PIN length vs. bcrypt cost**: accepted as an inherent trade-off of the
+  till PIN UX (see the pre-implementation review for the full reasoning) —
+  not "fixed," but bcrypt cost for newly-created/reset PINs is now **12**
+  (`server/routes/staff.ts`), up from the original local seed's cost 10; the
+  four migrated mock staff PINs were re-hashed at cost 12 during migration
+  (`supabase/seed.sql`) since plaintext was still available for mock data —
+  that option won't exist for any real staff PIN migrated later.
+- **Weak-PIN denylist**: added (`server/routes/staff.ts`'s `WEAK_PINS`/
+  `assertStrongPin`) — rejects the obvious sequential/repeated-digit
+  patterns at creation and reset time.
+- **Centralized brute-force lockout**: done — see DL-011 above.
+- **Local offline-cache exposure** (a lost/stolen terminal's SQLite file
+  exposes cached `pin_hash` values with no rate limiting): explicitly
+  **not mitigated** in this prompt. Real mitigation (encryption at rest)
+  needs Tauri's secure-storage APIs, which don't exist yet — the app still
+  runs as the plain-file Express+SQLite prototype (see the two prior Tauri
+  addenda above). Flagged again here rather than silently accepted a third
+  time: this is a real, currently-unmitigated risk on any till that syncs
+  staff data, not just a theoretical one.
+- **Service-role key handling**: `SUPABASE_SERVICE_ROLE_KEY` is read only in
+  `server/env.ts`/`server/lib/supabaseAdmin.ts`, never included in any HTTP
+  response, never logged. `.env.example` documents the required vars
+  (`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `TENANT_ID`) without real
+  values.
+- **PWA session TTL/revocation model**: genuinely deferred, not decided —
+  there is no PWA yet for it to apply to. Flagged as a decision the
+  Executive/Rider PWA prompt must make explicitly, not default silently.
+
 ### Open items (explicitly not decided here)
 
 - **Platform super-admin view scope**: referenced in DL-002 but deliberately

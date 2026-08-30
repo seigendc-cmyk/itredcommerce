@@ -28,6 +28,19 @@ supabase db push
 - The rest port every table from `server/db/migrations/001_init.sql` to
   Postgres with tenant scoping and RLS added, grouped the same way the
   original file's section banners group them.
+- `20260830150000_staff_pin_verification.sql` (Prompt 5) — the
+  `verify_staff_pin()` SECURITY DEFINER RPC that's now the one place a PIN
+  is ever compared, plus `failed_attempts`/`locked_until` (centralized
+  lockout) and `auth_user_id` (nullable, unpopulated — reserved for a
+  future PWA prompt) on `staff`, and an `access_token_hook()` function
+  ready to register once something populates `auth_user_id`. See the
+  governance doc's DL-011/DL-012 addendum.
+
+`seed.sql` (not a migration — see below) seeds one dev tenant
+(`TENANT-NYAMUTSAMBA`) and migrates the four `INITIAL_STAFF_MEMBERS` mock
+staff into it, PINs re-hashed at bcrypt cost 12. Apply it explicitly
+(`psql -f supabase/seed.sql` or `supabase db reset`, which runs it
+automatically after migrations) — `supabase db push` does not run it.
 
 ## Known omissions (deliberate, not oversights)
 
