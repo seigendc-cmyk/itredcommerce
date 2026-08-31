@@ -22,7 +22,10 @@ import {
   TrendingUp,
   UserPlus,
   Ban,
-  PlayCircle
+  PlayCircle,
+  FileCheck2,
+  AlertTriangle,
+  Zap
 } from 'lucide-react';
 import { StaffMember, ActiveView, StaffAccessRole } from '../../../types';
 import { INITIAL_STAFF_MEMBERS } from '../../../data/mockData';
@@ -33,14 +36,25 @@ import { Alert } from '../../ui/Alert';
 import { apiGet, apiPost, apiPatch } from '../../../api/client';
 import { BRANCH_TERMINAL_VIEWS } from '../../../utils/accessRoleGate';
 
+// Load-size tiers and ride types are the taxonomy confirmed in Prompt 7 —
+// the fare engine (Prompt 8) validates rate_config publishes against
+// exactly these keys.
+const FARE_LOAD_SIZE_TIERS = ['small', 'medium', 'large'] as const;
+const FARE_RIDE_TYPES = ['bicycle', 'motorbike', 'car', 'van'] as const;
+
 interface RateConfigVersion {
   id: string;
   version: number;
   currency: string;
   baseFee: number;
   perKmRate: number;
-  loadSizeSurchargeTiers: Array<{ label: string; maxWeightKg: number | null; surcharge: number }>;
+  useSeparateIntercityRate: boolean;
+  perKmRateIntercity: number | null;
+  loadSizeSurcharges: Record<string, number>;
   rideTypeMultipliers: Record<string, number>;
+  isMultiCurrency: boolean;
+  settlementCurrency: string | null;
+  exchangeRateToSettlement: number | null;
   effectiveDate: string;
   createdByStaffName?: string;
   createdAt: string;
@@ -120,9 +134,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [rateVersions, setRateVersions] = useState<RateConfigVersion[]>([]);
   const [isRatesLoading, setIsRatesLoading] = useState(false);
   const [isPublishFormOpen, setIsPublishFormOpen] = useState(false);
-  const [rateForm, setRateForm] = useState({
-    currency: 'USD', baseFee: '', perKmRate: '', effectiveDate: new Date().toISOString().slice(0, 10), notes: '',
+  const buildRateForm = (fromVersion?: RateConfigVersion) => ({
+    currency: fromVersion?.currency ?? 'USD',
+    baseFee: fromVersion ? String(fromVersion.baseFee) : '',
+    perKmRate: fromVersion ? String(fromVersion.perKmRate) : '',
+    useSeparateIntercityRate: fromVersion?.useSeparateIntercityRate ?? false,
+    perKmRateIntercity: fromVersion?.perKmRateIntercity != null ? String(fromVersion.perKmRateIntercity) : '',
+    loadSizeSurcharges: Object.fromEntries(
+      FARE_LOAD_SIZE_TIERS.map((tier) => [tier, String(fromVersion?.loadSizeSurcharges?.[tier] ?? 0)])
+    ) as Record<string, string>,
+    rideTypeMultipliers: Object.fromEntries(
+      FARE_RIDE_TYPES.map((type) => [type, String(fromVersion?.rideTypeMultipliers?.[type] ?? 1)])
+    ) as Record<string, string>,
+    isMultiCurrency: fromVersion?.isMultiCurrency ?? false,
+    settlementCurrency: fromVersion?.settlementCurrency ?? '',
+    exchangeRateToSettlement: fromVersion?.exchangeRateToSettlement != null ? String(fromVersion.exchangeRateToSettlement) : '',
+    effectiveDate: new Date().toISOString().slice(0, 10),
+    notes: '',
   });
+  const [rateForm, setRateForm] = useState(buildRateForm());
   const activeRateVersion = rateVersions[0];
 
   useEffect(() => {
@@ -134,6 +164,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       .finally(() => setIsRatesLoading(false));
   }, [activeTab]);
 
+  const handleOpenPublishForm = () => {
+    setRateForm(buildRateForm(activeRateVersion));
+    setIsPublishFormOpen(true);
+  };
+
   const handlePublishRate = async () => {
     const baseFee = parseFloat(rateForm.baseFee);
     const perKmRate = parseFloat(rateForm.perKmRate);
@@ -141,13 +176,56 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setAlertNotice('Base fee and per-km rate must be non-negative numbers.');
       return;
     }
+    const loadSizeSurcharges: Record<string, number> = {};
+    for (const tier of FARE_LOAD_SIZE_TIERS) {
+      const v = parseFloat(rateForm.loadSizeSurcharges[tier]);
+      if (Number.isNaN(v) || v < 0) {
+        setAlertNotice(`Load-size surcharge for "${tier}" must be a non-negative number.`);
+        return;
+      }
+      loadSizeSurcharges[tier] = v;
+    }
+    const rideTypeMultipliers: Record<string, number> = {};
+    for (const type of FARE_RIDE_TYPES) {
+      const v = parseFloat(rateForm.rideTypeMultipliers[type]);
+      if (Number.isNaN(v) || v < 0) {
+        setAlertNotice(`Ride-type multiplier for "${type}" must be a non-negative number.`);
+        return;
+      }
+      rideTypeMultipliers[type] = v;
+    }
+    let perKmRateIntercity: number | undefined;
+    if (rateForm.useSeparateIntercityRate) {
+      perKmRateIntercity = parseFloat(rateForm.perKmRateIntercity);
+      if (Number.isNaN(perKmRateIntercity) || perKmRateIntercity < 0) {
+        setAlertNotice('Intercity per-km rate must be a non-negative number when the separate rate is enabled.');
+        return;
+      }
+    }
+    let exchangeRateToSettlement: number | undefined;
+    if (rateForm.isMultiCurrency) {
+      if (!rateForm.settlementCurrency.trim()) {
+        setAlertNotice('Settlement currency is required when multi-currency is enabled.');
+        return;
+      }
+      exchangeRateToSettlement = parseFloat(rateForm.exchangeRateToSettlement);
+      if (Number.isNaN(exchangeRateToSettlement) || exchangeRateToSettlement <= 0) {
+        setAlertNotice('Exchange rate to settlement currency must be a positive number when multi-currency is enabled.');
+        return;
+      }
+    }
     try {
       const published = await apiPost<RateConfigVersion>('/rate-config', {
         currency: rateForm.currency,
         baseFee,
         perKmRate,
-        loadSizeSurchargeTiers: activeRateVersion?.loadSizeSurchargeTiers ?? [],
-        rideTypeMultipliers: activeRateVersion?.rideTypeMultipliers ?? {},
+        useSeparateIntercityRate: rateForm.useSeparateIntercityRate,
+        perKmRateIntercity,
+        loadSizeSurcharges,
+        rideTypeMultipliers,
+        isMultiCurrency: rateForm.isMultiCurrency,
+        settlementCurrency: rateForm.isMultiCurrency ? rateForm.settlementCurrency.trim() : undefined,
+        exchangeRateToSettlement,
         effectiveDate: rateForm.effectiveDate,
         notes: rateForm.notes || undefined,
       });
@@ -156,6 +234,142 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setAlertNotice(`Rate version ${published.version} published.`);
     } catch (err: any) {
       setAlertNotice(err?.message || 'Failed to publish rate version.');
+    }
+  };
+
+  // Fiscalization (Prompt 11 — real backend, GET/POST /fiscalization/*,
+  // GET /branches). Each tenant owns/manages its own fiscal-authority
+  // credentials — this section never exposes a saved credential value
+  // back to the browser, only whether one is configured.
+  interface FiscalBranchOption { id: string; code?: string; name: string; city?: string; status: string; }
+  interface FiscalCredentialFieldDef { key: string; label: string; type: 'text' | 'password'; placeholder?: string; required: boolean; helpText?: string; }
+  interface FiscalProviderDescriptor {
+    providerKey: string; countryCode: string; displayName: string; integrationPath: string;
+    submissionMode: 'PER_TRANSACTION' | 'BATCH_ADAPTER'; credentialFields: FiscalCredentialFieldDef[]; sandboxNote?: string;
+  }
+  interface FiscalRegistration {
+    id: string; branchId: string; country: string; providerKey: string; integrationPath: string;
+    status: 'NOT_CONFIGURED' | 'TEST' | 'ACTIVE' | 'SUSPENDED'; fiscalDayStatus: string; fiscalDayNumber: number;
+    hasCredentials: boolean; credentialsUpdatedAt: string | null; updatedAt: string | null;
+  }
+  interface FiscalSubmission {
+    id: string; saleNumber: string; submissionMode: string; status: string; invoiceSequenceNumber: number | null;
+    fiscalReferenceNumber: string | null; attemptCount: number; nonRetryable: boolean; errorMessage: string | null; createdAt: string;
+  }
+  interface FiscalSubmissionsSummary { pendingCount: number; failedCount: number; oldestPendingAgeMinutes: number; alert: boolean; }
+
+  const [fiscalBranches, setFiscalBranches] = useState<FiscalBranchOption[]>([]);
+  const [fiscalTenantCountry, setFiscalTenantCountry] = useState<string | null>(null);
+  const [selectedFiscalBranchId, setSelectedFiscalBranchId] = useState<string>('');
+  const [fiscalProviders, setFiscalProviders] = useState<FiscalProviderDescriptor[]>([]);
+  const [selectedProviderKey, setSelectedProviderKey] = useState<string>('');
+  const [fiscalRegistration, setFiscalRegistration] = useState<FiscalRegistration | null>(null);
+  const [fiscalCredentialsForm, setFiscalCredentialsForm] = useState<Record<string, string>>({});
+  const [fiscalSubmissions, setFiscalSubmissions] = useState<FiscalSubmission[]>([]);
+  const [fiscalSummary, setFiscalSummary] = useState<FiscalSubmissionsSummary | null>(null);
+  const [isFiscalLoading, setIsFiscalLoading] = useState(false);
+  const [isFiscalSaving, setIsFiscalSaving] = useState(false);
+  const [isFiscalTesting, setIsFiscalTesting] = useState(false);
+  const [fiscalTestResult, setFiscalTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+
+  const selectedFiscalProvider = fiscalProviders.find((p) => p.providerKey === selectedProviderKey);
+
+  // Branches + tenant country load once, when the tab is first opened.
+  useEffect(() => {
+    if (activeTab !== 'fiscalization') return;
+    apiGet<FiscalBranchOption[]>('/branches')
+      .then((rows) => {
+        setFiscalBranches(rows);
+        setSelectedFiscalBranchId((prev) => prev || rows[0]?.id || '');
+      })
+      .catch((err) => console.error('Failed to load branches', err));
+    apiGet<{ country: string }>('/fiscalization/tenant-country')
+      .then((r) => setFiscalTenantCountry(r.country))
+      .catch((err) => console.error('Failed to load tenant country', err));
+  }, [activeTab]);
+
+  // Providers offered are driven entirely by tenant.country (Prompt 11
+  // requirement 7) — never a free-text/arbitrary country picker.
+  useEffect(() => {
+    if (activeTab !== 'fiscalization' || !fiscalTenantCountry) return;
+    apiGet<FiscalProviderDescriptor[]>(`/fiscalization/providers?country=${encodeURIComponent(fiscalTenantCountry)}`)
+      .then(setFiscalProviders)
+      .catch((err) => console.error('Failed to load fiscalization providers', err));
+  }, [activeTab, fiscalTenantCountry]);
+
+  const loadFiscalRegistrationAndSubmissions = (branchId: string) => {
+    if (!branchId) return;
+    setIsFiscalLoading(true);
+    setFiscalTestResult(null);
+    Promise.all([
+      apiGet<FiscalRegistration | null>(`/fiscalization/registration/${encodeURIComponent(branchId)}`),
+      apiGet<{ submissions: FiscalSubmission[]; summary: FiscalSubmissionsSummary }>(`/fiscalization/submissions?branchId=${encodeURIComponent(branchId)}`),
+    ])
+      .then(([registration, subs]) => {
+        setFiscalRegistration(registration);
+        setSelectedProviderKey(registration?.providerKey || '');
+        setFiscalCredentialsForm({});
+        setFiscalSubmissions(subs.submissions);
+        setFiscalSummary(subs.summary);
+      })
+      .catch((err) => console.error('Failed to load fiscal registration/submissions', err))
+      .finally(() => setIsFiscalLoading(false));
+  };
+
+  useEffect(() => {
+    if (activeTab !== 'fiscalization' || !selectedFiscalBranchId) return;
+    loadFiscalRegistrationAndSubmissions(selectedFiscalBranchId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, selectedFiscalBranchId]);
+
+  const handleSaveFiscalCredentials = async () => {
+    if (!selectedFiscalBranchId || !selectedProviderKey) {
+      setAlertNotice('Select a branch and a fiscalization provider first.');
+      return;
+    }
+    setIsFiscalSaving(true);
+    try {
+      const saved = await apiPost<FiscalRegistration>(`/fiscalization/registration/${encodeURIComponent(selectedFiscalBranchId)}`, {
+        providerKey: selectedProviderKey,
+        integrationPath: selectedFiscalProvider?.integrationPath,
+        credentials: fiscalCredentialsForm,
+      });
+      setFiscalRegistration(saved);
+      setFiscalCredentialsForm({});
+      setAlertNotice('Fiscal credentials saved (status: TEST — run a connection test to activate).');
+    } catch (err: any) {
+      setAlertNotice(err?.message || 'Failed to save fiscal credentials.');
+    } finally {
+      setIsFiscalSaving(false);
+    }
+  };
+
+  const handleTestFiscalConnection = async () => {
+    if (!selectedFiscalBranchId) return;
+    setIsFiscalTesting(true);
+    setFiscalTestResult(null);
+    try {
+      const hasUnsavedInput = Object.values(fiscalCredentialsForm).some((v) => v?.trim());
+      const result = await apiPost<{ ok: boolean; message: string }>(`/fiscalization/registration/${encodeURIComponent(selectedFiscalBranchId)}/test-connection`, {
+        credentials: hasUnsavedInput ? fiscalCredentialsForm : undefined,
+        providerKey: selectedProviderKey,
+      });
+      setFiscalTestResult(result);
+      if (result.ok) loadFiscalRegistrationAndSubmissions(selectedFiscalBranchId);
+    } catch (err: any) {
+      setFiscalTestResult({ ok: false, message: err?.message || 'Connection test failed.' });
+    } finally {
+      setIsFiscalTesting(false);
+    }
+  };
+
+  const handleRetryFiscalSubmission = async (id: string) => {
+    try {
+      await apiPost(`/fiscalization/submissions/${encodeURIComponent(id)}/retry`);
+      setAlertNotice('Retry requested.');
+      loadFiscalRegistrationAndSubmissions(selectedFiscalBranchId);
+    } catch (err: any) {
+      setAlertNotice(err?.message || 'Failed to retry submission.');
     }
   };
 
@@ -241,6 +455,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             { id: 'devices', label: 'Hardware Devices & POS', icon: <Printer className="w-3.5 h-3.5" /> },
             { id: 'tax', label: 'Tax & Fiscalization', icon: <Percent className="w-3.5 h-3.5" /> },
             { id: 'rates', label: 'Fare & Rate Configuration', icon: <TrendingUp className="w-3.5 h-3.5" /> },
+            { id: 'fiscalization', label: 'Fiscalization', icon: <FileCheck2 className="w-3.5 h-3.5" /> },
             { id: 'branches', label: 'Branches & Terminals', icon: <Building2 className="w-3.5 h-3.5" /> },
             { id: 'connected_shops', label: 'Connect Other Shops', icon: <Database className="w-3.5 h-3.5" /> },
             { id: 'backup', label: 'Backup & Restore', icon: <HardDrive className="w-3.5 h-3.5" /> },
@@ -565,12 +780,31 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     </div>
                   </div>
 
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 font-mono">
+                    <div>
+                      <div className="text-[10px] text-slate-400 uppercase">Local Per-KM Override</div>
+                      <div className="font-bold text-slate-800">
+                        {activeRateVersion.useSeparateIntercityRate && activeRateVersion.perKmRateIntercity != null
+                          ? `${activeRateVersion.currency} ${activeRateVersion.perKmRateIntercity.toFixed(2)}/km (intercity)`
+                          : 'Disabled — one rate applies to all routes'}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-slate-400 uppercase">Multi-Currency Settlement</div>
+                      <div className="font-bold text-slate-800">
+                        {activeRateVersion.isMultiCurrency && activeRateVersion.settlementCurrency
+                          ? `${activeRateVersion.currency} → ${activeRateVersion.settlementCurrency} @ ${activeRateVersion.exchangeRateToSettlement}`
+                          : 'Disabled — fare stored in ' + activeRateVersion.currency}
+                      </div>
+                    </div>
+                  </div>
+
                   <div>
-                    <div className="text-[10px] text-slate-400 uppercase mb-1">Load-Size Surcharge Tiers</div>
+                    <div className="text-[10px] text-slate-400 uppercase mb-1">Load-Size Surcharges</div>
                     <div className="flex flex-wrap gap-2 font-mono">
-                      {activeRateVersion.loadSizeSurchargeTiers.map((tier, i) => (
-                        <span key={i} className="px-2 py-1 bg-white border border-slate-300">
-                          {tier.label} (≤{tier.maxWeightKg ?? '∞'}kg): +{activeRateVersion.currency} {tier.surcharge.toFixed(2)}
+                      {FARE_LOAD_SIZE_TIERS.map((tier) => (
+                        <span key={tier} className="px-2 py-1 bg-white border border-slate-300 capitalize">
+                          {tier}: +{activeRateVersion.currency} {(activeRateVersion.loadSizeSurcharges[tier] ?? 0).toFixed(2)}
                         </span>
                       ))}
                     </div>
@@ -578,31 +812,105 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <div>
                     <div className="text-[10px] text-slate-400 uppercase mb-1">Ride-Type Multipliers</div>
                     <div className="flex flex-wrap gap-2 font-mono">
-                      {Object.entries(activeRateVersion.rideTypeMultipliers).map(([type, mult]) => (
-                        <span key={type} className="px-2 py-1 bg-white border border-slate-300">{type}: ×{mult}</span>
+                      {FARE_RIDE_TYPES.map((type) => (
+                        <span key={type} className="px-2 py-1 bg-white border border-slate-300 capitalize">{type}: ×{activeRateVersion.rideTypeMultipliers[type] ?? 1}</span>
                       ))}
                     </div>
                   </div>
                 </div>
               )}
 
-              <Button variant="primary" size="sm" onClick={() => setIsPublishFormOpen((v) => !v)}>
-                Publish New Rate Version
+              <Button variant="primary" size="sm" onClick={() => (isPublishFormOpen ? setIsPublishFormOpen(false) : handleOpenPublishForm())}>
+                {isPublishFormOpen ? 'Cancel' : 'Publish New Rate Version'}
               </Button>
 
               {isPublishFormOpen && (
-                <div className="bg-slate-50 p-3 border border-slate-300 space-y-3">
+                <div className="bg-slate-50 p-3 border border-slate-300 space-y-4">
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                    <Input label="Base Fee" isMono value={rateForm.baseFee} onChange={(e) => setRateForm((f) => ({ ...f, baseFee: e.target.value }))} placeholder={activeRateVersion ? String(activeRateVersion.baseFee) : '0.00'} />
-                    <Input label="Per-KM Rate" isMono value={rateForm.perKmRate} onChange={(e) => setRateForm((f) => ({ ...f, perKmRate: e.target.value }))} placeholder={activeRateVersion ? String(activeRateVersion.perKmRate) : '0.00'} />
+                    <Input label="Base Fee" isMono value={rateForm.baseFee} onChange={(e) => setRateForm((f) => ({ ...f, baseFee: e.target.value }))} />
+                    <Input label="Per-KM Rate" isMono value={rateForm.perKmRate} onChange={(e) => setRateForm((f) => ({ ...f, perKmRate: e.target.value }))} />
                     <Input label="Effective Date" type="date" value={rateForm.effectiveDate} onChange={(e) => setRateForm((f) => ({ ...f, effectiveDate: e.target.value }))} />
                     <Input label="Currency" isMono value={rateForm.currency} onChange={(e) => setRateForm((f) => ({ ...f, currency: e.target.value }))} />
                   </div>
+
+                  <div className="space-y-1.5">
+                    <label className="flex items-center gap-2 font-bold text-slate-700 uppercase text-[11px] cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={rateForm.useSeparateIntercityRate}
+                        onChange={(e) => setRateForm((f) => ({ ...f, useSeparateIntercityRate: e.target.checked }))}
+                      />
+                      Use a separate per-km rate for intercity routes
+                    </label>
+                    {rateForm.useSeparateIntercityRate && (
+                      <Input
+                        label="Intercity Per-KM Rate"
+                        isMono
+                        value={rateForm.perKmRateIntercity}
+                        onChange={(e) => setRateForm((f) => ({ ...f, perKmRateIntercity: e.target.value }))}
+                      />
+                    )}
+                  </div>
+
+                  <div>
+                    <div className="text-[10px] font-bold text-slate-500 uppercase mb-1.5">Load-Size Surcharges (flat amount, {rateForm.currency})</div>
+                    <div className="grid grid-cols-3 gap-3">
+                      {FARE_LOAD_SIZE_TIERS.map((tier) => (
+                        <Input
+                          key={tier}
+                          label={tier}
+                          isMono
+                          value={rateForm.loadSizeSurcharges[tier]}
+                          onChange={(e) => setRateForm((f) => ({ ...f, loadSizeSurcharges: { ...f.loadSizeSurcharges, [tier]: e.target.value } }))}
+                        />
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-[10px] font-bold text-slate-500 uppercase mb-1.5">Ride-Type Multipliers</div>
+                    <div className="grid grid-cols-4 gap-3">
+                      {FARE_RIDE_TYPES.map((type) => (
+                        <Input
+                          key={type}
+                          label={type}
+                          isMono
+                          value={rateForm.rideTypeMultipliers[type]}
+                          onChange={(e) => setRateForm((f) => ({ ...f, rideTypeMultipliers: { ...f.rideTypeMultipliers, [type]: e.target.value } }))}
+                        />
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="flex items-center gap-2 font-bold text-slate-700 uppercase text-[11px] cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={rateForm.isMultiCurrency}
+                        onChange={(e) => setRateForm((f) => ({ ...f, isMultiCurrency: e.target.checked }))}
+                      />
+                      Convert to a different settlement currency
+                    </label>
+                    {rateForm.isMultiCurrency && (
+                      <div className="grid grid-cols-2 gap-3">
+                        <Input
+                          label="Settlement Currency"
+                          isMono
+                          value={rateForm.settlementCurrency}
+                          onChange={(e) => setRateForm((f) => ({ ...f, settlementCurrency: e.target.value }))}
+                        />
+                        <Input
+                          label={`Exchange Rate (1 ${rateForm.currency} = ? settlement)`}
+                          isMono
+                          value={rateForm.exchangeRateToSettlement}
+                          onChange={(e) => setRateForm((f) => ({ ...f, exchangeRateToSettlement: e.target.value }))}
+                        />
+                      </div>
+                    )}
+                  </div>
+
                   <Input label="Notes" value={rateForm.notes} onChange={(e) => setRateForm((f) => ({ ...f, notes: e.target.value }))} />
-                  <p className="text-slate-500">
-                    Load-size surcharge tiers and ride-type multipliers carry forward unchanged from the current version — editing
-                    them individually isn't wired up yet; publish still bumps the version and locks in this snapshot.
-                  </p>
+
                   <Button variant="primary" size="sm" onClick={handlePublishRate}>Publish</Button>
                 </div>
               )}
@@ -616,6 +924,212 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       <span className="text-slate-600">{v.currency} {v.baseFee.toFixed(2)} base + {v.perKmRate.toFixed(2)}/km</span>
                       <span className="text-slate-500">{v.effectiveDate}</span>
                       <span className="text-slate-500">{v.createdByStaffName || '—'}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB: FISCALIZATION (Prompt 11) */}
+          {activeTab === 'fiscalization' && (
+            <div className="space-y-4 text-xs">
+              <div className="pb-3 border-b border-slate-200">
+                <h3 className="font-bold text-sm uppercase text-slate-900">Fiscal Authority Integration</h3>
+                <p className="text-slate-500">
+                  Your business owns and manages its own fiscal-authority credentials — there is no centralized,
+                  platform-held credential store, and iTred never submits on your behalf. Credentials are encrypted
+                  at rest and never displayed once saved.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="text-[11px] font-bold uppercase tracking-wider text-slate-700">Branch</label>
+                  <select
+                    value={selectedFiscalBranchId}
+                    onChange={(e) => setSelectedFiscalBranchId(e.target.value)}
+                    className="w-full h-9 px-3 text-xs bg-white border border-slate-300 rounded focus:border-orange-500 focus:outline-none"
+                  >
+                    {fiscalBranches.length === 0 && <option value="">No branches found</option>}
+                    {fiscalBranches.map((b) => (
+                      <option key={b.id} value={b.id}>{b.name}{b.city ? ` — ${b.city}` : ''}</option>
+                    ))}
+                  </select>
+                  <p className="text-[10px] text-slate-400">
+                    Fiscal registration is shared by every terminal at this branch — not per-terminal.
+                  </p>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[11px] font-bold uppercase tracking-wider text-slate-700">Country</label>
+                  <div className="h-9 px-3 flex items-center bg-slate-50 border border-slate-200 rounded text-slate-700 font-mono">
+                    {fiscalTenantCountry ?? '—'}
+                  </div>
+                  <p className="text-[10px] text-slate-400">Set at tenant level — determines which providers are offered below.</p>
+                </div>
+              </div>
+
+              {isFiscalLoading && <div className="text-slate-500">Loading fiscal registration…</div>}
+
+              {!isFiscalLoading && fiscalRegistration && (
+                <div className="bg-[#FAF8F5] border border-slate-300 p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-slate-900 uppercase">Current Registration</span>
+                    <StatusBadge status={fiscalRegistration.status} size="sm" />
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 font-mono">
+                    <div>
+                      <div className="text-[10px] text-slate-400 uppercase">Provider</div>
+                      <div className="font-bold text-slate-800">{fiscalRegistration.providerKey}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-slate-400 uppercase">Integration Path</div>
+                      <div className="font-bold text-slate-800">{fiscalRegistration.integrationPath}</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-slate-400 uppercase">Credentials</div>
+                      <div className={`font-bold ${fiscalRegistration.hasCredentials ? 'text-emerald-700' : 'text-amber-600'}`}>
+                        {fiscalRegistration.hasCredentials ? 'Configured' : 'Not configured'}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {!isFiscalLoading && fiscalProviders.length === 0 && fiscalTenantCountry && (
+                <Alert type="warning" size="sm">
+                  No fiscalization provider is available for country "{fiscalTenantCountry}" yet.
+                </Alert>
+              )}
+
+              {!isFiscalLoading && fiscalProviders.length > 0 && (
+                <div className="bg-slate-50 p-3 border border-slate-300 space-y-4">
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-bold uppercase tracking-wider text-slate-700">Provider / Integration Path</label>
+                    <select
+                      value={selectedProviderKey}
+                      onChange={(e) => { setSelectedProviderKey(e.target.value); setFiscalCredentialsForm({}); setFiscalTestResult(null); }}
+                      className="w-full h-9 px-3 text-xs bg-white border border-slate-300 rounded focus:border-orange-500 focus:outline-none"
+                    >
+                      <option value="">Select a provider…</option>
+                      {fiscalProviders.map((p) => (
+                        <option key={p.providerKey} value={p.providerKey}>{p.displayName}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {selectedFiscalProvider?.sandboxNote && (
+                    <div className="p-2.5 bg-blue-50 border border-blue-200 text-blue-900 leading-relaxed flex items-start gap-2">
+                      <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                      <span>{selectedFiscalProvider.sandboxNote}</span>
+                    </div>
+                  )}
+
+                  {selectedFiscalProvider && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {selectedFiscalProvider.credentialFields.map((field) => (
+                        <div key={field.key} className="space-y-1">
+                          <Input
+                            label={field.label}
+                            type={field.type === 'password' ? 'password' : 'text'}
+                            placeholder={fiscalRegistration?.hasCredentials ? '•••••••• (unchanged — enter a new value to replace)' : field.placeholder}
+                            value={fiscalCredentialsForm[field.key] ?? ''}
+                            onChange={(e) => setFiscalCredentialsForm((f) => ({ ...f, [field.key]: e.target.value }))}
+                            isMono
+                          />
+                          {field.helpText && <p className="text-[10px] text-slate-400">{field.helpText}</p>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {fiscalTestResult && (
+                    <Alert type={fiscalTestResult.ok ? 'success' : 'error'} size="sm">
+                      {fiscalTestResult.message}
+                    </Alert>
+                  )}
+
+                  <div className="flex items-center gap-2 pt-1">
+                    <Button variant="primary" size="sm" onClick={handleSaveFiscalCredentials} isLoading={isFiscalSaving} disabled={!selectedProviderKey}>
+                      Save Credentials
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleTestFiscalConnection}
+                      isLoading={isFiscalTesting}
+                      disabled={!selectedProviderKey || (!fiscalRegistration?.hasCredentials && !Object.values(fiscalCredentialsForm).some((v) => v?.trim()))}
+                      leftIcon={<Zap className="w-3.5 h-3.5" />}
+                    >
+                      Test Connection & Activate
+                    </Button>
+                  </div>
+                  <p className="text-[10px] text-slate-400">
+                    Saving credentials always sets status to TEST — a passing connection test against the sandbox is required before this registration is ACTIVE and starts submitting real sales.
+                  </p>
+                </div>
+              )}
+
+              <div className="pt-2">
+                <div className="flex items-center justify-between pb-2 border-b border-slate-200">
+                  <h3 className="font-bold text-sm uppercase text-slate-900 flex items-center gap-2">
+                    <FileCheck2 className="w-4 h-4 text-orange-500" />
+                    Submission Status
+                  </h3>
+                  {fiscalSummary && (
+                    <div className="flex items-center gap-2 font-mono">
+                      <span className={`inline-flex items-center px-1.5 py-0.5 text-[10px] font-bold uppercase border ${fiscalSummary.failedCount > 0 ? 'bg-rose-50 text-rose-800 border-rose-300' : 'bg-slate-100 text-slate-600 border-slate-300'}`}>
+                        {fiscalSummary.failedCount} Failed
+                      </span>
+                      <span className="inline-flex items-center px-1.5 py-0.5 text-[10px] font-bold uppercase border bg-orange-50 text-[#FF6B00] border-orange-200">
+                        {fiscalSummary.pendingCount} Pending
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                {fiscalSummary?.alert && (
+                  <Alert type="warning" size="sm">
+                    {fiscalSummary.pendingCount} submission(s) pending
+                    {fiscalSummary.oldestPendingAgeMinutes > 0 ? `, oldest ${fiscalSummary.oldestPendingAgeMinutes} minute(s) ago` : ''}. Check
+                    connectivity and provider status.
+                  </Alert>
+                )}
+
+                <div className="border border-slate-300 divide-y divide-slate-200 font-mono mt-2 max-h-72 overflow-y-auto">
+                  {fiscalSubmissions.length === 0 && <div className="p-3 text-slate-400 text-center">No submissions recorded yet for this branch.</div>}
+                  {fiscalSubmissions.map((s) => (
+                    <div key={s.id} className="p-2.5 flex flex-wrap items-center justify-between gap-2 bg-white">
+                      <div>
+                        <div className="font-bold text-slate-800">{s.saleNumber}</div>
+                        <div className="text-[10px] text-slate-500">{s.createdAt}</div>
+                      </div>
+                      <span
+                        className={`inline-flex items-center px-1.5 py-0.5 text-[10px] font-bold uppercase border ${
+                          s.status === 'SUBMITTED' || s.status === 'QUEUED_FOR_BATCH'
+                            ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                            : s.nonRetryable
+                            ? 'bg-rose-50 text-rose-800 border-rose-300'
+                            : 'bg-orange-50 text-[#FF6B00] border-orange-200'
+                        }`}
+                      >
+                        {s.nonRetryable ? 'FAILED' : s.status}
+                      </span>
+                      <div className="text-slate-600">
+                        {s.fiscalReferenceNumber ? `Ref: ${s.fiscalReferenceNumber}` : s.invoiceSequenceNumber != null ? `Seq #${s.invoiceSequenceNumber}` : '—'}
+                      </div>
+                      {s.errorMessage && (
+                        <div className="text-[10px] text-rose-600 basis-full flex items-start gap-1">
+                          <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+                          <span className="break-all">{s.errorMessage}</span>
+                        </div>
+                      )}
+                      {(s.status === 'FAILED' || s.nonRetryable) && (
+                        <Button size="sm" variant="outline" onClick={() => handleRetryFiscalSubmission(s.id)} leftIcon={<RefreshCw className="w-3 h-3" />}>
+                          Retry
+                        </Button>
+                      )}
                     </div>
                   ))}
                 </div>

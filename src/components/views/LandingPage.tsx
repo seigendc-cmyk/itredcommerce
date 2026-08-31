@@ -256,6 +256,13 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                 onClick={() => onNavigate('SALES_RETURN')}
               />
               <CTATile
+                id="cta-delivery-dispatch"
+                title="Delivery Dispatch"
+                description="Send a completed sale out for delivery"
+                icon={<Truck className="w-4 h-4" />}
+                onClick={() => onNavigate('DELIVERY_DISPATCH')}
+              />
+              <CTATile
                 id="cta-customers"
                 title="Customers"
                 description="Directory & credit balances"

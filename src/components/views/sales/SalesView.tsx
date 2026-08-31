@@ -78,6 +78,8 @@ export interface SalesViewProps {
   onNavigateToHeldSales?: () => void;
   onNavigateToHeldReceipts?: () => void;
   onNavigateToLayaway?: () => void;
+  /** Prompt 7: jumps to Delivery Dispatch with this sale pre-filled, once it's completed and its receipt is showing. */
+  onNavigateToDeliveryDispatch?: (saleNumber: string) => void;
   onRecordCompletedSale?: (sale: SaleTransaction) => void;
   onRecordHeldSale?: (heldSale: HeldSale) => void;
   onParkCart?: (parked: HeldReceipt) => void;
@@ -100,6 +102,7 @@ export const SalesView: React.FC<SalesViewProps> = ({
   onNavigateToHeldSales,
   onNavigateToHeldReceipts,
   onNavigateToLayaway,
+  onNavigateToDeliveryDispatch,
   onRecordCompletedSale,
   onRecordHeldSale,
   onParkCart,
@@ -1090,6 +1093,11 @@ export const SalesView: React.FC<SalesViewProps> = ({
         }}
         sale={completedSaleData}
         currentStaff={currentStaff}
+        onCreateDelivery={
+          onNavigateToDeliveryDispatch && completedSaleData
+            ? () => onNavigateToDeliveryDispatch(completedSaleData.saleNumber)
+            : undefined
+        }
       />
     </div>
   );

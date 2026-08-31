@@ -1,0 +1,29 @@
+{
+  "name": "itred-rider-pwa",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "iTred Commerce Rider PWA — always-online delivery broadcast board and confirmation flow, Supabase-only (DL-002).",
+  "scripts": {
+    "dev": "vite --port=3200 --host=0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.112.4",
+    "@tailwindcss/vite": "^4.1.14",
+    "lucide-react": "^0.546.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "tailwindcss": "^4.1.14"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^5.0.4",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.3",
+    "vite-plugin-pwa": "^0.21.1"
+  }
+}

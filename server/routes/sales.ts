@@ -4,6 +4,7 @@ import { asyncHandler, ApiError } from '../lib/http';
 import { requireAuth } from '../middleware/auth';
 import { generateId, nowIso } from '../lib/ids';
 import { applyBatchWithOutbox, type BatchEntry } from '../sync/outboxWriter';
+import { queueSaleForFiscalization } from '../lib/fiscalization/fiscalSubmissionService';
 
 const router = Router();
 router.use(requireAuth);
@@ -366,6 +367,29 @@ router.post(
       }
       throw err;
     }
+
+    // Prompt 11: never blocks or can fail the sale response — a
+    // fiscalization problem is a compliance/audit concern, not a reason to
+    // reject a completed sale. No-ops entirely if this branch has no
+    // ACTIVE fiscal registration.
+    queueSaleForFiscalization({
+      saleId: sale.saleId,
+      saleNumber: sale.saleNumber,
+      branchId: shiftRow.branch_id,
+      dateTime,
+      items: sale.items.map((item) => ({
+        description: item.itemName ?? item.sku,
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        taxRate: item.taxRate ?? 0,
+        taxAmount: item.taxAmount ?? 0,
+        lineTotal: item.lineTotal,
+      })),
+      subtotal: sale.subtotal,
+      taxTotal: sale.taxTotal,
+      grandTotal: sale.grandTotal,
+      customerName: sale.customerName,
+    });
 
     res.status(201).json({ sale: loadSale(sale.saleId), alreadyProcessed: false });
   })

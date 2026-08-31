@@ -54,6 +54,7 @@ export type ActiveView =
   | 'SALES_CREDIT'
   | 'SALES_RETURN'
   | 'SALES_HISTORY'
+  | 'DELIVERY_DISPATCH'
   | 'HELD_SALES'
   | 'HELD_RECEIPTS'
   | 'LAYAWAY'
@@ -276,6 +277,14 @@ export interface Branch {
   terminals?: Terminal[];
   staffIds?: string[];
   notes?: string;
+  // Geocoded pickup coordinates (Prompt 7, delivery subsystem). Not yet a
+  // persisted backend concept — branches have no CRUD API/table rows today
+  // (see ITRED_GOVERNANCE_AND_ARCHITECTURE.md's "Second Tauri flag" note) —
+  // so these travel with the client-side Branch record and are captured
+  // into delivery_orders at dispatch time, same as branchName already is on
+  // sales_transactions rows.
+  latitude?: number;
+  longitude?: number;
 }
 
 export interface LocationStock {
@@ -745,6 +754,87 @@ export interface CreditNote {
   refundMethod: 'CASH' | 'CUSTOMER_CREDIT' | 'ORIGINAL_METHOD';
   reasonCategory: 'DEFECTIVE' | 'WRONG_ITEM' | 'CUSTOMER_RETURN' | 'PRICE_ADJUSTMENT';
   status: 'ISSUED' | 'APPLIED' | 'CANCELLED';
+}
+
+// --------------------------------------------------------------------
+// DELIVERY SUBSYSTEM (Prompt 7 — dispatch-side data model & creation flow
+// only; fare formula is Prompt 8, rider board is Prompt 9). See
+// ITRED_GOVERNANCE_AND_ARCHITECTURE.md's delivery subsystem addendum.
+// --------------------------------------------------------------------
+
+// Business decisions confirmed for this prompt (not invented unilaterally,
+// per the governance doc's "do not implement without sign-off" rule):
+// local/intercity boundary is 10km; confirmation codes are 6-character
+// alphanumeric; load-size tiers are Small/Medium/Large; ride types are
+// Bicycle/Motorbike/Car/Van.
+export type DeliveryOrderStatus =
+  | 'posted'
+  | 'accepted'
+  | 'in_transit'
+  | 'delivered'
+  | 'failed'
+  | 'under_investigation'
+  | 'cancelled';
+
+export type DeliveryRouteClass = 'local' | 'intercity';
+export type DeliveryLoadSizeTier = 'small' | 'medium' | 'large';
+export type DeliveryRideType = 'bicycle' | 'motorbike' | 'car' | 'van';
+export type RiderStatus = 'ACTIVE' | 'OFF_DUTY' | 'SUSPENDED';
+
+export interface DeliveryOrder {
+  id: string;
+  tenantId?: string;
+  saleId: string;
+  saleNumber: string;
+  pickupBranchId: string;
+  pickupBranchName?: string;
+  deliveryAddressLine: string;
+  deliveryCity?: string;
+  deliveryLandmark?: string;
+  deliveryLatitude: number;
+  deliveryLongitude: number;
+  deliveryContactName?: string;
+  deliveryContactPhone?: string;
+  loadSizeTier: DeliveryLoadSizeTier;
+  rideTypeRequirement: DeliveryRideType;
+  distanceKm: number;
+  routeClass: DeliveryRouteClass;
+  // Computed by the fare engine (Prompt 8) at creation time from the then-
+  // active rate_config version, which fareRateConfigVersion locks in — a
+  // later rate change never retroactively alters an existing dispatch.
+  // Stays null only if no rate_config has been published yet.
+  fareAmount: number | null;
+  fareCurrency: string | null;
+  fareRateConfigVersion: number | null;
+  status: DeliveryOrderStatus;
+  confirmationCode: string;
+  confirmationCodeExpiresAt: string;
+  confirmationCodeAttemptCount: number;
+  riderId?: string | null;
+  createdByStaffId?: string;
+  createdByStaffName?: string;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+// Riders are the business's own employed/contracted riders, not a
+// third-party marketplace — tenant-scoped, one rider per underlying staff
+// record with the RIDER access role.
+export interface Rider {
+  id: string;
+  tenantId?: string;
+  staffId: string;
+  name?: string;
+  vehicleType: DeliveryRideType;
+  phone?: string;
+  status: RiderStatus;
+  homeBranchId?: string;
+  // Self-managed via the Rider PWA (Prompt 9) — a single live value, not a
+  // tracked history.
+  currentLatitude?: number | null;
+  currentLongitude?: number | null;
+  locationUpdatedAt?: string | null;
+  isAvailable?: boolean;
 }
 
 export interface MenuItem {

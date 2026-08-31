@@ -51,7 +51,8 @@ import {
   ActivityReasonCode,
   ExceptionSeverity,
   BackupRecord,
-  CashFlowProjectionEntry
+  CashFlowProjectionEntry,
+  DeliveryOrder
 } from './types';
 import {
   INITIAL_STAFF_MEMBERS,
@@ -108,6 +109,7 @@ import { HeldReceiptsView } from './components/views/sales/HeldReceiptsView';
 import { LayawayView } from './components/views/sales/LayawayView';
 import { SalesHistoryView } from './components/views/sales/SalesHistoryView';
 import { CreditNotesView } from './components/views/sales/CreditNotesView';
+import { DeliveryDispatchView } from './components/views/sales/DeliveryDispatchView';
 import { PurchasingView } from './components/views/purchasing/PurchasingView';
 import { PurchaseMemoView } from './components/views/purchasing/PurchaseMemoView';
 import { ReceiveStockView } from './components/views/purchasing/ReceiveStockView';
@@ -181,6 +183,7 @@ export default function App() {
   const [layawayOrders, setLayawayOrders] = useState<LayawayOrder[]>(INITIAL_LAYAWAY_ORDERS);
   const [salesTransactions, setSalesTransactions] = useState<SaleTransaction[]>(INITIAL_SALES_TRANSACTIONS);
   const [creditNotes, setCreditNotes] = useState<CreditNote[]>(INITIAL_CREDIT_NOTES);
+  const [deliveryOrders, setDeliveryOrders] = useState<DeliveryOrder[]>([]);
 
   // Phase 4 Multi-Location, Logistics & Purchasing State
   const [warehouses, setWarehouses] = useState<Warehouse[]>(INITIAL_WAREHOUSES);
@@ -688,6 +691,21 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appStage, hasFetchedBackOfficeData, currentStaff.accessRole]);
 
+  // Delivery dispatch history (Prompt 7) — both till operators and
+  // head-office staff can create/view these, unlike the head-office-only
+  // fetch above.
+  useEffect(() => {
+    if (appStage !== 'MAIN_APP') return;
+    (async () => {
+      try {
+        const orders = await apiGet<DeliveryOrder[]>('/delivery-orders');
+        setDeliveryOrders(orders);
+      } catch (err) {
+        console.error('Failed to fetch delivery orders', err);
+      }
+    })();
+  }, [appStage]);
+
   // Global Keyboard Shortcuts
   useEffect(() => {
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
@@ -1048,6 +1066,14 @@ export default function App() {
       terminalId: 'POS-D01',
     };
     setSalesTransactions((prev) => [saleTx, ...prev]);
+  };
+
+  const handleCreateDeliveryOrder = (newOrder: DeliveryOrder) => {
+    setDeliveryOrders((prev) => [newOrder, ...prev]);
+  };
+
+  const handleUpdateDeliveryOrder = (updatedOrder: DeliveryOrder) => {
+    setDeliveryOrders((prev) => prev.map((o) => (o.id === updatedOrder.id ? updatedOrder : o)));
   };
 
   const handleIssueCreditNote = (newNote: CreditNote) => {
@@ -1570,7 +1596,17 @@ export default function App() {
   };
 
   const activeWarehouse = (warehouses || []).find((w) => w.id === selectedWarehouseId) || warehouses?.[0] || { id: 'WH-01', name: 'Main Store Floor', code: 'WH-01', address: '100 Industrial Parkway', phone: '+1 555-0199', managerName: 'Marcus Chen', isCentralHub: true };
-  const activeBranch = (branches || []).find((b) => b.id === selectedBranchId) || branches?.[0] || { id: 'BR-01', name: 'Downtown Branch', code: 'BR-01', address: '450 Commercial Ave', phone: '+1 555-0101', managerName: 'Jonathan Reynolds', isFlagship: true };
+  const activeBranch: Branch = (branches || []).find((b) => b.id === selectedBranchId) || branches?.[0] || {
+    id: 'BR-01',
+    code: 'BR-01',
+    name: 'Downtown Branch',
+    address: '450 Commercial Ave',
+    managerName: 'Jonathan Reynolds',
+    contactPhone: '+1 555-0101',
+    email: 'branch-downtown@itred.com',
+    status: 'ACTIVE',
+    isDefault: true,
+  };
 
   // Render view router for MAIN_APP stage
   const renderActiveView = () => {
@@ -1615,6 +1651,7 @@ export default function App() {
             onNavigateToHeldSales={() => handleNavigate('HELD_SALES')}
             onNavigateToHeldReceipts={() => handleNavigate('HELD_RECEIPTS')}
             onNavigateToLayaway={() => handleNavigate('LAYAWAY')}
+            onNavigateToDeliveryDispatch={(saleNumber) => handleNavigate('DELIVERY_DISPATCH', { saleNumber })}
             onRecordCompletedSale={handleRecordCompletedSale}
             onRecordHeldSale={handleRecordHeldSale}
             onParkCart={handleParkCart}
@@ -1640,6 +1677,7 @@ export default function App() {
             onNavigateToHeldSales={() => handleNavigate('HELD_SALES')}
             onNavigateToHeldReceipts={() => handleNavigate('HELD_RECEIPTS')}
             onNavigateToLayaway={() => handleNavigate('LAYAWAY')}
+            onNavigateToDeliveryDispatch={(saleNumber) => handleNavigate('DELIVERY_DISPATCH', { saleNumber })}
             onRecordCompletedSale={handleRecordCompletedSale}
             onRecordHeldSale={handleRecordHeldSale}
             onParkCart={handleParkCart}
@@ -1657,6 +1695,19 @@ export default function App() {
             onIssueCreditNote={handleIssueCreditNote}
             onBackToLanding={() => handleNavigate('LANDING')}
             onNavigateToPOS={() => handleNavigate('SALES_CASH')}
+          />
+        );
+
+      case 'DELIVERY_DISPATCH':
+        return (
+          <DeliveryDispatchView
+            deliveryOrders={deliveryOrders}
+            activeBranch={activeBranch}
+            currentStaff={currentStaff}
+            onCreateDeliveryOrder={handleCreateDeliveryOrder}
+            onUpdateDeliveryOrder={handleUpdateDeliveryOrder}
+            onBackToLanding={() => handleNavigate('LANDING')}
+            initialSaleNumber={navigationParams?.saleNumber}
           />
         );
 

@@ -27,6 +27,7 @@
   },
   "exclude": [
     "node_modules",
-    "executive-pwa"
+    "executive-pwa",
+    "rider-pwa"
   ]
 }

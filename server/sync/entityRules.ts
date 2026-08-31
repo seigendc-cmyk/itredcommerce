@@ -84,6 +84,13 @@ const CATEGORY_BY_TABLE: Record<string, EntityCategory> = Object.fromEntries([
 export function categoryForTable(table: string): EntityCategory {
   const category = CATEGORY_BY_TABLE[table];
   if (!category) {
+    // delivery_orders (Prompt 7) is deliberately absent from
+    // CATEGORY_BY_TABLE — DL-008 requires it never be queued in the
+    // outbox for later creation, so it's written directly to Supabase,
+    // synchronously, by server/routes/deliveryOrders.ts, and never goes
+    // through applyWithOutbox/applyBatchWithOutbox at all. If you hit this
+    // error for "delivery_orders", that's a sign something is trying to
+    // route it through the outbox — fix the caller, don't add it here.
     throw new Error(
       `No sync category registered for table "${table}" — add it to server/sync/entityRules.ts (DL-007) before syncing it.`
     );

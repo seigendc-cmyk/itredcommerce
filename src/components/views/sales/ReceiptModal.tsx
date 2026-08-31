@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Printer, Check, Copy, X } from 'lucide-react';
+import { Printer, Check, Copy, X, Truck } from 'lucide-react';
 import { SaleTransaction, StaffMember } from '../../../types';
 import { Modal } from '../../ui/Modal';
 import { Button } from '../../ui/Button';
@@ -9,6 +9,8 @@ export interface ReceiptModalProps {
   onClose: () => void;
   sale: SaleTransaction | null;
   currentStaff: StaffMember;
+  /** Present only when this completed sale is eligible to become a delivery dispatch (Prompt 7). */
+  onCreateDelivery?: () => void;
 }
 
 export const ReceiptModal: React.FC<ReceiptModalProps> = ({
@@ -16,6 +18,7 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
   onClose,
   sale,
   currentStaff,
+  onCreateDelivery,
 }) => {
   const [isPrinted, setIsPrinted] = useState(false);
 
@@ -41,6 +44,17 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
           <Button variant="outline" size="sm" onClick={onClose}>
             Close
           </Button>
+          {onCreateDelivery && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onCreateDelivery}
+              leftIcon={<Truck className="w-4 h-4" />}
+              className="font-bold border-orange-300 text-orange-700 hover:bg-orange-50"
+            >
+              Create Delivery Dispatch
+            </Button>
+          )}
           <Button
             variant="primary"
             size="sm"

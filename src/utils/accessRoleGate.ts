@@ -20,6 +20,7 @@ export const BRANCH_TERMINAL_VIEWS: ReadonlySet<ActiveView> = new Set<ActiveView
   'SALES_CREDIT',
   'SALES_RETURN',
   'SALES_HISTORY',
+  'DELIVERY_DISPATCH',
   'HELD_SALES',
   'HELD_RECEIPTS',
   'LAYAWAY',

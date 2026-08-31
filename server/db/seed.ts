@@ -732,26 +732,35 @@ function seedGovernance() {
 function seedRateConfig() {
   // One placeholder v1 row so the settings UI and any future fare-engine
   // consumer never see an empty table on a fresh install — see DL-004 and
-  // server/db/migrations/005_rate_config.sql.
+  // server/db/migrations/005_rate_config.sql. These numbers are explicitly
+  // NOT real rate-card figures (Prompt 8's own open-decision instruction:
+  // "do not hardcode real rate numbers... beyond a clearly-marked
+  // placeholder example") — every vendor must publish their own version via
+  // Settings -> Fare & Rate Configuration before relying on calculated
+  // fares. Local vs. intercity rate splitting and multi-currency are both
+  // left at their vendor-toggleable "off" default.
   db.prepare(
-    `INSERT INTO rate_config (id, version, currency, base_fee, per_km_rate, load_size_surcharge_tiers, ride_type_multipliers, effective_date, created_by_staff_id, created_by_staff_name, created_at, notes)
-     VALUES (@id, 1, @currency, @baseFee, @perKmRate, @loadSizeSurchargeTiers, @rideTypeMultipliers, @effectiveDate, @createdByStaffId, @createdByStaffName, @createdAt, @notes)`
+    `INSERT INTO rate_config (
+      id, version, currency, base_fee, per_km_rate, use_separate_intercity_rate, per_km_rate_intercity,
+      load_size_surcharge_tiers, ride_type_multipliers, is_multi_currency, settlement_currency,
+      exchange_rate_to_settlement, effective_date, created_by_staff_id, created_by_staff_name, created_at, notes
+    ) VALUES (
+      @id, 1, @currency, @baseFee, @perKmRate, 0, NULL,
+      @loadSizeSurcharges, @rideTypeMultipliers, 0, NULL,
+      NULL, @effectiveDate, @createdByStaffId, @createdByStaffName, @createdAt, @notes
+    )`
   ).run({
     id: generateId('RATE'),
     currency: 'USD',
     baseFee: 2.5,
     perKmRate: 0.75,
-    loadSizeSurchargeTiers: j([
-      { label: 'Small', maxWeightKg: 5, surcharge: 0 },
-      { label: 'Medium', maxWeightKg: 20, surcharge: 1.5 },
-      { label: 'Large', maxWeightKg: null, surcharge: 4 },
-    ]),
-    rideTypeMultipliers: j({ STANDARD: 1.0, EXPRESS: 1.5, SCHEDULED: 0.9 }),
+    loadSizeSurcharges: j({ small: 0, medium: 1.5, large: 4 }),
+    rideTypeMultipliers: j({ bicycle: 0.8, motorbike: 1.0, car: 1.3, van: 1.6 }),
     effectiveDate: new Date().toISOString().slice(0, 10),
     createdByStaffId: null,
     createdByStaffName: 'System Administrator',
     createdAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
-    notes: 'Initial placeholder rate version — pending real-world rate-card sign-off.',
+    notes: 'PLACEHOLDER EXAMPLE VALUES ONLY — not a real rate card. Replace via Settings before enabling live delivery dispatch.',
   });
 }
 

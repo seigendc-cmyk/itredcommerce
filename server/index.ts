@@ -19,8 +19,16 @@ import stockTransfersRouter from './routes/stockTransfers';
 import stocktakeRouter from './routes/stocktake';
 import rateConfigRouter from './routes/rateConfig';
 import staffRouter from './routes/staff';
+import deliveryOrdersRouter from './routes/deliveryOrders';
+import connectivityRouter from './routes/connectivity';
+import fiscalizationRouter from './routes/fiscalization';
+import branchesRouter from './routes/branches';
 import { isSupabaseConfigured } from './env';
 import { pullStaffFromSupabase } from './sync/staffPull';
+import { pullFiscalRegistrationsFromSupabase } from './sync/fiscalRegistrationPull';
+import { connectivityMonitor } from './sync/connectivityInstance';
+import { startPolling } from './sync/connectivity';
+import { startFiscalDrainLoop } from './sync/fiscalDrainLoop';
 
 runMigrations();
 seedIfEmpty();
@@ -35,6 +43,29 @@ if (isSupabaseConfigured) {
   setInterval(() => void pullStaffFromSupabase(), STAFF_PULL_INTERVAL_MS);
 } else {
   console.log('[server] Supabase not configured (SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY/TENANT_ID) — running fully offline against local SQLite staff cache.');
+}
+
+// Prompt 11: read-through cache of shared branch-level fiscal
+// registrations (credentials included, as ciphertext — see
+// server/lib/fiscalCrypto.ts). Same pull-cache shape/cadence as staff.
+const FISCAL_REGISTRATION_PULL_INTERVAL_MS = 5 * 60 * 1000;
+if (isSupabaseConfigured) {
+  void pullFiscalRegistrationsFromSupabase();
+  setInterval(() => void pullFiscalRegistrationsFromSupabase(), FISCAL_REGISTRATION_PULL_INTERVAL_MS);
+}
+
+// Fiscal submissions get their own tighter-cadence drain loop, separate
+// from the general outbox — see server/sync/fiscalDrainLoop.ts's header
+// comment for why.
+startFiscalDrainLoop();
+
+// DL-008: one shared connectivity signal, polled in the background so the
+// delivery-dispatch CTA (and any future UI) can read a cheap cached state
+// via GET /api/connectivity rather than each surface probing independently.
+const CONNECTIVITY_POLL_INTERVAL_MS = 10 * 1000;
+if (isSupabaseConfigured) {
+  void connectivityMonitor.checkNow();
+  startPolling(connectivityMonitor, CONNECTIVITY_POLL_INTERVAL_MS);
 }
 
 const app = express();
@@ -59,6 +90,10 @@ app.use('/api/transfers', stockTransfersRouter);
 app.use('/api/stocktake', stocktakeRouter);
 app.use('/api/rate-config', rateConfigRouter);
 app.use('/api/staff', staffRouter);
+app.use('/api/delivery-orders', deliveryOrdersRouter);
+app.use('/api/connectivity', connectivityRouter);
+app.use('/api/fiscalization', fiscalizationRouter);
+app.use('/api/branches', branchesRouter);
 
 // --- Additional route modules are mounted here as milestones land ---
 

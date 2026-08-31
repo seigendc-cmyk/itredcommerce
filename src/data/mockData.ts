@@ -1612,6 +1612,8 @@ export const INITIAL_BRANCHES: Branch[] = [
     terminals: [INITIAL_TERMINALS[0], INITIAL_TERMINALS[1]],
     staffIds: ['STF-001', 'STF-002', 'STF-004'],
     notes: 'Flagship retail and commercial trade branch. High transaction throughput.',
+    latitude: 40.7128,
+    longitude: -74.006,
   },
   {
     id: 'BR-02',
@@ -1630,6 +1632,8 @@ export const INITIAL_BRANCHES: Branch[] = [
     terminals: [INITIAL_TERMINALS[2]],
     staffIds: ['STF-001'],
     notes: 'Commercial trade counter serving mechanical workshops and fleet contractors.',
+    latitude: 40.7357,
+    longitude: -74.1724,
   },
   {
     id: 'BR-03',
@@ -1648,6 +1652,8 @@ export const INITIAL_BRANCHES: Branch[] = [
     terminals: [],
     staffIds: ['STF-004'],
     notes: 'Rapid replenishment satellite branch adjacent to logistics corridor.',
+    latitude: 40.6413,
+    longitude: -73.7781,
   },
 ];
 
