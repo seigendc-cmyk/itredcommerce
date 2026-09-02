@@ -12,7 +12,7 @@ import { ConnectivityMonitor } from './connectivity';
 const PROBE_TIMEOUT_MS = 4000;
 
 async function probeSupabase(): Promise<boolean> {
-  if (!isSupabaseConfigured) return false;
+  if (!isSupabaseConfigured()) return false;
   const client = getSupabaseAdmin();
   if (!client) return false;
 

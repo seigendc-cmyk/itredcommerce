@@ -21,6 +21,11 @@ export interface StaffMember {
   avatarInitials: string;
   lastLogin?: string;
   terminalAccess: string[];
+  // Optional recovery contact details, captured for the tenant's first
+  // (owner/admin) staff record by the Business Profile onboarding wizard —
+  // generically useful on any staff record, not onboarding-only.
+  contactPhone?: string;
+  contactEmail?: string;
 }
 
 export interface Supplier {
@@ -46,7 +51,15 @@ export interface Supplier {
   status?: 'ACTIVE' | 'ON_HOLD' | 'DISPUTED' | 'ARCHIVED';
 }
 
-export type AppStage = 'SPLASH' | 'WELCOME_UPDATE' | 'STAFF_ACCESS' | 'MAIN_APP';
+// ACTIVATION and ONBOARDING are new (Business Profile onboarding wizard):
+// ACTIVATION is a real, minimal pre-login gate — it resolves whether this
+// install's code belongs to a brand-new tenant (-> ONBOARDING, the full
+// wizard) or an existing one (-> a lightweight branch/terminal confirm,
+// still under the ONBOARDING stage) before STAFF_ACCESS, since the admin
+// PIN created by the wizard IS the first staff record — there's no one to
+// log in as until onboarding finishes. See ITRED_GOVERNANCE_AND_ARCHITECTURE.md's
+// Business Profile Onboarding addendum.
+export type AppStage = 'SPLASH' | 'WELCOME_UPDATE' | 'ACTIVATION' | 'ONBOARDING' | 'STAFF_ACCESS' | 'MAIN_APP';
 
 export type ActiveView = 
   | 'LANDING'
@@ -109,6 +122,7 @@ export type ActiveView =
   | 'REPORTS_CENTER'
   | 'ONLINE_UPGRADE'
   | 'LICENSING'
+  | 'BUSINESS_PROFILE'
   | 'UPDATES'
   | 'SOFTWARE_UPDATES'
   | 'PAYMENT_METHODS'
@@ -277,12 +291,13 @@ export interface Branch {
   terminals?: Terminal[];
   staffIds?: string[];
   notes?: string;
-  // Geocoded pickup coordinates (Prompt 7, delivery subsystem). Not yet a
-  // persisted backend concept — branches have no CRUD API/table rows today
-  // (see ITRED_GOVERNANCE_AND_ARCHITECTURE.md's "Second Tauri flag" note) —
-  // so these travel with the client-side Branch record and are captured
-  // into delivery_orders at dispatch time, same as branchName already is on
-  // sales_transactions rows.
+  // Geocoded pickup coordinates. Introduced client-side-only in Prompt 7
+  // (delivery subsystem) since branches had no CRUD API/table rows at all
+  // then; the Business Profile onboarding wizard is what first persists a
+  // real branch row (including these columns) to both Supabase and local
+  // SQLite — see ITRED_GOVERNANCE_AND_ARCHITECTURE.md's Business Profile
+  // Onboarding addendum, which closes the branch-persistence gap the
+  // "Second Tauri flag" note had carried since Prompt 3.
   latitude?: number;
   longitude?: number;
 }
@@ -1658,6 +1673,66 @@ export interface ReportExportOptions {
   includeSummaryCharts: boolean;
   includeAuditHeader: boolean;
   orientation: 'PORTRAIT' | 'LANDSCAPE';
+}
+
+// --------------------------------------------------------
+// BUSINESS PROFILE ONBOARDING — tenant-level profile, set once by the
+// first-install wizard and editable thereafter from the System menu's
+// Business Profile page (same fields, same shared form-section
+// components — not two separate systems). See
+// ITRED_GOVERNANCE_AND_ARCHITECTURE.md's Business Profile Onboarding
+// addendum for the wizard-scope and field-locking decisions.
+// --------------------------------------------------------
+export type BusinessType =
+  | 'GENERAL_RETAIL'
+  | 'WHOLESALE_DISTRIBUTION'
+  | 'HOSPITALITY'
+  | 'PHARMACY'
+  | 'HARDWARE_BUILDING'
+  | 'FASHION_APPAREL'
+  | 'ELECTRONICS_APPLIANCES'
+  | 'LIQUOR_BOTTLE_STORE'
+  | 'BUTCHERY_FRESH_PRODUCE'
+  | 'AUTOMOTIVE_PARTS_SERVICES'
+  | 'SALON_PERSONAL_CARE'
+  | 'OTHER';
+
+// Fields marked (sensitive) below are the confirm-to-change set on the
+// permanent Business Profile page: tin, vatNumber, registrationNumber,
+// country, baseCurrency.
+export interface BusinessProfile {
+  tenantId: string;
+  legalName: string;
+  // "Trading/brand name" reuses the tenant's existing display_name column
+  // rather than adding a redundant field — see Section 1.6's warning
+  // against duplicate/legacy type pairs.
+  displayName: string;
+  registrationNumber?: string;
+  tin?: string; // sensitive — what fiscalization submissions are tied to
+  vatRegistered: boolean;
+  vatNumber?: string; // sensitive
+  country: string; // sensitive — ISO 3166-1 alpha-2; also drives FiscalizationProvider selection
+  businessType?: BusinessType;
+  registeredAddress?: string;
+  businessPhone?: string;
+  businessEmail?: string;
+  whatsappBusinessNumber?: string;
+  website?: string;
+  logoDataUrl?: string;
+  brandColor?: string;
+  baseCurrency: string; // sensitive — ISO 4217
+  multiCurrencyEnabled: boolean;
+  fiscalYearStartMonth: number; // 1-12
+  pairingCode: string;
+  onboardingCompletedAt?: string;
+  // Primary branch, created alongside the tenant at onboarding.
+  primaryBranch: {
+    id: string;
+    name: string;
+    address?: string;
+    latitude: number;
+    longitude: number;
+  };
 }
 
 // --------------------------------------------------------

@@ -101,6 +101,10 @@ import { INITIAL_BI_ALERTS } from './data/mockBiData';
 import { SplashScreen } from './components/startup/SplashScreen';
 import { WelcomeUpdateScreen } from './components/startup/WelcomeUpdateScreen';
 import { StaffAccessScreen } from './components/auth/StaffAccessScreen';
+import { ActivationScreen, ResolvedTenant } from './components/onboarding/ActivationScreen';
+import { OnboardingWizard } from './components/onboarding/OnboardingWizard';
+import { JoinTenantConfirm } from './components/onboarding/JoinTenantConfirm';
+import { BusinessProfileView } from './components/views/system/BusinessProfileView';
 import { HeaderNav } from './components/layout/HeaderNav';
 import { LandingPage } from './components/views/LandingPage';
 import { SalesView } from './components/views/sales/SalesView';
@@ -776,6 +780,26 @@ export default function App() {
   const handleStaffAuthenticated = (staff: StaffMember) => {
     setCurrentStaff(staff);
     setAppStage('MAIN_APP');
+  };
+
+  // Business Profile onboarding — see ITRED_GOVERNANCE_AND_ARCHITECTURE.md's
+  // Business Profile Onboarding addendum. An already-provisioned install
+  // (env.tenantId already set server-side) skips straight past ACTIVATION
+  // to STAFF_ACCESS exactly as before this feature existed; only a fresh
+  // install sees the new gate.
+  const [onboardingActivationCode, setOnboardingActivationCode] = useState<string>('');
+  const [onboardingPairingCode, setOnboardingPairingCode] = useState<string>('');
+  const [onboardingJoinInfo, setOnboardingJoinInfo] = useState<ResolvedTenant | null>(null);
+
+  const handleContinueFromWelcome = async () => {
+    try {
+      const { needsOnboarding } = await apiGet<{ needsOnboarding: boolean }>('/onboarding/status');
+      setAppStage(needsOnboarding ? 'ACTIVATION' : 'STAFF_ACCESS');
+    } catch {
+      // Unreachable backend — fall through to the normal staff-access
+      // screen, which already has its own "unable to reach server" state.
+      setAppStage('STAFF_ACCESS');
+    }
   };
 
   const handleLockSession = () => {
@@ -2192,6 +2216,14 @@ export default function App() {
           />
         );
 
+      case 'BUSINESS_PROFILE':
+        return (
+          <BusinessProfileView
+            currentStaff={currentStaff}
+            onBackToLanding={() => handleNavigate('LANDING')}
+          />
+        );
+
       case 'UPDATES':
       case 'SOFTWARE_UPDATES':
         return (
@@ -2460,8 +2492,43 @@ export default function App() {
 
       {appStage === 'WELCOME_UPDATE' && (
         <WelcomeUpdateScreen
-          onContinueToStaffAccess={() => setAppStage('STAFF_ACCESS')}
+          onContinueToStaffAccess={handleContinueFromWelcome}
         />
+      )}
+
+      {appStage === 'ACTIVATION' && (
+        <ActivationScreen
+          onNewTenant={(code) => {
+            setOnboardingActivationCode(code);
+            setOnboardingJoinInfo(null);
+            setAppStage('ONBOARDING');
+          }}
+          onJoinTenant={(code, pairingCode, resolved) => {
+            setOnboardingActivationCode(code);
+            setOnboardingPairingCode(pairingCode);
+            setOnboardingJoinInfo(resolved);
+            setAppStage('ONBOARDING');
+          }}
+          onBackToWelcome={() => setAppStage('WELCOME_UPDATE')}
+        />
+      )}
+
+      {appStage === 'ONBOARDING' && (
+        onboardingJoinInfo ? (
+          <JoinTenantConfirm
+            activationCode={onboardingActivationCode}
+            pairingCode={onboardingPairingCode}
+            resolved={onboardingJoinInfo}
+            onJoined={() => setAppStage('STAFF_ACCESS')}
+            onBack={() => setAppStage('ACTIVATION')}
+          />
+        ) : (
+          <OnboardingWizard
+            activationCode={onboardingActivationCode}
+            onAuthenticated={handleStaffAuthenticated}
+            onBack={() => setAppStage('ACTIVATION')}
+          />
+        )
       )}
 
       {appStage === 'STAFF_ACCESS' && (

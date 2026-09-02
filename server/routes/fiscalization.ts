@@ -31,7 +31,7 @@ const FISCAL_ADMIN_ROLES = BACK_OFFICE_WRITE_ROLES;
 
 function requireSupabase() {
   const client = getSupabaseAdmin();
-  if (!isSupabaseConfigured || !client) {
+  if (!isSupabaseConfigured() || !client) {
     throw new ApiError(503, 'Fiscalization settings require a configured connection to the central system', 'SUPABASE_UNAVAILABLE');
   }
   return client;

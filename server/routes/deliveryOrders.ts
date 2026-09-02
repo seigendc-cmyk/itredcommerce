@@ -165,7 +165,7 @@ router.post(
     // offline, and this is the server-side backstop for that same rule.
     // Re-probed live here rather than trusting the last poll, since the
     // decision is irreversible once a confirmation code is issued.
-    if (!isSupabaseConfigured) {
+    if (!isSupabaseConfigured()) {
       throw new ApiError(503, 'Delivery dispatch requires a configured connection to the central system', 'OFFLINE');
     }
     const connectivityState = await connectivityMonitor.checkNow();
@@ -365,7 +365,7 @@ router.post(
     // Same "never queue, must be live" reasoning as creation (DL-008/
     // DL-015) — reopening a delivery order the rider is still holding is
     // just as time-sensitive as creating one.
-    if (!isSupabaseConfigured) {
+    if (!isSupabaseConfigured()) {
       throw new ApiError(503, 'Reissuing a code requires a configured connection to the central system', 'OFFLINE');
     }
     const connectivityState = await connectivityMonitor.checkNow();

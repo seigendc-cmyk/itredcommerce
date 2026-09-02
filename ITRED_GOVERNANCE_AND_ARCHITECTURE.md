@@ -1379,3 +1379,170 @@ entirely mock) coexisting indefinitely.
   note.
 - **The old mock `FiscalizationView` system view**: retire or rewire — see
   above.
+
+## BUSINESS PROFILE ONBOARDING ADDENDUM (2026-09-02)
+
+Builds a first-launch onboarding wizard (Tenant → Branch → the tenant's
+first Staff record) plus a permanent Business Profile page in the System
+menu that edits the same tenant/branch records, not a parallel store. Two
+items were explicitly flagged as requiring sign-off before implementation;
+both were put to you directly and confirmed before any code was written.
+
+### DL-028: Wizard scope — option (a), keyed off a new Tenant Pairing Code, not the software activation code
+
+**Decision (your call, matching the recommendation)**: the full wizard runs
+only on the install that creates a new tenant; any later install either
+joins that tenant via a lightweight branch/terminal confirm, or creates a
+new tenant if given no pairing code. The signal is a new **Tenant Pairing
+Code** (`tenants.pairing_code`, 8-char alphanumeric, same confusable-excluding
+charset as `deliveryCode.ts`'s confirmation code) — generated once when the
+founding install's wizard completes, shown to the admin, and re-shown on the
+permanent Business Profile page for handing to whoever sets up the next
+branch till.
+
+This is a **different concept** from `LicenceInfo.activationCode` (a
+product/plan software license key, unrelated to tenant identity) —
+conflating the two was considered and rejected during design: the existing
+activation-code format/flow (`ITR-PRO-XXXX-XXXX-202X`) reads as a purchase
+credential issued by iTred support, with no natural mechanism for it to also
+encode which tenant a second install should join. Introducing one new,
+narrowly-scoped concept was simpler and more honest than overloading an
+existing one to do a second, unrelated job.
+
+**Real pre-login ACTIVATION stage, added as a prerequisite**: `LicensingView`
+existed only as a post-login System-menu page with entirely simulated
+activation (`handleActivateSubmit` was a `setTimeout`, never touched a
+server) — there was no gate before `STAFF_ACCESS` at all
+(`WELCOME_UPDATE` → `STAFF_ACCESS` directly). Since the wizard's Step 5
+creates the tenant's *first* staff record, nothing could log in to reach a
+post-login activation screen on a genuine first launch. A new `ACTIVATION`
+app stage (`src/types/index.ts`'s `AppStage`) was inserted between
+`WELCOME_UPDATE` and `STAFF_ACCESS`, reusing LicensingView's activation-code
+UI pattern but making only the pairing-code resolution call real
+(`POST /onboarding/resolve-pairing-code`). `LicensingView` itself — renewal,
+entitlements, expiry countdown — is untouched and still simulated; making
+the rest of it real was flagged as separate, unrequested scope, not folded
+in here. An already-provisioned install skips ACTIVATION's real branching
+entirely: `WelcomeUpdateScreen`'s continue button now calls
+`GET /onboarding/status` first and goes straight to `STAFF_ACCESS` exactly
+as before this feature existed unless `needsOnboarding` is true.
+
+### DL-029: Onboarding is the one legitimate caller that predates env.tenantId — and the one thing that makes env.tenantId mutable
+
+**Decision**: every route in this codebase (per DL-011) is scoped by
+`env.tenantId`, sourced from a `TENANT_ID` env var fixed at process boot —
+but a fresh install has no tenant yet, which is exactly what onboarding
+exists to create. Rather than special-case this one flow with its own
+parallel Supabase-client path, `server/env.ts`'s `isSupabaseConfigured` became
+a function (was a boot-time-computed `const boolean`) and `env.tenantId`
+became explicitly mutable, so `server/lib/installationConfig.ts`'s
+`persistInstallationConfig()` — called at the end of both
+`POST /onboarding/complete` and `POST /onboarding/join-tenant` — can flip
+this process from unconfigured to configured **without a restart**:
+existing routes, the staff/tenant pull-cache loops, and connectivity polling
+all pick up the new tenant immediately. `server/lib/supabaseAdmin.ts` gained
+one deliberate exception, `getSupabaseAdminUnscoped()` (url+key only, no
+tenant check) — the only thing onboarding.ts is allowed to import instead of
+`getSupabaseAdmin()`, since it is by definition the one caller that runs
+before a tenant exists.
+
+Restart-survival reuses, rather than reinvents, local SQLite's
+`installation_config` singleton (`002_multi_tenant.sql`) — scaffolded in
+Prompt 2 specifically for "this device's fixed tenant/branch/terminal
+binding, captured once at activation time" and explicitly left unwired
+("that's business logic for a later prompt"). This is that prompt:
+`bootstrapTenantIdFromLocal()` runs once at boot, after migrations, and
+restores `env.tenantId` from that table if `TENANT_ID` isn't set in the
+environment — so a second process start after onboarding doesn't need the
+`.env` file rewritten, avoiding a whole separate persistence mechanism.
+
+**Unauthenticated by design, guarded by provisioning state instead of a
+session**: `/api/onboarding/*` mounts with no `requireAuth` (there is no
+staff/session yet), and every route instead refuses to run a second time
+once `env.tenantId` is already set (409 `ALREADY_PROVISIONED`) — verified
+live against the running server, along with `/api/business-profile`'s normal
+401 when unauthenticated.
+
+**Tenant/branch/staff/terminal rows are written directly to both Supabase
+and local SQLite** (not via the outbox) at wizard completion, so this
+device's own data is usable the instant setup finishes rather than waiting
+up to 5 minutes for the first pull-cache cycle — the same reasoning DL-015
+already used for delivery orders bypassing the outbox, applied here for a
+different reason (immediate local usability vs. never-should-be-queued).
+
+### DL-030: Field-locking is confirm-to-change, not a hard lock; branch geocoding is now genuinely persisted
+
+**Decision (your call, matching the recommendation)**: TIN, VAT number,
+registration number, country, and base currency require an explicit
+confirm-to-change step (`ConfirmDialog`) on the permanent Business Profile
+page before becoming editable; every other field is freely editable.
+Changing one of the five is also the one thing this page logs — a
+`BUSINESS_PROFILE_SENSITIVE_FIELD_CHANGED` `activity_events` row (via the
+existing `applyWithOutbox`, so it syncs like every other activity event),
+carrying old/new values in `metadata`. Nothing about a past record changes:
+this is a forward-looking guard, not a data-integrity mechanism — the
+existing versioning pattern (DL-004/DL-010/DL-023) already makes historical
+fiscal submissions and priced transactions immune to a later config change
+regardless of this UI gate.
+
+**Business type taxonomy** (your call, matching the recommendation):
+`BusinessType` — General Retail/Supermarket, Wholesale & Distribution,
+Hospitality, Pharmacy, Hardware & Building Supplies, Fashion & Apparel,
+Electronics & Appliances, Liquor/Bottle Store, Butchery & Fresh Produce,
+Automotive Parts & Services, Salon & Personal Care, Other — tuned to this
+product's actual Zimbabwe/Kenya retail SME market rather than a generic
+global list, on the stated assumption it may later feed BI Brain peer-group
+benchmarking (not built here).
+
+**Branch geocoding persistence gap (flagged in the Executive PWA and
+Delivery Fare addenda's "Open items," and again in DL-016) is now closed**:
+`branches.latitude`/`longitude` are real columns (Supabase and local SQLite
+both), not just the client-side-only `Branch.latitude`/`longitude` DL-016
+introduced as a workaround. The primary branch created by onboarding is the
+first real row ever written there. `server/routes/branches.ts`'s existing
+GET still doesn't select them (unchanged, out of this prompt's scope) — the
+delivery-dispatch pickup-coordinate flow DL-016 built keeps working exactly
+as before, unaffected.
+
+**"Trading/brand name" reuses `tenants.display_name`** (already existed,
+previously just mirrored `legal_name`) rather than adding a redundant
+`trading_name` column — Section 1.6's warning against duplicate/legacy type
+pairs applied directly here.
+
+**New, small, reusable addition, not onboarding-specific**:
+`staff.contact_phone`/`contact_email` (Supabase and local) — Step 5 needed
+somewhere to put the admin's recovery contact details, and no such columns
+existed on any staff record at all; adding them generically (available to
+every staff member, not gated to admins) was simpler than inventing a
+side-table for two nullable strings.
+
+### Open items (explicitly not decided here)
+
+- **The Supabase migration for this addendum has not been applied to any
+  real deployed project** — `supabase/migrations/20260902090000_business_profile.sql`
+  exists as a file only; running it against a real project is a deployment
+  step, the same class of gap `access_token_hook` registration (DL-013) and
+  the WhatsApp Edge Function secrets (DL-021) already are.
+- **Logo storage as a base64 `logo_data_url` column, not object storage**:
+  no Supabase Storage bucket exists anywhere in this codebase yet, and one
+  wasn't built here — same "no live external dependency" simplification
+  precedent as DL-018's manual FX rate. Revisit if logo sizes (capped at
+  300KB client-side) or a second consumer make this untenable.
+  `MAX_LOGO_DATA_URL_LENGTH` in `server/routes/onboarding.ts` is the
+  matching server-side ceiling.
+- **`POST /onboarding/resolve-pairing-code` has no rate limiting** — it's
+  the one unauthenticated endpoint that answers "does a business with this
+  code exist," which is a low-value oracle (confirms existence, reveals
+  legal/display name and branch list) but not a zero-value one. Flagged,
+  not mitigated.
+- **No `branchPull.ts` job exists** — `server/routes/branches.ts`'s GET
+  still only ever reads local SQLite (unchanged, per its own header
+  comment). `businessProfile.ts`'s PUT mirrors a primary-branch edit into
+  local SQLite by hand for this reason, rather than assuming a pull job will
+  reconcile it.
+- **`Branch.latitude`/`longitude` on other, non-primary branches**: only the
+  primary branch is guaranteed geocoded (onboarding requires it); additional
+  branches created later (head-office "Locations" management, or
+  `JoinTenantConfirm`'s "add a new branch" path) also require coordinates at
+  creation time, but nothing back-fills coordinates for branches that
+  predate this addendum in an existing tenant.

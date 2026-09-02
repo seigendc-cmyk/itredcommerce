@@ -23,50 +23,76 @@ import deliveryOrdersRouter from './routes/deliveryOrders';
 import connectivityRouter from './routes/connectivity';
 import fiscalizationRouter from './routes/fiscalization';
 import branchesRouter from './routes/branches';
+import onboardingRouter from './routes/onboarding';
+import businessProfileRouter from './routes/businessProfile';
 import { isSupabaseConfigured } from './env';
 import { pullStaffFromSupabase } from './sync/staffPull';
 import { pullFiscalRegistrationsFromSupabase } from './sync/fiscalRegistrationPull';
+import { pullTenantFromSupabase } from './sync/tenantPull';
 import { connectivityMonitor } from './sync/connectivityInstance';
 import { startPolling } from './sync/connectivity';
 import { startFiscalDrainLoop } from './sync/fiscalDrainLoop';
+import { bootstrapTenantIdFromLocal } from './lib/installationConfig';
 
 runMigrations();
 seedIfEmpty();
 
-// DL-005/DL-011: refresh the local staff/PIN offline-fallback cache from
-// Supabase at startup and periodically thereafter. Best-effort — a failed
-// pull just means the cache stays at its last-known-good state, which is
-// exactly the offline-fallback behavior this cache exists for.
-const STAFF_PULL_INTERVAL_MS = 5 * 60 * 1000;
-if (isSupabaseConfigured) {
-  void pullStaffFromSupabase();
-  setInterval(() => void pullStaffFromSupabase(), STAFF_PULL_INTERVAL_MS);
-} else {
-  console.log('[server] Supabase not configured (SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY/TENANT_ID) — running fully offline against local SQLite staff cache.');
-}
-
-// Prompt 11: read-through cache of shared branch-level fiscal
-// registrations (credentials included, as ciphertext — see
-// server/lib/fiscalCrypto.ts). Same pull-cache shape/cadence as staff.
-const FISCAL_REGISTRATION_PULL_INTERVAL_MS = 5 * 60 * 1000;
-if (isSupabaseConfigured) {
-  void pullFiscalRegistrationsFromSupabase();
-  setInterval(() => void pullFiscalRegistrationsFromSupabase(), FISCAL_REGISTRATION_PULL_INTERVAL_MS);
-}
+// A fresh install has no TENANT_ID env var — if the Business Profile
+// onboarding wizard already ran in a previous process (this is a restart,
+// not a first boot), the tenant this install is bound to lives in local
+// SQLite's installation_config singleton instead. See
+// server/lib/installationConfig.ts.
+bootstrapTenantIdFromLocal();
 
 // Fiscal submissions get their own tighter-cadence drain loop, separate
 // from the general outbox — see server/sync/fiscalDrainLoop.ts's header
-// comment for why.
+// comment for why. Unlike the pull loops below, this one doesn't depend on
+// isSupabaseConfigured() at start time — it already checks per-submission.
 startFiscalDrainLoop();
 
-// DL-008: one shared connectivity signal, polled in the background so the
-// delivery-dispatch CTA (and any future UI) can read a cheap cached state
-// via GET /api/connectivity rather than each surface probing independently.
-const CONNECTIVITY_POLL_INTERVAL_MS = 10 * 1000;
-if (isSupabaseConfigured) {
+// DL-005/DL-011/Prompt-11/DL-008's background sync jobs all depend on a
+// configured tenant, which — since the Business Profile onboarding wizard
+// — may not exist yet at process boot and can become configured mid-process
+// once onboarding completes. Grouped into one idempotent starter so both
+// boot and the onboarding-completion routes can call the same thing rather
+// than duplicating the isSupabaseConfigured() gate three times.
+let backgroundSyncStarted = false;
+export function startBackgroundSync() {
+  if (backgroundSyncStarted) return;
+  if (!isSupabaseConfigured()) {
+    console.log('[server] Supabase not configured (SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY/TENANT_ID) — running fully offline against local SQLite caches.');
+    return;
+  }
+  backgroundSyncStarted = true;
+
+  // DL-005/DL-011: refresh the local staff/PIN offline-fallback cache from
+  // Supabase at startup and periodically thereafter. Best-effort — a failed
+  // pull just means the cache stays at its last-known-good state, which is
+  // exactly the offline-fallback behavior this cache exists for.
+  const STAFF_PULL_INTERVAL_MS = 5 * 60 * 1000;
+  void pullStaffFromSupabase();
+  setInterval(() => void pullStaffFromSupabase(), STAFF_PULL_INTERVAL_MS);
+
+  // Business Profile: same pull-cache shape/cadence as staff.
+  const TENANT_PULL_INTERVAL_MS = 5 * 60 * 1000;
+  void pullTenantFromSupabase();
+  setInterval(() => void pullTenantFromSupabase(), TENANT_PULL_INTERVAL_MS);
+
+  // Prompt 11: read-through cache of shared branch-level fiscal
+  // registrations (credentials included, as ciphertext — see
+  // server/lib/fiscalCrypto.ts). Same pull-cache shape/cadence as staff.
+  const FISCAL_REGISTRATION_PULL_INTERVAL_MS = 5 * 60 * 1000;
+  void pullFiscalRegistrationsFromSupabase();
+  setInterval(() => void pullFiscalRegistrationsFromSupabase(), FISCAL_REGISTRATION_PULL_INTERVAL_MS);
+
+  // DL-008: one shared connectivity signal, polled in the background so the
+  // delivery-dispatch CTA (and any future UI) can read a cheap cached state
+  // via GET /api/connectivity rather than each surface probing independently.
+  const CONNECTIVITY_POLL_INTERVAL_MS = 10 * 1000;
   void connectivityMonitor.checkNow();
   startPolling(connectivityMonitor, CONNECTIVITY_POLL_INTERVAL_MS);
 }
+startBackgroundSync();
 
 const app = express();
 
@@ -76,6 +102,12 @@ app.use(sessionMiddleware);
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
+
+// No requireAuth — this install has no staff/session to authenticate as
+// until onboarding creates the first one. Each route inside guards itself
+// against re-running once env.tenantId is already set (409 ALREADY_PROVISIONED).
+app.use('/api/onboarding', onboardingRouter);
+app.use('/api/business-profile', businessProfileRouter);
 
 app.use('/api/auth', authRouter);
 app.use('/api/inventory', inventoryRouter);
@@ -104,7 +136,7 @@ app.use('/api', (_req, res) => {
 });
 
 if (env.isProduction) {
-  const distDir = path.resolve(process.cwd(), 'dist');
+  const distDir = env.distDir;
   if (fs.existsSync(distDir)) {
     app.use(express.static(distDir));
     app.get('*', (_req, res) => res.sendFile(path.join(distDir, 'index.html')));

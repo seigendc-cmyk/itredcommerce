@@ -260,7 +260,7 @@ function markResult(row: LocalSubmissionRow, result: SubmitOutcomeLike, invoiceS
 // shows reads from Supabase, not any one terminal's local cache. See the
 // governance doc addendum.
 async function mirrorSubmissionToSupabase(localId: string): Promise<void> {
-  if (!isSupabaseConfigured) return;
+  if (!isSupabaseConfigured()) return;
   const supabase = getSupabaseAdmin();
   if (!supabase) return;
   const row = db.prepare('SELECT * FROM fiscal_submissions WHERE id = ?').get(localId) as any;
