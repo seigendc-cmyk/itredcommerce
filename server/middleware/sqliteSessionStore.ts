@@ -12,8 +12,15 @@ const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 export class SqliteSessionStore extends session.Store {
   constructor() {
     super();
-    // Best-effort cleanup of expired sessions on boot.
-    db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
+    // Best-effort cleanup of expired sessions on boot. Swallow errors: this
+    // runs at module-load time, which (via ESM import evaluation order) is
+    // before index.ts's runMigrations() call — on a brand-new database the
+    // sessions table doesn't exist yet, and there's nothing to clean up.
+    try {
+      db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
+    } catch {
+      // no-op — table not created yet
+    }
   }
 
   get(sid: string, callback: (err: any, session?: session.SessionData | null) => void): void {
