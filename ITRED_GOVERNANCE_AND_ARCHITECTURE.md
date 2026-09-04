@@ -1659,3 +1659,191 @@ still-open Cargo dependency work). Wiring any of the above against that
 unfinished foundation would risk exactly the "parallel/duplicate path"
 problem this prompt warned against. Recommend treating hardware I/O as its
 own later prompt once Tauri packaging itself is finished.
+
+## TAURI DESKTOP PACKAGING ADDENDUM (2026-09-04)
+
+This closes the "Second Tauri flag" — first raised in the HEAD-OFFICE APP
+ADDENDUM ("still no `src-tauri`, no Tauri dependency anywhere in the repo"),
+carried forward unresolved through every subsequent prompt, and re-flagged a
+second time in DL-023's "Known gap" note. Two packaging approaches were
+proposed for review rather than decided unilaterally, given how much mature,
+already-tested business logic (DL-006 through DL-030: outbox/sync, delivery
+dispatch, fare engine, fiscalization, onboarding) lives in the Express layer:
+(a) bundle the existing Express server as a Tauri sidecar, each install
+spawning its own process against its own local SQLite file; (b) port that
+logic into Rust/Tauri commands directly, eliminating Express. Option (a) was
+confirmed — the existing Express logic was extensive and already correct per
+this document's own addenda, and a from-scratch Rust rewrite of ~25 prompts'
+worth of working logic was assessed as high-risk for no functional gain at
+this stage.
+
+### DL-033: Sidecar approach — each install spawns its own Express+SQLite backend as a Tauri external binary
+
+**Decision**: `src-tauri/src/sidecar.rs` spawns the Express server
+(`dist-server/server.mjs`) as a Tauri `externalBin` sidecar, once per app
+launch, in release builds only — `tauri dev` keeps using its existing
+`beforeDevCommand` (Vite + a fixed-port Express dev server), unchanged. Since
+Node's Single Executable Application feature is still experimental and
+complicates `node:sqlite`, the sidecar binary is the real Node.js runtime
+itself, copied under Tauri's external-binary naming convention
+(`scripts/prepare-sidecar.mjs`) and invoked as `node.exe dist-server/server.mjs`
+— not a compiled Node binary.
+
+What makes each install genuinely independent, per DL-002/DL-009's
+requirement (own local SQLite, own outbox, no shared local server between
+desks) rather than just a Tauri window wrapping the existing shared setup:
+
+- **Own SQLite file**: `<app-data-dir>/data/itred.db`, where `app-data-dir`
+  is Tauri's OS-standard per-install application-data directory
+  (`app.path().app_data_dir()`) — a different physical file per install by
+  OS convention, never a shared path.
+- **Own ephemeral port**: `find_free_port()` binds `127.0.0.1:0`, reads back
+  whatever the OS assigned, releases it, and hands it to the sidecar as
+  `API_PORT` — no fixed port shared between installs, no coordination
+  needed between them to avoid collision.
+- **Own independent Supabase connection**: `SUPABASE_URL`/
+  `SUPABASE_SERVICE_ROLE_KEY`/`FISCAL_CREDENTIALS_KEY`/etc. are read from an
+  optional `config.env` file dropped in that install's own app-data
+  directory (`read_config_overrides`) — the same manual, out-of-band
+  secret-distribution discipline DL-024 already established for the fiscal
+  credentials key, now the generic mechanism for every per-install secret a
+  real deployment needs. No secret is baked into the shipped binary or
+  installer.
+- **Two-installs-on-one-machine dev testing**: an `ITRED_INSTANCE_ID` env
+  var (set only by a developer, never by a real install) suffixes the
+  app-data directory (`…/instances/<id>`), letting two "installs" run side
+  by side on one machine without two physical devices — verified directly
+  (not via this mechanism specifically, but its equivalent): two backends
+  launched concurrently against distinct `DB_PATH`/`API_PORT` pairs
+  bootstrapped independent schemas with zero collision on port or file lock.
+- **WAL mode**: unconditional, unchanged — `server/db/connection.ts`'s
+  `db.exec('PRAGMA journal_mode = WAL')` runs on every connection open with
+  no conditional gate. Confirmed directly against two independent fresh
+  per-install databases (`PRAGMA journal_mode` returned `wal` on both).
+- **Installer target**: Windows MSI + NSIS only (`tauri.conf.json`'s
+  `bundle.targets`), confirmed as the sole target for the current dev
+  environment — no macOS/Linux build requested or produced. A full
+  `tauri build` was run end-to-end (Vite → esbuild server bundle → sidecar
+  prep → Rust release compile → bundling) and produced both
+  `iTred Commerce_0.1.0_x64_en-US.msi` and
+  `iTred Commerce_0.1.0_x64-setup.exe` successfully.
+
+**Rationale**: reusing the real Node runtime as the sidecar avoids taking on
+Node SEA's experimental-feature risk merely to save a few hundred MB in the
+installer. Per-install ephemeral ports and OS-standard app-data directories
+mean two installs never need to coordinate with each other to avoid
+collision — each simply asks the OS for what's free/private to it, at spawn
+time, independently.
+
+### DL-034: `seedIfEmpty()` was silently defeating "genuinely fresh install" — now gated to non-production
+
+**Decision**: `server/index.ts` called `seedIfEmpty()` (mock demo data —
+fake staff with working bcrypt-hashed PINs, fake products, fake sales/shifts/
+purchasing) unconditionally at every boot, gated only on "does the local
+`staff` table have zero rows." That condition is true exactly once for the
+shared dev database (harmless, intended), but was *also* true for every
+single genuinely fresh Tauri install, every time — discovered directly while
+testing requirement 3 below: a server pointed at a brand-new empty SQLite
+file auto-seeded fake demo data before onboarding ever ran. A real
+customer's first launch would have shown a mix of fake demo staff/PINs/
+products alongside whatever the onboarding wizard created, not the blank
+slate DL-028/029 assumes. Fixed with one guard in `server/index.ts`:
+`seedIfEmpty()` now only runs when `!env.isProduction` — `npm run dev`/`tsx`
+always run with `NODE_ENV=development` (unchanged), and the packaged Tauri
+sidecar always sets `NODE_ENV=production` (`sidecar.rs`), so no existing
+dev/demo workflow changes.
+
+**Rationale**: this is exactly the class of "existing logic assumes a
+shared/dev setup" problem this addendum's own scope explicitly called out
+for a stop-and-report rather than a silent side-effect fix — flagged to you
+directly before being fixed, per your explicit go-ahead.
+
+### DL-035: `join-tenant`'s existing-branch path didn't cache the tenant or branch locally before inserting a terminal — broke under genuine per-install separation
+
+**Decision**: discovered live while testing requirement 3's "brand-new
+install joining an existing tenant via pairing code" case. Under the old
+shared-single-SQLite-file setup this was invisible: every terminal already
+had every tenant/branch row cached locally, because they were all the same
+file. On a genuinely separate per-install database, two real foreign keys
+(`branches.tenant_id`, `terminals.tenant_id`/`branch_id` —
+`002_multi_tenant.sql`) fail on insert, because neither the tenant nor the
+branch being joined has ever been cached on this install before. The
+`branch.new` path already mirrored a newly-created branch into local SQLite;
+the `branch.existingBranchId` path (the realistic case — a second till
+joining an already-set-up branch) did not, and neither path cached the
+tenant row at all. Fixed in `server/routes/onboarding.ts`'s `/join-tenant`
+route: the full tenant row is fetched and mirrored into local SQLite
+immediately after the pairing code resolves (before any branch/terminal
+work), and the existing-branch lookup now selects and mirrors the full
+branch row the same way the new-branch path already did. Deliberately *not*
+done via `pullTenantFromSupabase()`/`env.tenantId` directly at that point —
+this request can still fail afterward (branch not found, a Supabase
+terminal-insert error), and setting `env.tenantId` before
+`persistInstallationConfig()` durably commits would leave the process
+believing it's already provisioned with no matching `installation_config`
+row if that later failure happened. Verified live end-to-end after the fix:
+a second install joined the first install's freshly-onboarded test tenant by
+pairing code, ending with two installs sharing the same tenant/branch but
+each with its own distinct `installation_config`, own terminal, and correct
+independent local SQLite state.
+
+**Rationale**: same discipline as DL-034 — a genuine gap this packaging work
+surfaced, not something to patch quietly. The fix mirrors the pattern the
+`branch.new` path already established rather than inventing a new one.
+
+### Known gap, reconfirmed — DL-023's cross-terminal fiscal-retry routing is now concretely real, not theoretical
+
+DL-023 already flagged that a manually-triggered fiscal-submission retry and
+a terminal's own local drain loop were, at the time, touching the same
+shared database, and that this would need a real cross-terminal mechanism
+"once genuine per-install separation lands." It has now landed, and the gap
+is unchanged and unresolved, per this prompt's explicit instruction not to
+touch DL-006 through DL-030's business logic: `server/routes/fiscalization.ts`'s
+`POST /submissions/:id/retry` reads `fiscal_submissions` from `WHERE id = ?`
+against **this terminal's own local SQLite only**, and its own 404 message
+already says so verbatim — `'Fiscal submission not found on this terminal'`.
+Under genuine per-install separation, a submission created by the terminal
+that completed the sale lives only in that terminal's local queue; a
+head-office admin clicking "retry" on a different terminal's Settings page
+has no way to see or flip that row. Not fixed here — flagged again, as
+DL-023 itself already anticipated, so it isn't lost a third time.
+
+### Testing performed
+
+- `cargo check` on `src-tauri` — clean.
+- Two independent simulated fresh installs launched concurrently (distinct
+  `DB_PATH`/`API_PORT`, no shared `.env` in scope, mirroring the sidecar's
+  real `current_dir`/env-var contract): both migrated schema from scratch,
+  both showed `journal_mode = wal`, both had zero seeded rows (post-DL-034
+  fix), no port or file-lock collision between them.
+- Live round-trip against the dev Supabase project (after 8 previously-
+  unapplied migrations — an existing, already-documented "file only, not
+  applied" gap unrelated to this packaging work — were applied by you): a
+  brand-new install created a new tenant via the wizard; a second brand-new
+  install joined that tenant via its real pairing code, attaching to the
+  existing branch. Verified both installs' local SQLite ended up correct
+  and mutually independent (own `installation_config`, own terminal row,
+  shared tenant/branch data correctly synced). Test tenant/branch/staff/
+  terminal rows deleted from Supabase afterward.
+- Full `tauri build` produced both a working MSI and NSIS installer.
+
+### Open items (explicitly not decided here)
+
+- **macOS/Linux builds**: not requested, not built. Windows MSI/NSIS only.
+- **Hardware peripheral integration**: unchanged from the prior addendum's
+  findings — still a separate, later prompt.
+- **Local `terminals` cache has no `app_surface` column** (pre-existing,
+  predates this prompt): Supabase's `terminals` table carries it; local
+  SQLite's does not, and neither onboarding route writes it locally. Not a
+  packaging-caused issue (the shared setup had the same gap) and not
+  encountered as a functional problem in this testing — this install's own
+  surface is already available via `installation_config.app_surface`. Noted
+  for awareness, not fixed here.
+- **The 8 previously-unapplied Supabase migrations**: now applied to the dev
+  project (delivery orders, fare engine, rider PWA, WhatsApp notifications,
+  fiscalization, business profile, executive rollups, chart of accounts) —
+  this closes those specific "file only, not applied" gaps as a side effect
+  of unblocking this prompt's required onboarding test, not as originally
+  scoped work.
+- **DL-023's cross-terminal fiscal-retry routing**: see above — unresolved,
+  now concretely reachable rather than theoretical.

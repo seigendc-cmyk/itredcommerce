@@ -61167,13 +61167,66 @@ var init_onboarding = __esm({
         if (tenantLookupError) throw new ApiError(502, "Failed to look up pairing code", "SUPABASE_READ_FAILED");
         if (!tenant) throw new ApiError(404, "No business found for that pairing code", "PAIRING_CODE_NOT_FOUND");
         const tenantId = tenant.id;
+        const { data: fullTenant, error: fullTenantError } = await client2.from("tenants").select("*").eq("id", tenantId).single();
+        if (fullTenantError || !fullTenant) {
+          throw new ApiError(502, "Failed to load tenant details after resolving pairing code", "SUPABASE_READ_FAILED");
+        }
+        db.prepare(`
+      INSERT OR IGNORE INTO tenants (id, legal_name, display_name, country, base_currency, status,
+        registration_number, tin, vat_registered, vat_number, business_type, registered_address,
+        business_phone, business_email, whatsapp_business_number, website, logo_data_url, brand_color,
+        multi_currency_enabled, fiscal_year_start_month, pairing_code, onboarding_completed_at)
+      VALUES (@id, @legal_name, @display_name, @country, @base_currency, @status,
+        @registration_number, @tin, @vat_registered, @vat_number, @business_type, @registered_address,
+        @business_phone, @business_email, @whatsapp_business_number, @website, @logo_data_url, @brand_color,
+        @multi_currency_enabled, @fiscal_year_start_month, @pairing_code, @onboarding_completed_at)
+    `).run({
+          id: fullTenant.id,
+          legal_name: fullTenant.legal_name,
+          display_name: fullTenant.display_name,
+          country: fullTenant.country,
+          base_currency: fullTenant.base_currency,
+          status: fullTenant.status,
+          registration_number: fullTenant.registration_number ?? null,
+          tin: fullTenant.tin ?? null,
+          vat_registered: fullTenant.vat_registered ? 1 : 0,
+          vat_number: fullTenant.vat_number ?? null,
+          business_type: fullTenant.business_type ?? null,
+          registered_address: fullTenant.registered_address ?? null,
+          business_phone: fullTenant.business_phone ?? null,
+          business_email: fullTenant.business_email ?? null,
+          whatsapp_business_number: fullTenant.whatsapp_business_number ?? null,
+          website: fullTenant.website ?? null,
+          logo_data_url: fullTenant.logo_data_url ?? null,
+          brand_color: fullTenant.brand_color ?? null,
+          multi_currency_enabled: fullTenant.multi_currency_enabled ? 1 : 0,
+          fiscal_year_start_month: fullTenant.fiscal_year_start_month ?? 1,
+          pairing_code: fullTenant.pairing_code ?? null,
+          onboarding_completed_at: fullTenant.onboarding_completed_at ?? null
+        });
         let branchId;
         let branchName;
         if ("existingBranchId" in body.branch) {
-          const { data: branch, error } = await client2.from("branches").select("id, name").eq("id", body.branch.existingBranchId).eq("tenant_id", tenantId).maybeSingle();
+          const { data: branch, error } = await client2.from("branches").select("id, name, code, address, contact_phone, email, status, is_default, latitude, longitude").eq("id", body.branch.existingBranchId).eq("tenant_id", tenantId).maybeSingle();
           if (error || !branch) throw new ApiError(404, "Branch not found for this business", "BRANCH_NOT_FOUND");
           branchId = branch.id;
           branchName = branch.name;
+          db.prepare(`
+        INSERT OR IGNORE INTO branches (id, tenant_id, code, name, address, contact_phone, email, status, is_default, latitude, longitude)
+        VALUES (@id, @tenant_id, @code, @name, @address, @contact_phone, @email, @status, @is_default, @latitude, @longitude)
+      `).run({
+            id: branch.id,
+            tenant_id: tenantId,
+            code: branch.code ?? null,
+            name: branch.name,
+            address: branch.address ?? null,
+            contact_phone: branch.contact_phone ?? null,
+            email: branch.email ?? null,
+            status: branch.status ?? "ACTIVE",
+            is_default: branch.is_default ? 1 : 0,
+            latitude: branch.latitude ?? null,
+            longitude: branch.longitude ?? null
+          });
         } else {
           const newBranch = body.branch.new;
           if (!newBranch?.name?.trim()) throw new ApiError(400, "branch.new.name is required");
@@ -61625,7 +61678,9 @@ var init_index = __esm({
     init_fiscalDrainLoop();
     init_installationConfig();
     runMigrations();
-    seedIfEmpty();
+    if (!env.isProduction) {
+      seedIfEmpty();
+    }
     bootstrapTenantIdFromLocal();
     startFiscalDrainLoop();
     backgroundSyncStarted = false;

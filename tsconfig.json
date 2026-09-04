@@ -28,6 +28,7 @@
   "exclude": [
     "node_modules",
     "executive-pwa",
-    "rider-pwa"
+    "rider-pwa",
+    "src-tauri"
   ]
 }

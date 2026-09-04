@@ -11,3 +11,6 @@ data/*.db-journal
 data/*.db-wal
 data/*.db-shm
 data/backups/
+src-tauri/target/
+src-tauri/binaries/
+src-tauri/resources/

@@ -36,7 +36,15 @@ import { startFiscalDrainLoop } from './sync/fiscalDrainLoop';
 import { bootstrapTenantIdFromLocal } from './lib/installationConfig';
 
 runMigrations();
-seedIfEmpty();
+// Mock-data seeding is a dev/demo convenience for the shared dev database —
+// never appropriate for a packaged install, where an empty `staff` table
+// means a genuinely fresh customer install waiting for onboarding, not an
+// empty dev DB waiting for demo data. `npm run dev`/`tsx` always run with
+// NODE_ENV=development; the packaged Tauri sidecar always sets
+// NODE_ENV=production (see src-tauri/src/sidecar.rs).
+if (!env.isProduction) {
+  seedIfEmpty();
+}
 
 // A fresh install has no TENANT_ID env var — if the Business Profile
 // onboarding wizard already ran in a previous process (this is a restart,

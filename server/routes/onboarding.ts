@@ -402,18 +402,93 @@ router.post(
     if (!tenant) throw new ApiError(404, 'No business found for that pairing code', 'PAIRING_CODE_NOT_FOUND');
     const tenantId = tenant.id as string;
 
+    // A fresh install joining an existing tenant has never cached that
+    // tenant locally, but branches.tenant_id and terminals.tenant_id/branch_id
+    // are all real local foreign keys (002_multi_tenant.sql) — on a
+    // genuinely separate per-install SQLite file (as opposed to the shared
+    // dev database every terminal used to share), the branch/terminal
+    // inserts below would fail against an empty local `tenants` table.
+    // Mirrored directly here (not via pullTenantFromSupabase/env.tenantId)
+    // because this request can still fail after this point (branch not
+    // found, Supabase terminal insert error) — env.tenantId must stay
+    // unset until persistInstallationConfig actually commits, or a failed
+    // attempt would leave this process believing it's already provisioned
+    // with no durable installation_config row to match.
+    const { data: fullTenant, error: fullTenantError } = await client
+      .from('tenants')
+      .select('*')
+      .eq('id', tenantId)
+      .single();
+    if (fullTenantError || !fullTenant) {
+      throw new ApiError(502, 'Failed to load tenant details after resolving pairing code', 'SUPABASE_READ_FAILED');
+    }
+    db.prepare(`
+      INSERT OR IGNORE INTO tenants (id, legal_name, display_name, country, base_currency, status,
+        registration_number, tin, vat_registered, vat_number, business_type, registered_address,
+        business_phone, business_email, whatsapp_business_number, website, logo_data_url, brand_color,
+        multi_currency_enabled, fiscal_year_start_month, pairing_code, onboarding_completed_at)
+      VALUES (@id, @legal_name, @display_name, @country, @base_currency, @status,
+        @registration_number, @tin, @vat_registered, @vat_number, @business_type, @registered_address,
+        @business_phone, @business_email, @whatsapp_business_number, @website, @logo_data_url, @brand_color,
+        @multi_currency_enabled, @fiscal_year_start_month, @pairing_code, @onboarding_completed_at)
+    `).run({
+      id: fullTenant.id,
+      legal_name: fullTenant.legal_name,
+      display_name: fullTenant.display_name,
+      country: fullTenant.country,
+      base_currency: fullTenant.base_currency,
+      status: fullTenant.status,
+      registration_number: fullTenant.registration_number ?? null,
+      tin: fullTenant.tin ?? null,
+      vat_registered: fullTenant.vat_registered ? 1 : 0,
+      vat_number: fullTenant.vat_number ?? null,
+      business_type: fullTenant.business_type ?? null,
+      registered_address: fullTenant.registered_address ?? null,
+      business_phone: fullTenant.business_phone ?? null,
+      business_email: fullTenant.business_email ?? null,
+      whatsapp_business_number: fullTenant.whatsapp_business_number ?? null,
+      website: fullTenant.website ?? null,
+      logo_data_url: fullTenant.logo_data_url ?? null,
+      brand_color: fullTenant.brand_color ?? null,
+      multi_currency_enabled: fullTenant.multi_currency_enabled ? 1 : 0,
+      fiscal_year_start_month: fullTenant.fiscal_year_start_month ?? 1,
+      pairing_code: fullTenant.pairing_code ?? null,
+      onboarding_completed_at: fullTenant.onboarding_completed_at ?? null,
+    });
+
     let branchId: string;
     let branchName: string;
     if ('existingBranchId' in body.branch) {
       const { data: branch, error } = await client
         .from('branches')
-        .select('id, name')
+        .select('id, name, code, address, contact_phone, email, status, is_default, latitude, longitude')
         .eq('id', body.branch.existingBranchId)
         .eq('tenant_id', tenantId)
         .maybeSingle();
       if (error || !branch) throw new ApiError(404, 'Branch not found for this business', 'BRANCH_NOT_FOUND');
       branchId = branch.id;
       branchName = branch.name;
+      // This install has never cached this branch locally before (it may
+      // have been created by a different install entirely) — terminals.branch_id
+      // is a real local foreign key (002_multi_tenant.sql), so a genuinely
+      // fresh per-install SQLite file needs this row mirrored in before the
+      // terminal insert below, exactly as the new-branch path already does.
+      db.prepare(`
+        INSERT OR IGNORE INTO branches (id, tenant_id, code, name, address, contact_phone, email, status, is_default, latitude, longitude)
+        VALUES (@id, @tenant_id, @code, @name, @address, @contact_phone, @email, @status, @is_default, @latitude, @longitude)
+      `).run({
+        id: branch.id,
+        tenant_id: tenantId,
+        code: branch.code ?? null,
+        name: branch.name,
+        address: branch.address ?? null,
+        contact_phone: branch.contact_phone ?? null,
+        email: branch.email ?? null,
+        status: branch.status ?? 'ACTIVE',
+        is_default: branch.is_default ? 1 : 0,
+        latitude: branch.latitude ?? null,
+        longitude: branch.longitude ?? null,
+      });
     } else {
       const newBranch = body.branch.new;
       if (!newBranch?.name?.trim()) throw new ApiError(400, 'branch.new.name is required');
