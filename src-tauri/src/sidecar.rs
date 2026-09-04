@@ -9,6 +9,8 @@
 // disturbed by this.
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -21,6 +23,44 @@ use tauri_plugin_shell::ShellExt;
 
 pub struct SidecarState {
     pub child: Mutex<Option<CommandChild>>,
+}
+
+// `log::*` has no sink at all in release builds (lib.rs only registers
+// tauri-plugin-log under `cfg!(debug_assertions)`) — a release install that
+// fails here previously failed *completely silently*: blank window, nothing
+// anywhere to diagnose it from. This writes a plain always-on text log next
+// to this install's own data directory, independent of the log plugin.
+fn log_line(data_dir: &Path, msg: &str) {
+    let line = format!("[{}] {}\n", chrono_now(), msg);
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("sidecar.log"))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+    log::info!("{msg}");
+}
+
+/// Tauri's path APIs return Windows extended-length (`\\?\`-prefixed)
+/// paths. Node's own internal main-module resolver (`resolveMainPath` →
+/// `realpathSync`) does not handle that prefix correctly — confirmed
+/// empirically: passing a `\\?\`-prefixed script path corrupted it down to
+/// just `C:`, crashing with `EISDIR: lstat 'C:'` before any app code ran.
+/// Every path handed to the sidecar (cwd, script arg, env vars) is
+/// normalized through this first.
+fn normalize_path(p: &Path) -> String {
+    let s = p.to_string_lossy().into_owned();
+    s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+}
+
+fn chrono_now() -> String {
+    // Avoids pulling in a chrono/time dependency just for a log timestamp —
+    // this only needs to be human-readable, not parsed.
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => format!("{}", d.as_secs()),
+        Err(_) => "unknown-time".to_string(),
+    }
 }
 
 /// Binds an ephemeral local port, reads back what the OS assigned, then
@@ -98,70 +138,105 @@ fn load_or_create_session_secret(data_dir: &Path) -> std::io::Result<String> {
 }
 
 pub fn start(app: &AppHandle) -> Result<(), String> {
+    // data_dir itself might not resolve/create — nowhere to log that failure
+    // *to* yet, so it's the one step this function can't make visible.
     let data_dir = install_data_dir(app)?;
     std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
 
+    match run(app, &data_dir) {
+        Ok(()) => {
+            log_line(&data_dir, "[sidecar] startup completed successfully");
+            Ok(())
+        }
+        Err(err) => {
+            log_line(&data_dir, &format!("[sidecar] FAILED: {err}"));
+            Err(err)
+        }
+    }
+}
+
+fn run(app: &AppHandle, data_dir: &Path) -> Result<(), String> {
     let db_dir = data_dir.join("data");
     std::fs::create_dir_all(&db_dir).map_err(|e| e.to_string())?;
     let db_path = db_dir.join("itred.db");
 
     let port = find_free_port().map_err(|e| e.to_string())?;
-    let session_secret = load_or_create_session_secret(&data_dir).map_err(|e| e.to_string())?;
+    let session_secret = load_or_create_session_secret(data_dir).map_err(|e| e.to_string())?;
     let overrides = read_config_overrides(&data_dir.join("config.env"));
 
+    // resource_dir() resolves to the install's base directory, not the
+    // bundled-resources folder directly — tauri.conf.json's
+    // `bundle.resources: ["resources/server/**/*"]` preserves that same
+    // "resources/" prefix under it, so the real files sit at
+    // <resource_dir>/resources/server/... (confirmed empirically: without
+    // this extra segment, current_dir() pointed at a nonexistent path and
+    // spawn() failed outright with "the directory name is invalid").
     let resource_dir = app
         .path()
         .resource_dir()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("resource_dir() failed: {e}"))?
+        .join("resources")
         .join("server");
     let server_entry = resource_dir.join("server.mjs");
     let dist_dir = resource_dir.join("dist");
 
+    log_line(
+        data_dir,
+        &format!(
+            "[sidecar] resolved paths: resource_dir={:?} server_entry={:?} (exists={}) dist_dir={:?} (exists={}) db_path={:?} port={}",
+            resource_dir,
+            server_entry,
+            server_entry.exists(),
+            dist_dir,
+            dist_dir.exists(),
+            db_path,
+            port
+        ),
+    );
+
     let mut envs: HashMap<String, String> = HashMap::new();
     envs.insert("NODE_ENV".into(), "production".into());
     envs.insert("API_PORT".into(), port.to_string());
-    envs.insert("DB_PATH".into(), db_path.to_string_lossy().into_owned());
-    envs.insert("DIST_DIR".into(), dist_dir.to_string_lossy().into_owned());
+    envs.insert("DB_PATH".into(), normalize_path(&db_path));
+    envs.insert("DIST_DIR".into(), normalize_path(&dist_dir));
     envs.insert("SESSION_SECRET".into(), session_secret);
     for (key, value) in overrides {
         envs.insert(key, value);
     }
 
-    log::info!(
-        "[sidecar] starting backend: db={:?} port={} resource_dir={:?}",
-        db_path,
-        port,
-        resource_dir
-    );
-
-    let (mut rx, child) = app
+    let sidecar_command = app
         .shell()
         .sidecar("itred-server")
-        .map_err(|e| e.to_string())?
-        .current_dir(resource_dir)
+        .map_err(|e| format!("shell().sidecar(\"itred-server\") failed: {e}"))?;
+    log_line(data_dir, "[sidecar] resolved sidecar binary, spawning...");
+
+    let (mut rx, child) = sidecar_command
+        .current_dir(normalize_path(&resource_dir))
         .envs(envs)
-        .args([server_entry.to_string_lossy().into_owned()])
+        .args([normalize_path(&server_entry)])
         .spawn()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("spawn() failed: {e}"))?;
+    log_line(data_dir, &format!("[sidecar] spawned, pid={}", child.pid()));
 
     app.manage(SidecarState {
         child: Mutex::new(Some(child)),
     });
 
+    let event_log_dir = data_dir.to_path_buf();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
             match event {
                 CommandEvent::Stdout(line) => {
-                    log::info!("[server] {}", String::from_utf8_lossy(&line));
+                    log_line(&event_log_dir, &format!("[server] {}", String::from_utf8_lossy(&line)));
                 }
                 CommandEvent::Stderr(line) => {
-                    log::warn!("[server] {}", String::from_utf8_lossy(&line));
+                    log_line(&event_log_dir, &format!("[server:stderr] {}", String::from_utf8_lossy(&line)));
                 }
                 CommandEvent::Error(err) => {
-                    log::error!("[server] spawn error: {err}");
+                    log_line(&event_log_dir, &format!("[server] spawn error: {err}"));
                 }
                 CommandEvent::Terminated(payload) => {
-                    log::warn!("[server] exited: {:?}", payload.code);
+                    log_line(&event_log_dir, &format!("[server] exited: {:?}", payload.code));
                     break;
                 }
                 _ => {}
@@ -174,12 +249,14 @@ pub fn start(app: &AppHandle) -> Result<(), String> {
             "backend did not start listening on 127.0.0.1:{port} within 20s"
         ));
     }
+    log_line(data_dir, &format!("[sidecar] backend listening on 127.0.0.1:{port}"));
 
     let url = tauri::Url::parse(&format!("http://127.0.0.1:{port}")).map_err(|e| e.to_string())?;
     if let Some(window) = app.get_webview_window("main") {
-        window.navigate(url).map_err(|e| e.to_string())?;
+        window.navigate(url).map_err(|e| format!("window.navigate() failed: {e}"))?;
+        log_line(data_dir, "[sidecar] navigated main window to backend");
     } else {
-        log::warn!("[sidecar] no 'main' window found to navigate to the backend");
+        log_line(data_dir, "[sidecar] no 'main' window found to navigate to the backend");
     }
 
     Ok(())

@@ -1847,3 +1847,52 @@ DL-023 itself already anticipated, so it isn't lost a third time.
   scoped work.
 - **DL-023's cross-terminal fiscal-retry routing**: see above — unresolved,
   now concretely reachable rather than theoretical.
+
+### DL-036: the packaged app never actually launched successfully until now — two silent packaging bugs, found only by running the real installed app
+
+Everything above (DL-033 through DL-035) was verified via manually-orchestrated
+processes standing in for the sidecar (same env vars/cwd contract, not the
+actual `app.exe`/Tauri runtime). The gap in that testing showed immediately
+once the real installed app was launched (via the built MSI) and reported as
+a blank window that never reached Staff Access — the exact kind of thing this
+document's own guidance says to verify in the real app, not infer from
+adjacent testing. Root causes, found by adding an always-on plain-text
+`sidecar.log` next to this install's data directory (release builds
+previously had **zero** diagnostics at all — `lib.rs` only registers
+`tauri-plugin-log` under `cfg!(debug_assertions)`, so a release-mode failure
+here was completely invisible, not merely unlogged):
+
+1. **`resource_dir()` path was missing a path segment.** It resolves to the
+   install's own base directory, not the bundled-resources folder directly;
+   `tauri.conf.json`'s `bundle.resources: ["resources/server/**/*"]`
+   preserves that same `resources/` prefix underneath it, so the real files
+   sit at `<resource_dir>/resources/server/...`. `sidecar.rs` only joined
+   `"server"`, pointing `current_dir()` at a directory that didn't exist —
+   `spawn()` failed outright ("the directory name is invalid," Windows error
+   267), before the sidecar process ever started.
+2. **Node's own main-module resolver doesn't handle Windows extended-length
+   paths.** Once (1) was fixed, the sidecar spawned but Node itself crashed
+   inside `resolveMainPath`/`realpathSync` with `EISDIR: lstat 'C:'` —
+   Tauri's path APIs return `\\?\`-prefixed paths, and passing one as the
+   main script argument corrupted it down to just `C:` inside Node's
+   internal resolver, before any application code ran. Fixed by stripping
+   the `\\?\` prefix (`normalize_path()`) from every path handed to the
+   sidecar — cwd, script argument, and the `DB_PATH`/`DIST_DIR` env vars.
+
+Both fixed and verified against the actual installed app (not a stand-in):
+`sidecar.log` shows a clean start (migrations applied, `iTred Commerce API
+listening on http://localhost:<port>`), the window navigates to the real
+backend, and `GET /api/onboarding/status` responds correctly through it.
+Both MSI and NSIS installers were rebuilt afterward — the ones DL-033 first
+verified were built *before* this fix and would have exhibited the same
+blank-window failure on a real machine.
+
+**Rationale for fixing directly rather than stopping to ask**: unlike
+DL-034/DL-035 (onboarding business logic), this is squarely inside this
+prompt's own scope — packaging/process-topology — and both bugs are in code
+this same prompt wrote, not in DL-006 through DL-030's existing logic.
+**Lesson for this document's own testing discipline**: manually reconstructing
+a sidecar's env/cwd contract is not a substitute for launching the actual
+packaged binary at least once — it validates the Express/SQLite layer
+correctly but cannot catch bugs in the Tauri-specific glue code connecting
+the two, which is exactly where both of these lived.
