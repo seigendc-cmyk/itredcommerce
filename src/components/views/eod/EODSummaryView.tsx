@@ -1,18 +1,18 @@
-import React, { useState, useMemo } from 'react';
-import { 
-  FileSpreadsheet, 
-  ArrowLeft, 
-  DollarSign, 
-  AlertTriangle, 
-  CheckCircle2, 
-  Clock, 
-  Printer, 
-  ShieldAlert, 
-  Check, 
-  X, 
-  Lock, 
-  Store, 
-  Calendar, 
+import React, { useState, useEffect, useMemo } from 'react';
+import {
+  FileSpreadsheet,
+  ArrowLeft,
+  DollarSign,
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
+  Printer,
+  ShieldAlert,
+  Check,
+  X,
+  Lock,
+  Store,
+  Calendar,
   FileText,
   CreditCard,
   Smartphone,
@@ -21,16 +21,17 @@ import {
   History,
   TrendingDown,
   Layers,
-  ArrowRight
+  ArrowRight,
+  Info
 } from 'lucide-react';
-import { 
-  StaffMember, 
-  Branch, 
-  Terminal, 
-  Shift, 
-  HeldSale, 
-  CreditNote, 
-  EODReport, 
+import {
+  StaffMember,
+  Branch,
+  Terminal,
+  Shift,
+  HeldSale,
+  CreditNote,
+  EODReport,
   EODReconciliationEntry,
   StockAdjustmentRecord,
   ApprovalRequest
@@ -38,6 +39,7 @@ import {
 import { Button } from '../../ui/Button';
 import { Input } from '../../ui/Input';
 import { Alert } from '../../ui/Alert';
+import { apiGet, apiPost, ApiClientError } from '../../../api/client';
 
 export interface EODSummaryViewProps {
   currentStaff: StaffMember;
@@ -53,6 +55,13 @@ export interface EODSummaryViewProps {
   onNavigateToShifts: () => void;
   onNavigateToApprovals: () => void;
 }
+
+// Categories where "$0.00 expected" is a known data-pipeline limitation,
+// not a real reconciled zero — see server/routes/eod.ts's header comment.
+// Credit notes (returns) aren't yet linked back to the issuing shift, and
+// there is no cash-payout feature anywhere in this codebase, so these two
+// categories can never show anything but 0 today.
+const CATEGORIES_WITH_KNOWN_ZERO_LIMITATION = new Set(['REFUNDS', 'PAYOUTS']);
 
 export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
   currentStaff,
@@ -77,63 +86,96 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
 
   const activeBranch = branches?.find((b) => b.id === selectedBranchId) || branches?.[0] || { id: 'BR-01', name: 'Downtown Branch', code: 'BR-01' };
 
-  // Calculate live expected amounts from current shifts for the selected branch & date
-  const relevantShifts = useMemo(() => {
-    return (shifts || []).filter((s) => s.branchId === selectedBranchId);
-  }, [shifts, selectedBranchId]);
+  // Real reconciliation data — aggregated server-side from already-CLOSED
+  // shifts' frozen totals (see server/routes/eod.ts). Never recomputed from
+  // raw transactions here or on the server, per shiftReconciliation.ts's
+  // immutable/versioned design.
+  const [expectedByCategory, setExpectedByCategory] = useState<Record<string, number>>({});
+  const [grossSales, setGrossSales] = useState(0);
+  const [openTillsCount, setOpenTillsCount] = useState(0);
+  const [isLoadingReconciliation, setIsLoadingReconciliation] = useState(false);
+  const [reconciliationError, setReconciliationError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setIsLoadingReconciliation(true);
+    setReconciliationError(null);
+    apiGet<{ grossSales: number; openTillsCount: number; reconciliation: { category: string; expectedAmount: number }[] }>(
+      `/eod/reconciliation?branchId=${encodeURIComponent(selectedBranchId)}&date=${encodeURIComponent(selectedDate)}`
+    )
+      .then((data) => {
+        if (cancelled) return;
+        const map: Record<string, number> = {};
+        data.reconciliation.forEach((r) => { map[r.category] = r.expectedAmount; });
+        setExpectedByCategory(map);
+        setGrossSales(data.grossSales);
+        setOpenTillsCount(data.openTillsCount);
+      })
+      .catch(() => { if (!cancelled) setReconciliationError('Unable to load reconciliation data from the server. Confirm the backend is reachable.'); })
+      .finally(() => { if (!cancelled) setIsLoadingReconciliation(false); });
+    return () => { cancelled = true; };
+  }, [selectedBranchId, selectedDate]);
+
+  // Past EOD reports for this branch, fetched from the server. Seeded from
+  // the eodReports prop so something renders before the first fetch resolves.
+  const [pastReports, setPastReports] = useState<EODReport[]>(eodReports);
+  useEffect(() => {
+    let cancelled = false;
+    apiGet<EODReport[]>(`/eod/reports?branchId=${encodeURIComponent(selectedBranchId)}`)
+      .then((reports) => { if (!cancelled) setPastReports(reports); })
+      .catch(() => { /* keep whatever was already showing */ });
+    return () => { cancelled = true; };
+  }, [selectedBranchId]);
 
   // Outstanding unresolved conditions
-  const openTills = useMemo(() => {
-    return (relevantShifts || []).filter((s) => s.status === 'OPEN' || s.status === 'REQUIRES_CLOSURE');
-  }, [relevantShifts]);
-
+  // heldSales.status is 'OUTSTANDING' | 'SETTLED' | 'CONVERTED_CREDIT' | 'CANCELLED'
+  // (src/types/index.ts) — this previously filtered on 'HELD'/'PARKED', values
+  // that don't exist in that union and so never matched a real record.
   const unresolvedHeldSales = useMemo(() => {
-    return (heldSales || []).filter((hs) => hs.status === 'HELD' || hs.status === 'PARKED');
+    return (heldSales || []).filter((hs) => hs.status === 'OUTSTANDING');
   }, [heldSales]);
 
   const unapprovedRefunds = useMemo(() => {
     return (creditNotes || []).filter((cn) => cn.status === 'ISSUED');
   }, [creditNotes]);
 
+  // StockAdjustmentRecord (src/types/index.ts) has no status/approval-workflow
+  // field at all — stock_adjustments rows are already-posted, one-shot
+  // records (adjustmentType/quantityDelta/reason), never a pending state.
+  // This previously filtered on a 'PENDING_APPROVAL' value that could never
+  // exist on the real type, so it silently always evaluated to empty.
+  // Kept as an explicit empty list (not deleted) so the "Pending Adjustments"
+  // banner tile still renders honestly at 0 rather than needing a bigger,
+  // separate change to invent a real stock-adjustment approval workflow.
   const pendingAdjustments = useMemo(() => {
-    return stockAdjustments.filter((sa) => sa.status === 'PENDING_APPROVAL');
+    return [] as StockAdjustmentRecord[];
   }, [stockAdjustments]);
 
-  // Aggregate expected amounts across all terminal shifts
-  const aggregateExpected = useMemo(() => {
-    let cash = 0;
-    let mobile = 0;
-    let card = 0;
-    let credit = 0;
-    let layaway = 0;
-    let refunds = 0;
-    let payouts = 0;
-    let grossSales = 0;
+  const aggregateExpected = useMemo(() => ({
+    cash: expectedByCategory.CASH ?? 0,
+    mobile: expectedByCategory.MOBILE_MONEY ?? 0,
+    card: expectedByCategory.CARD_BANK ?? 0,
+    credit: expectedByCategory.CREDIT_SALES ?? 0,
+    layaway: expectedByCategory.LAYAWAYS ?? 0,
+    refunds: expectedByCategory.REFUNDS ?? 0,
+    payouts: expectedByCategory.PAYOUTS ?? 0,
+    grossSales,
+  }), [expectedByCategory, grossSales]);
 
-    relevantShifts.forEach((s) => {
-      cash += s.expectedCash;
-      mobile += s.totalMobileMoneySales;
-      card += s.totalCardSales;
-      credit += s.totalCreditSales;
-      layaway += s.totalLayawayReceipts;
-      refunds += s.totalRefunds;
-      payouts += s.totalPayouts;
-      grossSales += s.grossSales;
+  // Reconciliation table state (User counted amounts) — reset whenever the
+  // server-computed expected amounts change (new branch/date selected).
+  const [countedEntries, setCountedEntries] = useState<Record<string, number>>({});
+  useEffect(() => {
+    setCountedEntries({
+      CASH: aggregateExpected.cash,
+      MOBILE_MONEY: aggregateExpected.mobile,
+      CARD_BANK: aggregateExpected.card,
+      CREDIT_SALES: aggregateExpected.credit,
+      LAYAWAYS: aggregateExpected.layaway,
+      REFUNDS: aggregateExpected.refunds,
+      PAYOUTS: aggregateExpected.payouts,
     });
-
-    return { cash, mobile, card, credit, layaway, refunds, payouts, grossSales };
-  }, [relevantShifts]);
-
-  // Reconciliation table state (User counted amounts)
-  const [countedEntries, setCountedEntries] = useState<Record<string, number>>({
-    CASH: aggregateExpected.cash,
-    MOBILE_MONEY: aggregateExpected.mobile,
-    CARD_BANK: aggregateExpected.card,
-    CREDIT_SALES: aggregateExpected.credit,
-    LAYAWAYS: aggregateExpected.layaway,
-    REFUNDS: aggregateExpected.refunds,
-    PAYOUTS: aggregateExpected.payouts,
-  });
+  }, [aggregateExpected]);
 
   const [entryNotes, setEntryNotes] = useState<Record<string, string>>({
     CASH: 'Drawer currency counted and bagged for bank deposit.',
@@ -220,44 +262,43 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
   const isManager = currentStaff.role === 'STORE_MANAGER' || currentStaff.role === 'SYS_ADMIN';
 
   // Unresolved conditions flags count
-  const unresolvedConditionsCount = 
-    openTills.length + 
-    unresolvedHeldSales.length + 
+  const unresolvedConditionsCount =
+    openTillsCount +
+    unresolvedHeldSales.length +
     (hasVariance ? 1 : 0) +
     pendingAdjustments.length;
 
-  const handleFinalizeEOD = () => {
-    const newReport: EODReport = {
-      id: `EOD-${Date.now()}`,
-      reportNumber: `EOD-${selectedDate.replace(/-/g, '')}-${activeBranch.code || 'BR01'}`,
-      date: selectedDate,
-      branchId: activeBranch.id,
-      branchName: activeBranch.name,
-      terminalId: 'ALL_CONSOLIDATED',
-      terminalName: 'Consolidated Branch Terminals',
-      generatedByStaffId: currentStaff.id,
-      generatedByStaffName: currentStaff.name,
-      status: hasVariance ? 'DISCREPANCY_FLAGGED' : isApprovedByManager ? 'APPROVED' : 'SUBMITTED',
-      reconciliation: reconciliationList,
-      totalSales: aggregateExpected.grossSales,
-      totalCashExpected: aggregateExpected.cash,
-      totalCashCounted: countedEntries['CASH'] || aggregateExpected.cash,
-      totalVariance: totalVariance,
-      unresolvedHeldSalesCount: unresolvedHeldSales.length,
-      unresolvedHeldSalesValue: unresolvedHeldSales.reduce((acc, h) => acc + h.grandTotal, 0),
-      unapprovedRefundsCount: unapprovedRefunds.length,
-      unapprovedRefundsValue: unapprovedRefunds.reduce((acc, r) => acc + r.totalRefundAmount, 0),
-      openTillsCount: openTills.length,
-      pendingStockAdjustmentsCount: pendingAdjustments.length,
-      managerApprovedBy: isApprovedByManager ? currentStaff.name : undefined,
-      managerApprovalDate: isApprovedByManager ? new Date().toISOString().replace('T', ' ').substring(0, 16) : undefined,
-      managerNotes: managerNotes.trim() || undefined,
-      createdDateTime: new Date().toISOString().replace('T', ' ').substring(0, 16),
-    };
+  const [isFinalizing, setIsFinalizing] = useState(false);
+  const [finalizeError, setFinalizeError] = useState<string | null>(null);
 
-    onSaveEODReport(newReport);
-    setSelectedPastReport(newReport);
-    setViewTab('PAST_REPORTS');
+  const handleFinalizeEOD = async () => {
+    setFinalizeError(null);
+    setIsFinalizing(true);
+    try {
+      const report = await apiPost<EODReport>('/eod/reports', {
+        branchId: activeBranch.id,
+        branchName: activeBranch.name,
+        date: selectedDate,
+        countedEntries,
+        entryNotes,
+        managerNotes: managerNotes.trim() || undefined,
+        managerApproved: isApprovedByManager,
+        unresolvedHeldSalesCount: unresolvedHeldSales.length,
+        unresolvedHeldSalesValue: unresolvedHeldSales.reduce((acc, h) => acc + h.grandTotal, 0),
+        unapprovedRefundsCount: unapprovedRefunds.length,
+        unapprovedRefundsValue: unapprovedRefunds.reduce((acc, r) => acc + r.totalRefundAmount, 0),
+        pendingStockAdjustmentsCount: pendingAdjustments.length,
+      });
+
+      onSaveEODReport(report);
+      setPastReports((prev) => [report, ...prev.filter((r) => r.id !== report.id)]);
+      setSelectedPastReport(report);
+      setViewTab('PAST_REPORTS');
+    } catch (err) {
+      setFinalizeError(err instanceof ApiClientError ? err.message : 'Failed to finalize EOD report. Please try again.');
+    } finally {
+      setIsFinalizing(false);
+    }
   };
 
   return (
@@ -334,7 +375,7 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
                   : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
               }`}
             >
-              Archived EOD Reports ({eodReports.length})
+              Archived EOD Reports ({pastReports.length})
             </button>
           </div>
 
@@ -365,6 +406,17 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
 
       {viewTab === 'ACTIVE_EOD' ? (
         <div className="space-y-4">
+          {reconciliationError && (
+            <Alert type="error" title="Could Not Load Reconciliation Data">{reconciliationError}</Alert>
+          )}
+
+          <Alert type="warning" size="sm" icon={<Info className="w-4 h-4 shrink-0" />}>
+            <strong>Returns &amp; Payouts:</strong> credit notes aren't yet linked back to the shift that issued
+            them, and there is no cash-payout recording feature yet — so the Sales Returns and Petty Cash rows
+            below will always show $0.00 expected regardless of what actually happened. Verify those two
+            categories manually until this is built.
+          </Alert>
+
           {/* PROMINENT UNRESOLVED CONDITIONS ALERT BANNER */}
           {unresolvedConditionsCount > 0 && (
             <div className="bg-amber-50 border-2 border-amber-500 p-4 shadow-sm space-y-3">
@@ -381,7 +433,7 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 pt-1 text-xs">
                 {/* Condition: Open Tills */}
                 <div className={`p-2.5 border ${
-                  openTills.length > 0 ? 'bg-rose-50/80 border-rose-300 text-rose-900' : 'bg-white border-gray-200 text-gray-700'
+                  openTillsCount > 0 ? 'bg-rose-50/80 border-rose-300 text-rose-900' : 'bg-white border-gray-200 text-gray-700'
                 }`}>
                   <div className="flex items-center justify-between mb-1">
                     <span className="font-bold text-[11px] uppercase tracking-tight flex items-center gap-1">
@@ -389,11 +441,11 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
                       Open Tills / Registers
                     </span>
                     <span className="font-mono font-bold px-1.5 py-0.5 bg-rose-200 text-rose-950 text-[11px]">
-                      {openTills.length}
+                      {openTillsCount}
                     </span>
                   </div>
                   <p className="text-[11px] text-gray-600">
-                    {openTills.length > 0 ? 'Registers must be closed before final Z-Report.' : 'All registers balanced & closed.'}
+                    {openTillsCount > 0 ? 'Registers must be closed before final Z-Report.' : 'All registers balanced & closed.'}
                   </p>
                 </div>
 
@@ -411,8 +463,8 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
                     </span>
                   </div>
                   <p className="text-[11px] text-gray-600">
-                    {unresolvedHeldSales.length > 0 
-                      ? `$${unresolvedHeldSales.reduce((acc, h) => acc + h.grandTotal, 0).toFixed(2)} in parked customer carts.` 
+                    {unresolvedHeldSales.length > 0
+                      ? `$${unresolvedHeldSales.reduce((acc, h) => acc + h.grandTotal, 0).toFixed(2)} in parked customer carts.`
                       : 'Zero parked sales.'}
                   </p>
                 </div>
@@ -467,6 +519,7 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
                 </h3>
                 <p className="text-[11px] text-gray-300 font-mono">
                   Reconciling trading day {selectedDate} for {activeBranch.name}
+                  {isLoadingReconciliation && ' • Loading…'}
                 </p>
               </div>
               <div className="text-right">
@@ -489,10 +542,18 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
                 <tbody className="divide-y divide-gray-200">
                   {reconciliationList.map((entry) => {
                     const isDiff = Math.abs(entry.variance) > 0.01;
+                    const hasKnownZeroLimitation = CATEGORIES_WITH_KNOWN_ZERO_LIMITATION.has(entry.category);
                     return (
                       <tr key={entry.category} className={isDiff ? 'bg-rose-50/40' : 'hover:bg-gray-50'}>
                         <td className="py-3 px-3">
-                          <div className="font-bold text-gray-900">{entry.label}</div>
+                          <div className="font-bold text-gray-900 flex items-center gap-1.5">
+                            {entry.label}
+                            {hasKnownZeroLimitation && (
+                              <span title="Expected amount not yet linked to real data — see banner above">
+                                <Info className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                              </span>
+                            )}
+                          </div>
                           <span className="text-[10px] font-mono text-gray-500 uppercase">{entry.category}</span>
                         </td>
                         <td className="py-3 px-3 text-right font-mono font-bold text-gray-900 text-xs">
@@ -511,8 +572,8 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
                           </div>
                         </td>
                         <td className={`py-3 px-3 text-right font-mono font-bold text-xs ${
-                          isDiff 
-                            ? entry.variance < 0 ? 'text-rose-600' : 'text-amber-600' 
+                          isDiff
+                            ? entry.variance < 0 ? 'text-rose-600' : 'text-amber-600'
                             : 'text-emerald-700'
                         }`}>
                           {entry.variance === 0 ? '$0.00' : `${entry.variance < 0 ? '-' : '+'}$${Math.abs(entry.variance).toFixed(2)}`}
@@ -599,7 +660,7 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
                       className="mt-0.5 rounded-none border-gray-300 text-[#FF6B00] focus:ring-[#FF6B00]"
                     />
                     <span className="text-[11px] text-gray-700 leading-snug">
-                      I hereby verify and certify that all cash drawers, electronic batches, and credit transactions 
+                      I hereby verify and certify that all cash drawers, electronic batches, and credit transactions
                       for <strong>{activeBranch.name}</strong> on <strong>{selectedDate}</strong> have been audited and reconciled.
                     </span>
                   </label>
@@ -612,12 +673,16 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
               </div>
             </div>
 
+            {finalizeError && (
+              <Alert type="error" size="sm">{finalizeError}</Alert>
+            )}
+
             {/* Action Bar */}
             <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-3 border-t border-gray-200">
               <div className="text-xs text-gray-500 font-mono">
-                {openTills.length > 0 && (
+                {openTillsCount > 0 && (
                   <span className="text-rose-600 font-bold">
-                    ⚠️ {openTills.length} open shift till(s) remain unclosed.
+                    ⚠️ {openTillsCount} open shift till(s) remain unclosed.
                   </span>
                 )}
               </div>
@@ -639,6 +704,8 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
                   variant="primary"
                   size="md"
                   onClick={handleFinalizeEOD}
+                  isLoading={isFinalizing}
+                  disabled={isLoadingReconciliation}
                   className="w-full sm:w-auto bg-[#FF6B00] hover:bg-[#E05E00] text-white font-bold"
                 >
                   <CheckCircle2 className="w-4 h-4 mr-1.5" />
@@ -669,7 +736,7 @@ export const EODSummaryView: React.FC<EODSummaryViewProps> = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-200 font-mono text-[11px]">
-                  {eodReports.map((rep) => (
+                  {pastReports.map((rep) => (
                     <tr key={rep.id} className="hover:bg-gray-50">
                       <td className="py-2.5 px-3 font-bold text-gray-900">{rep.reportNumber}</td>
                       <td className="py-2.5 px-3 text-gray-700">{rep.date}</td>

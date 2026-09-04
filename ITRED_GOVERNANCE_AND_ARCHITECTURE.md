@@ -1546,3 +1546,116 @@ side-table for two nullable strings.
   `JoinTenantConfirm`'s "add a new branch" path) also require coordinates at
   creation time, but nothing back-fills coordinates for branches that
   predate this addendum in an existing tenant.
+
+## BRANCH TERMINAL CORE FLOWS — AUDIT & EOD WIRING ADDENDUM (2026-09-02)
+
+This prompt asked for the branch-terminal app's core flows (sell/cart, view
+products, returns, EOD) to be wired to the real backend, plus the
+already-built delivery-dispatch and fiscalization hooks to be attached at
+the sale-complete point — with explicit instructions to stop and report
+rather than build a parallel path if either hook didn't cleanly attach. An
+audit against the actual codebase (not assumption) found most of the
+requested scope already done in Prompt 3 and the delivery/fiscalization
+prompts; this addendum records what the audit found, what it fixed, and
+what it deliberately left as a flagged gap rather than silently patching.
+
+### DL-031: Audit findings — sell/cart, products, and returns were already real; two hooks needed attention
+
+**Already wired, verified by direct inspection, no changes made**: sell/cart
+(`SalesView` → `POST /sales`, written through the outbox — Prompt 3), view
+products (`App.tsx` fetches `GET /inventory/items`, real local SQLite synced
+from Supabase, passed down as a prop — the mock-data import in `SalesView`
+is only an unused-until-loaded default), and accept returns (`CreditNotesView`
+→ `POST /credit-notes` — Prompt 3). The fiscalization hook was also
+confirmed already correctly attached: `queueSaleForFiscalization()` is
+called directly inside `server/routes/sales.ts`'s sale-creation route.
+
+**Delivery CTA — functionally attached, but missing the specified
+connectivity behavior**: `ReceiptModal`'s "Create Delivery Dispatch" button
+was already wired end-to-end (`onCreateDelivery` → `onNavigateToDeliveryDispatch(saleNumber)`
+→ `DeliveryDispatchView`, from the Delivery Dispatch addendum's
+re-confirmation pass), but had no disabled-when-offline state and no
+connectivity indicator, contrary to this prompt's explicit requirement. Not
+a structural mismatch requiring a decision — `useConnectivity()` (DL-008)
+already existed and was simply unused here. Fixed: the button is now
+`disabled` (not hidden) while offline, with a `Wifi`/`WifiOff` indicator
+next to it, mirroring the gating `DeliveryDispatchView` itself already
+applies to its own create action.
+
+### DL-032: EOD was entirely unwired — built on closed shifts' frozen totals, never on raw transactions
+
+**Decision**: `EODSummaryView` was 100% local React state with no backend
+route at all, despite `eod_reports`/`eod_reconciliation_entries` existing in
+the schema since Prompt 1. `server/routes/eod.ts` (new) aggregates EOD's
+seven tender categories by summing the corresponding column
+(`total_cash_sales`, `total_mobile_money_sales`, etc.) across every
+`status = 'CLOSED'` shift row for the branch/date — those columns are
+themselves populated at shift-close time from `shiftReconciliation.ts`'s
+immutable snapshot (`server/routes/shifts.ts`'s close handler). EOD
+therefore never touches `sales_transactions` or recomputes anything a
+shift already froze — it only sums numbers that were already locked at
+shift-close, which is what "reconcile against shiftReconciliation.ts, which
+must remain immutable/versioned" requires. `POST /eod/reports` always
+recomputes expected amounts server-side from this same aggregation — the
+client only ever supplies physically-counted amounts and notes, never
+expected ones, so a stale or tampered client value can't misstate what the
+system actually recorded. Verified against the running server end-to-end
+(login, fetch reconciliation, finalize, list — including a pre-seeded
+historical report surfacing correctly alongside the new one), not just
+type-checked.
+
+**Known limitation, flagged rather than fixed (your explicit call)**:
+`shifts.total_refunds`, `total_payouts`, and `total_layaway_receipts` are
+never populated by any real write path — credit notes (returns) live in
+their own ledger with no link back to the issuing shift, and there is no
+cash-payout feature anywhere in this codebase. REFUNDS and PAYOUTS will
+therefore always aggregate to $0.00 in both the reconciliation screen and
+finalized reports, regardless of what actually happened that day. Rather
+than silently shipping a number that looks reconciled but isn't,
+`EODSummaryView` shows an explicit warning banner naming this, and an info
+icon on the two affected table rows. Building real credit-note-to-shift
+linkage and a cash-payout feature is out of scope for this prompt — revisit
+if EOD accuracy on those two categories becomes a blocker.
+
+**Two pre-existing, unrelated type errors surfaced and fixed while rewriting
+this file** (present before this prompt, not introduced by it — confirmed
+via a before/after `tsc` diff): `unresolvedHeldSales` filtered on
+`hs.status === 'HELD' || hs.status === 'PARKED'`, values that don't exist in
+`HeldSale.status`'s real union (`'OUTSTANDING' | 'SETTLED' | 'CONVERTED_CREDIT' | 'CANCELLED'`)
+and so could never have matched a real record — fixed to filter on
+`'OUTSTANDING'`. `pendingAdjustments` filtered on `sa.status === 'PENDING_APPROVAL'`,
+a field that doesn't exist on `StockAdjustmentRecord` at all (it's an
+already-posted, one-shot record with no approval workflow) — left as an
+explicit empty list with a comment, rather than inventing an approval
+workflow that wasn't asked for.
+
+### Hardware peripheral integration — researched per this prompt's request, not built
+
+No official `tauri-apps`-org plugin exists for POS hardware. Findings,
+recorded here so a later prompt doesn't have to re-research this:
+
+- **Barcode scanner**: needs no Tauri plugin at all. Standard retail
+  scanners are USB-HID keyboard-wedge or POS-scanner-class devices that
+  emit keystrokes; the robust approach is capturing rapid keystroke+Enter
+  bursts into a focused input, which works today even before Tauri
+  packaging is finished.
+- **Receipt printer (ESC/POS)**: third-party-only, mixed maturity —
+  `tauri-plugin-esc-pos`, `tauri-plugin-thermal-printer`,
+  `tauri-plugin-lnxdxtf-thermal-printer` (adds Bluetooth),
+  `tauri-plugin-thermoprint`. Picking one means taking a dependency on a
+  single third-party maintainer; none evaluated in depth or installed.
+- **Cash drawer**: not a separate integration — conventionally kicked via
+  an ESC/POS pulse command sent through the receipt printer's own
+  RJ11/RJ12 port, so whichever printer plugin is chosen typically covers
+  this for free.
+- **Generic serial/USB**: `tauri-plugin-serialplugin` (s00d) is the most
+  actively maintained generic option if a device needs raw serial rather
+  than one of the ESC/POS-specific plugins.
+
+**Not implemented, deliberately**: the Tauri sidecar/plugin foundation from
+the earlier Tauri-scaffolding session is still incomplete (`lib.rs` only
+registers the log plugin — see the "Second Tauri flag" note and the
+still-open Cargo dependency work). Wiring any of the above against that
+unfinished foundation would risk exactly the "parallel/duplicate path"
+problem this prompt warned against. Recommend treating hardware I/O as its
+own later prompt once Tauri packaging itself is finished.

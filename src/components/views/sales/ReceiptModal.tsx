@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
-import { Printer, Check, Copy, X, Truck } from 'lucide-react';
+import { Printer, Check, Copy, X, Truck, Wifi, WifiOff } from 'lucide-react';
 import { SaleTransaction, StaffMember } from '../../../types';
 import { Modal } from '../../ui/Modal';
 import { Button } from '../../ui/Button';
+import { useConnectivity } from '../../../hooks/useConnectivity';
 
 export interface ReceiptModalProps {
   isOpen: boolean;
@@ -20,6 +21,12 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
   currentStaff,
   onCreateDelivery,
 }) => {
+  // DL-008/DL-015: delivery dispatch creation is never queued for later —
+  // it's disabled (not hidden) while offline, with a visible connectivity
+  // indicator, mirroring exactly how DeliveryDispatchView itself already
+  // gates its own "create" action.
+  const connectivity = useConnectivity();
+  const isOffline = connectivity === 'OFFLINE';
   const [isPrinted, setIsPrinted] = useState(false);
 
   if (!sale) return null;
@@ -45,15 +52,27 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
             Close
           </Button>
           {onCreateDelivery && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={onCreateDelivery}
-              leftIcon={<Truck className="w-4 h-4" />}
-              className="font-bold border-orange-300 text-orange-700 hover:bg-orange-50"
-            >
-              Create Delivery Dispatch
-            </Button>
+            <div className="flex items-center gap-1.5">
+              <span
+                title={isOffline ? 'Offline — reconnect to create a delivery dispatch' : 'Online'}
+                className={`inline-flex items-center gap-1 px-1.5 py-1 text-[10px] font-bold uppercase tracking-wide ${
+                  isOffline ? 'text-rose-600' : 'text-emerald-600'
+                }`}
+              >
+                {isOffline ? <WifiOff className="w-3.5 h-3.5" /> : <Wifi className="w-3.5 h-3.5" />}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onCreateDelivery}
+                disabled={isOffline}
+                title={isOffline ? 'Delivery dispatch requires an active connection' : undefined}
+                leftIcon={<Truck className="w-4 h-4" />}
+                className="font-bold border-orange-300 text-orange-700 hover:bg-orange-50"
+              >
+                Create Delivery Dispatch
+              </Button>
+            </div>
           )}
           <Button
             variant="primary"
