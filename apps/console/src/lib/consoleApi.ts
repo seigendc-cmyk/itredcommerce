@@ -1,12 +1,14 @@
 import { supabase } from './supabaseClient';
-import type { PlanComponentRow, TenantSubscriptionRow, BillingLineItem } from './billingEngine';
+import type { PlanComponentRow, TenantSubscriptionRow, BillingLineItem, BillingCycle } from './billingEngine';
 
-export type { PlanComponentRow, TenantSubscriptionRow, BillingLineItem };
+export type { PlanComponentRow, TenantSubscriptionRow, BillingLineItem, BillingCycle };
 
 export interface TenantRow {
   id: string;
   display_name: string;
   status: string;
+  billing_cycle: BillingCycle;
+  onboarding_completed_at: string | null;
 }
 
 export interface ActivationRequestRow {
@@ -35,6 +37,8 @@ export interface BillingInvoiceRow {
   id: string;
   tenant_id: string;
   billing_period: string;
+  period_start: string | null;
+  period_end: string | null;
   line_items: BillingLineItem[];
   total: number;
   currency: string;
@@ -56,7 +60,10 @@ async function invokeConsoleFunction<T>(name: string, body: Record<string, unkno
 }
 
 export async function listTenants(): Promise<TenantRow[]> {
-  const res = await supabase.from('tenants').select('id, display_name, status').order('display_name');
+  const res = await supabase
+    .from('tenants')
+    .select('id, display_name, status, billing_cycle, onboarding_completed_at')
+    .order('display_name');
   return unwrap({ data: res.data ?? [], error: res.error });
 }
 
@@ -121,7 +128,7 @@ export async function deletePlanComponent(id: string): Promise<void> {
 export async function listTenantSubscriptions(tenantId: string): Promise<TenantSubscriptionRow[]> {
   const res = await supabase
     .from('tenant_subscriptions')
-    .select('id, plan_component_id, quantity')
+    .select('id, plan_component_id, quantity, active_since, active_until')
     .eq('tenant_id', tenantId);
   return unwrap({ data: res.data ?? [], error: res.error });
 }
@@ -135,7 +142,7 @@ export async function createTenantSubscription(input: {
   const res = await supabase
     .from('tenant_subscriptions')
     .insert({ id, tenant_id: input.tenantId, plan_component_id: input.planComponentId, quantity: input.quantity })
-    .select('id, plan_component_id, quantity')
+    .select('id, plan_component_id, quantity, active_since, active_until')
     .single();
   return unwrap({ data: res.data, error: res.error });
 }
@@ -145,24 +152,36 @@ export async function updateTenantSubscriptionQuantity(id: string, quantity: num
   if (error) throw new Error(error.message);
 }
 
-export async function deleteTenantSubscription(id: string): Promise<void> {
-  const { error } = await supabase.from('tenant_subscriptions').delete().eq('id', id);
+// DL-053: soft delete (active_until = now()), not a hard DELETE — a hard
+// delete would erase the row (and its active_since) before the period it
+// was active during ever gets invoiced, silently under-billing for days
+// already used. tenant_subscriptions' DELETE grant was revoked at the
+// database level for exactly this reason (see the migration that added
+// this), so a hard delete isn't even available as a fallback here anymore.
+export async function endTenantSubscription(id: string): Promise<void> {
+  const { error } = await supabase
+    .from('tenant_subscriptions')
+    .update({ active_until: new Date().toISOString() })
+    .eq('id', id);
   if (error) throw new Error(error.message);
 }
 
+// DL-052/DL-053: billingPeriod is no longer caller input — the Edge
+// Function derives it (and period_start/period_end) from the tenant's
+// billing_cycle and either their most recent invoice or their onboarding
+// anchor. This always generates whatever the next period in sequence is.
 export async function generateBillingInvoice(input: {
   tenantId: string;
-  billingPeriod: string;
-}): Promise<{ id: string; lineItems: BillingLineItem[]; total: number; currency: string }> {
+}): Promise<{ id: string; billingPeriod: string; periodStart: string; periodEnd: string; lineItems: BillingLineItem[]; total: number; currency: string }> {
   return invokeConsoleFunction('console-generate-billing-invoice', input);
 }
 
 export async function listBillingInvoices(tenantId: string): Promise<BillingInvoiceRow[]> {
   const res = await supabase
     .from('billing_invoices')
-    .select('id, tenant_id, billing_period, line_items, total, currency, status, paid_at, payment_reference')
+    .select('id, tenant_id, billing_period, period_start, period_end, line_items, total, currency, status, paid_at, payment_reference')
     .eq('tenant_id', tenantId)
-    .order('billing_period', { ascending: false });
+    .order('period_end', { ascending: false, nullsFirst: false });
   return unwrap({ data: res.data ?? [], error: res.error });
 }
 

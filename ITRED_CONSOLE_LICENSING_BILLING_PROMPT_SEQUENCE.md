@@ -419,7 +419,7 @@ Once confirmed, the full scope was implemented and committed as DL-048/049/050:
 
 ---
 
-## Sequence drift — read before drafting Prompt 15
+## Sequence drift — read before drafting anything past Prompt 14
 
 Between Prompt 13 and Prompt 14 landing, one additional, undrafted prompt was
 run in this session (commit `bc264b6`, "Build console-operator auth, terminal
@@ -434,38 +434,238 @@ It built, ahead of where this sequence placed them:
   issuance Edge Function depends on it (it needs a real operator identity to
   attribute `issued_by` to).
 - **A first cut of the billing calculation engine** (DL-047) —
-  `calculateInvoiceLineItems()` (duplicated between `apps/console` and the
-  `console-generate-billing-invoice` Edge Function, deliberately, per DL-038's
-  zero-shared-runtime rule), wired into a working `BillingOverviewPage` in
-  `apps/console` with real Supabase reads/writes, plan-component CRUD, and
-  invoice generation/mark-paid actions.
+  `calculateInvoiceLineItems()`, `billing_invoices` RLS, and a working
+  `BillingOverviewPage` in `apps/console`. Full DL-047 record below (it was
+  never actually captured in this companion doc at the time it landed —
+  backfilled here rather than left as a permanent gap).
 
-**Implication for Prompt 15 as this document currently drafts it**: it should
-NOT assume it's starting billing from zero. `plan_components`/
+### DL-047, backfilled
+
+`calculateInvoiceLineItems(components, subscriptions)` — a pure function
+(mirroring `server/lib/fareEngine.ts`'s "caller passes the exact
+already-selected rows" discipline) that takes each tenant's active
+`tenant_subscriptions` row, multiplies `quantity` by the referenced
+`plan_components.unit_price`, and labels the line with that component's own
+`billing_unit`. It never branched on `component_type` or `billing_unit`'s
+value — no opinion on flat-vs-scaled feature billing or proration, because
+neither was decided yet (both were DL-043 open items at the time). The same
+~25-line function exists in two places — `apps/console/src/lib/
+billingEngine.ts` (live preview) and inside `console-generate-billing-invoice`
+(the authoritative write) — duplicated rather than shared, per DL-038's
+zero-shared-runtime rule between `apps/console` and everything else. Once
+created, a `billing_invoices` row's `total`/`line_items` were made effectively
+immutable: the RLS grant lets a console operator only
+`update(status, paid_at, payment_reference)` directly. `plan_components` and
+`tenant_subscriptions` got ordinary direct RLS-gated CRUD for `authenticated`
+console operators (no Edge Function needed), since editing a price list or a
+subscription's quantity carries neither a signing-key nor a
+trusted-attribution requirement. Rationale: a calculator that stays
+mechanically neutral on undecided questions is safer than one that guesses —
+DL-043 required implementers to "not default to one interpretation," and
+writing code with no interpretation baked in is how that's honored literally.
+
+**Implication that held until the detour below**: `plan_components`/
 `tenant_subscriptions` CRUD, `billing_invoices` RLS, and a mechanically-neutral
-line-item calculator already exist and are already wired into `apps/console`'s
-UI. What Prompt 15 as originally conceived would still need to add: EcoCash/
-aggregator payment integration (DL-044, still unresolved), renewal scheduling,
-and — the two things DL-047 deliberately left unresolved — a decision on
-feature add-on billing scope (flat vs. per-branch/per-terminal) and proration
-on mid-cycle additions. Draft Prompt 15 against that actual starting point,
-not against an empty billing surface.
+line-item calculator already existed, wired into `apps/console`'s UI, before
+any prompt calling itself "Prompt 15" ever ran.
+
+---
+
+## Detour — feature add-on billing scope resolved via DL-051, not by Prompt 15
+
+Before a "Prompt 15" could run as originally drafted, a premise check on the
+existing `calculateInvoiceLineItems` revealed it did **not** already implement
+tenant-wide flat fee for feature add-ons as had been assumed — it never
+branched on `component_type` at all, and was mechanically neutral by design
+(exactly as DL-047 above documents). Rather than record that as a settled
+fact it wasn't, the decision was made explicitly and implemented:
+
+- **Migration** `20260905140000_feature_addon_flat_fee.sql` — a
+  `BEFORE INSERT OR UPDATE` trigger on `tenant_subscriptions` rejecting any
+  feature-type row with `quantity ≠ 1`. Enforced at the database level, not
+  client-side, since `tenant_subscriptions` has direct RLS-gated CRUD for any
+  console operator — a UI-only or calculator-only check could be bypassed via
+  a direct Supabase REST write.
+- `calculateInvoiceLineItems` itself was **not modified** — still never
+  branches on `component_type`. Its header comment in both copies now states
+  the scope question is resolved, and that it's resolved by the trigger, not
+  by the calculator gaining an opinion.
+- `BillingOverviewPage.tsx` — quantity inputs lock to `1` and disable
+  themselves when a feature component is selected.
+- Governance doc: DL-043's feature-billing-scope paragraph and its Open Items
+  bullet now say resolved; **DL-051** added recording the decision,
+  enforcement mechanism, and rationale.
+- **✅ Committed** — `5fa3d6e`.
+
+---
+
+## Step 0 audit — proration and a deeper billing-period gap
+
+Before implementing proration, both copies of `calculateInvoiceLineItems` and
+everything feeding them were audited. Findings:
+
+- **Proration was completely unhandled** — not partial, not stubbed. The
+  calculation was `quantity × unit_price` per active subscription, full stop.
+  No time dimension anywhere in either input.
+- `tenant_subscriptions.active_since` existed in schema but was **never
+  read** anywhere in the codebase (confirmed via repo-wide grep) — not even
+  included in the row shape `calculateInvoiceLineItems` received.
+- `tenant_subscriptions.active_until` was read, but only as a binary
+  include/exclude filter for "is this subscription active right now" — never
+  used to compute a partial-period amount.
+- Concrete implication: a branch or feature added mid-cycle was billed at
+  full `unit_price` with no reduction (confirmed via repo-wide grep for
+  "prorat" — no hits outside governance-doc prose).
+- **Deeper gap surfaced**: `billing_invoices.billing_period` was free text
+  (e.g. `'YYYY-MM'`), typed by hand by whoever called the generate-invoice
+  function. No stored per-tenant billing-cycle-length setting existed
+  anywhere — `tenants.fiscal_year_start_month` only anchors fiscal-year
+  reporting, not billing recurrence length. Confirmed separately: billing
+  cycle is genuinely tenant-configurable (monthly/quarterly/yearly), not
+  uniform — making this a real prerequisite, not a side issue.
+
+---
+
+## Prompt 15 (revised) — Billing Cycle Schema + Proration ✅ Both steps implemented, not yet committed
+
+```
+Before implementing proration, address a prerequisite gap surfaced during the
+Step 0 audit: billing_invoices.billing_period is currently free-text, typed by
+hand, with no stored per-tenant billing-cycle-length setting. Proration cannot
+be computed correctly without a real cycle length to measure a partial period
+against.
+
+1. BILLING CYCLE SCHEMA
+   - Add a billing_cycle field to tenants: enum of 'monthly', 'quarterly',
+     'yearly'. This is distinct from the existing fiscal_year_start_month,
+     which anchors fiscal year start, not billing recurrence.
+   - Propose whether billing_period on billing_invoices should become a
+     derived/computed value (e.g. actual start/end dates stored per invoice,
+     computed from active_since + billing_cycle at generation time) rather
+     than free text, for my review before implementing — this is a schema
+     change beyond Prompt 15's original scope, so show me the migration
+     before applying it.
+   - Confirm: does changing a tenant's billing_cycle mid-relationship need any
+     special handling (e.g. an existing monthly tenant switching to annual),
+     or is that out of scope for now? Flag if you think it needs a decision
+     from me rather than assuming.
+
+2. MID-CYCLE PRORATION
+   - With a real cycle length available, propose a proration approach
+     (immediate prorated charge vs. rolled into next invoice) for my review
+     before implementing — do not decide unilaterally, per DL-043.
+   - Proration math should use the tenant's actual billing_cycle length (30/90/
+     365-ish days depending on monthly/quarterly/yearly) against
+     tenant_subscriptions.active_since, not a hardcoded assumption of monthly.
+
+Stop after step 1's schema proposal and again after step 2's proration
+proposal — do not proceed past either without my confirmation.
+```
+
+**Step 1 result (DL-052)** — proposed and confirmed before writing the
+migration:
+
+- `tenants.billing_cycle` (text + check, `'monthly'|'quarterly'|'yearly'`,
+  default `'monthly'`) — confirmed.
+- Anchor for a tenant's first period: **`tenants.onboarding_completed_at`**,
+  reused rather than adding a new column — confirmed over a dedicated
+  `billing_anchor_at` field.
+- Period math: **calendar-based** (`+1`/`+3`/`+12` months via
+  `compute_billing_period_end()`) — confirmed over fixed 30/90/365-day
+  cycles, so "your March invoice" stays the actual calendar March
+  indefinitely rather than drifting.
+- `billing_period` **kept**, not dropped — becomes a computed display label
+  (e.g. `'2026-09'`), no longer accepted as caller input — confirmed over
+  dropping it entirely. `billing_invoices` gains `period_start`/`period_end`
+  (`timestamptz`, nullable) as the actual source of truth.
+- Mid-relationship `billing_cycle` changes: **out of scope, confirmed rather
+  than assumed** — applies prospectively only; no retroactive transition
+  rule built.
+- Migration: `supabase/migrations/20260905150000_billing_cycle_and_periods.sql`.
+- Governance doc: **DL-052** added.
+
+**Step 2 result (DL-053)** — proposed and confirmed before implementing:
+
+- Proration **rolled into the next invoice** — confirmed over an immediate
+  out-of-band charge (which would need a new triggering mechanism and
+  double-billing-avoidance bookkeeping the rolled-in approach doesn't).
+  Formula: `fraction = (effectiveEnd - effectiveStart) / (period_end -
+  period_start)`, clipped to `[active_since, active_until ?? period_end] ∩
+  [period_start, period_end)`. Applies uniformly to every `component_type`
+  including `'feature'` rows — DL-051 is about scale, not an exemption from
+  proration.
+- A related gap surfaced and fixed alongside it, **confirmed rather than
+  assumed**: `tenant_subscriptions`' hard `DELETE` would silently under-bill
+  a mid-period removal (the row, and its `active_since`, would be gone
+  before that period's invoice ever generates). `deleteTenantSubscription`
+  was renamed to `endTenantSubscription` and now soft-deletes via
+  `active_until = now()`; the `DELETE` grant/policy on the table was revoked
+  at the database level so this is an enforced invariant, not a client
+  convention.
+- `console-generate-billing-invoice` no longer accepts `billingPeriod` as
+  input at all — it chains periods itself (previous invoice's `period_end`,
+  or the onboarding anchor for a first invoice) and queries subscriptions
+  overlapping `[period_start, period_end)` rather than "active right now"
+  (which was only ever correct by coincidence for whatever period happened
+  to be current).
+- Explicitly **not built**: a guard against generating an invoice for a
+  period that hasn't elapsed yet in real time — flagged as a natural
+  companion to the not-yet-built scheduled generator, not decided here.
+- Migration: `supabase/migrations/20260905160000_tenant_subscription_soft_delete.sql`.
+- Tests: `apps/console/src/lib/billingEngine.test.ts` (13 new tests — full
+  period, mid-start, mid-end, both, excluded-entirely both directions,
+  feature-type parity, multi-line summation, period-math including the
+  Jan-31 calendar-overflow quirk, period chaining). `npm test` now covers
+  `apps/console/src/lib/**/*.test.ts` alongside the existing server tests —
+  **32/32 passing**, both `apps/console` and root typechecks clean.
+- Governance doc: **DL-053** added.
+
+**Not yet committed** — this is implemented and verified but sitting in the
+working tree as of this writing; commit when ready.
+
+Sections 3–5 of the original Prompt 15 draft are still ahead, unaffected by
+this detour:
+
+- **TerminalActivationToken renewal linkage** — trigger issuance of a
+  renewed token on successful invoice payment, replacing the 30-day
+  placeholder with a period tied to the tenant's actual `billing_cycle`.
+- **`PaymentProvider` abstraction** — EcoCash/aggregator integration
+  (Paynow or otherwise) behind an interface, so the still-unresolved
+  aggregator choice (DL-044) doesn't touch invoice-generation logic.
+- **Renewal/retry scheduling** — failed/declined payment handling, an
+  overdue-status escalation path, and the handoff into the existing
+  grace-period/module-lock logic from Prompt 14 (an unrenewed token simply
+  expires and the existing lock takes over — no separate lock mechanism).
+- Tests still owed per the original ask: invoice generation against a known
+  `tenant_subscriptions` set (partially covered now by the proration tests
+  above, but not yet an end-to-end generation test), and the
+  failed-payment → no-renewal → grace-period handoff.
 
 ---
 
 ## Still open (carried forward from the governance doc)
 
-- Feature add-on billing scope (tenant-wide vs. per-branch/per-terminal) — DL-043.
-  DL-047's calculation engine is deliberately built to not need this answer yet.
-- Mid-cycle proration approach — DL-043. Same as above.
+- ~~Feature add-on billing scope~~ — **Resolved via DL-051.** No longer open.
+- ~~Proration approach~~ — **Resolved via DL-053** (rolled into next
+  invoice). No longer open.
+- ~~Billing cycle length not represented in schema~~ — **Resolved via
+  DL-052.** No longer open.
+- ~~Whether `billing_period` should be derived~~ — **Resolved via DL-052**
+  (kept as a derived label, `period_start`/`period_end` added as source of
+  truth). No longer open.
+- Mid-relationship `billing_cycle` change transition rule — explicitly out
+  of scope per DL-052, not decided.
+- Guard against generating a not-yet-elapsed period's invoice — flagged in
+  DL-053 as a companion to the scheduled generator, not built.
 - PoolWise / CashPlan functional scope — undefined, placeholder only.
 - Specific EcoCash payment aggregator selection — DL-044.
 - DL-028's `LicenceInfo.activationCode` — needs inspection to decide
   retire/merge/keep-distinct relative to `TerminalActivationToken`. Still
   untouched.
-- TerminalActivationToken default validity period (30 days) — explicitly
-  marked as a placeholder in code and in the governance doc, pending Prompt
-  15's billing-cycle design.
+- TerminalActivationToken default validity period (30 days) — still an
+  explicit placeholder pending TerminalActivationToken renewal linkage
+  (Prompt 15 section 3) computing it from the tenant's actual `billing_cycle`
+  instead.
 - Tenant-configurable working-day calendar (DL-040) — still hardcoded to
   Mon–Fri; a per-tenant calendar remains unbuilt.
 - WhatsApp activation-request flow (DL-041) and `apps/console`'s issuance UI
@@ -474,16 +674,20 @@ not against an empty billing surface.
 
 ## Next in sequence
 
-- **Prompt 13** — ✅ Console scaffold + schema/RLS. Committed.
-- **Prompt 14** — ✅ Token issuance + offline verification. Committed,
-  including its stop-and-wait gate on signing scheme.
-- **Prompt 15** — Billing engine. Partially pre-built (see "Sequence drift"
-  above) — scope remaining work (EcoCash/aggregator integration, renewal
-  scheduling, and resolving proration/add-on billing scope) against the
-  existing `apps/console` billing UI and `calculateInvoiceLineItems` engine,
-  not from scratch.
+- ~~**Prompt 13** — Console scaffold + schema/RLS.~~ ✅ Committed (`61f901d`).
+- ~~**Prompt 14** — Token issuance + offline verification.~~ ✅ Committed
+  (`bfea8ff`, `c4b6e90`).
+- *(unnumbered)* Console-operator auth + first billing engine cut — ✅
+  Committed (`bc264b6`), ahead of plan.
+- *(unnumbered, via DL-051)* Feature add-on billing scope resolved + enforced
+  via DB trigger — ✅ Committed (`5fa3d6e`).
+- **Prompt 15 (revised), steps 1–2** — Billing cycle schema (DL-052) +
+  mid-cycle proration (DL-053). ✅ Implemented and tested, **not yet
+  committed**.
+- **Prompt 15, sections 3–5** — TerminalActivationToken renewal linkage,
+  `PaymentProvider` abstraction, renewal/retry scheduling. Not yet drafted.
 - **Prompt 16** — WhatsApp deep-link request flow + console-side fulfillment
   screen + two-ledger reconciliation logging — not yet drafted.
 - **Prompt 17** — Console UI wiring for the remaining pieces (activation
   requests issuance UI already exists from the `bc264b6` work; confirm what's
-  left before drafting) — only after 13–16 are logic-tested.
+  left before drafting) — only after 15–16 are logic-tested.

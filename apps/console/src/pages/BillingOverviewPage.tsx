@@ -1,13 +1,13 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { ConsoleShell } from '../components/ConsoleShell';
-import { calculateInvoiceLineItems } from '../lib/billingEngine';
+import { calculateInvoiceLineItems, computeNextBillingPeriod, type BillingPeriod } from '../lib/billingEngine';
 import {
   listTenants,
   listPlanComponents,
   listTenantSubscriptions,
   createTenantSubscription,
   updateTenantSubscriptionQuantity,
-  deleteTenantSubscription,
+  endTenantSubscription,
   listBillingInvoices,
   generateBillingInvoice,
   markInvoicePaid,
@@ -17,23 +17,24 @@ import {
   type BillingInvoiceRow,
 } from '../lib/consoleApi';
 
-function currentBillingPeriod(): string {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+function formatPeriodRange(period: BillingPeriod): string {
+  const fmt = (iso: string) => new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  return `${fmt(period.periodStart)} – ${fmt(period.periodEnd)}`;
 }
 
-// DL-043/DL-047: this page never decides feature-add-on billing scope or
-// proration — it only lets a console operator configure which components a
-// tenant is subscribed to (and what quantity), preview the resulting
-// invoice via the same neutral calculation the generation Edge Function
-// uses, and record payment against an already-generated invoice.
+// DL-043/DL-047/DL-052/DL-053: this page never decides feature-add-on
+// billing scope (resolved: DL-051) or the proration approach on its own
+// (resolved: DL-053, rolled into the invoice for whatever period a
+// subscription was actually active during) — it just lets a console
+// operator configure which components a tenant is subscribed to, preview
+// the resulting invoice via the same calculation the generation Edge
+// Function uses, and record payment against an already-generated invoice.
 export const BillingOverviewPage: React.FC = () => {
   const [tenants, setTenants] = useState<TenantRow[]>([]);
   const [components, setComponents] = useState<PlanComponentRow[]>([]);
   const [selectedTenantId, setSelectedTenantId] = useState<string>('');
   const [subscriptions, setSubscriptions] = useState<TenantSubscriptionRow[]>([]);
   const [invoices, setInvoices] = useState<BillingInvoiceRow[]>([]);
-  const [billingPeriod, setBillingPeriod] = useState(currentBillingPeriod());
   const [addComponentId, setAddComponentId] = useState('');
   const [addQuantity, setAddQuantity] = useState(1);
   const [loading, setLoading] = useState(true);
@@ -73,7 +74,23 @@ export const BillingOverviewPage: React.FC = () => {
     refreshTenantData(selectedTenantId);
   }, [selectedTenantId]);
 
-  const preview = useMemo(() => calculateInvoiceLineItems(components, subscriptions), [components, subscriptions]);
+  const selectedTenant = useMemo(() => tenants.find((t) => t.id === selectedTenantId) ?? null, [tenants, selectedTenantId]);
+
+  // DL-052/DL-053: mirrors the Edge Function's own period-chaining logic
+  // (next period starts where the most recent invoice left off, or at the
+  // tenant's onboarding anchor if they've never been invoiced) purely to
+  // show an accurate preview — the Edge Function computes the authoritative
+  // version itself at generation time, independent of what this shows.
+  const nextPeriod = useMemo<BillingPeriod | null>(() => {
+    if (!selectedTenant?.onboarding_completed_at) return null;
+    const mostRecentPeriodEnd = invoices.find((inv) => inv.period_end)?.period_end ?? null;
+    return computeNextBillingPeriod(selectedTenant.billing_cycle, selectedTenant.onboarding_completed_at, mostRecentPeriodEnd);
+  }, [selectedTenant, invoices]);
+
+  const preview = useMemo(
+    () => (nextPeriod ? calculateInvoiceLineItems(components, subscriptions, nextPeriod) : { lineItems: [], total: 0, currency: null }),
+    [components, subscriptions, nextPeriod]
+  );
   const componentsById = useMemo(() => new Map(components.map((c) => [c.id, c])), [components]);
 
   async function handleAddSubscription() {
@@ -109,7 +126,7 @@ export const BillingOverviewPage: React.FC = () => {
     setBusy(true);
     setError(null);
     try {
-      await deleteTenantSubscription(id);
+      await endTenantSubscription(id);
       await refreshTenantData(selectedTenantId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -122,7 +139,7 @@ export const BillingOverviewPage: React.FC = () => {
     setBusy(true);
     setError(null);
     try {
-      await generateBillingInvoice({ tenantId: selectedTenantId, billingPeriod });
+      await generateBillingInvoice({ tenantId: selectedTenantId });
       await refreshTenantData(selectedTenantId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -234,13 +251,21 @@ export const BillingOverviewPage: React.FC = () => {
           <section>
             <h2 className="text-xs font-bold uppercase tracking-wide text-slate-400 mb-2">Invoice preview</h2>
             <div className="bg-slate-900 border border-slate-800 rounded-lg p-3">
-              {preview.lineItems.length === 0 ? (
-                <p className="text-sm text-slate-500">No active subscriptions to bill.</p>
+              {!nextPeriod ? (
+                <p className="text-sm text-slate-500">This tenant hasn't completed onboarding yet — no billing anchor available.</p>
+              ) : preview.lineItems.length === 0 ? (
+                <p className="text-sm text-slate-500">No subscriptions active during {formatPeriodRange(nextPeriod)}.</p>
               ) : (
                 <>
+                  <p className="text-xs text-slate-500 mb-2">Next period: {formatPeriodRange(nextPeriod)} ({selectedTenant?.billing_cycle})</p>
                   {preview.lineItems.map((li, i) => (
                     <div key={i} className="flex justify-between text-sm py-1 border-b border-slate-800 last:border-0">
-                      <span className="text-slate-300">{li.componentType}{li.featureKey ? ` · ${li.featureKey}` : ''} × {li.quantity} ({li.billingUnit})</span>
+                      <span className="text-slate-300">
+                        {li.componentType}{li.featureKey ? ` · ${li.featureKey}` : ''} × {li.quantity} ({li.billingUnit})
+                        {li.proratedFraction < 1 && (
+                          <span className="text-amber-400"> · prorated {(li.proratedFraction * 100).toFixed(0)}%</span>
+                        )}
+                      </span>
                       <span className="text-slate-100">{li.currency} {li.amount.toFixed(2)}</span>
                     </div>
                   ))}
@@ -251,15 +276,9 @@ export const BillingOverviewPage: React.FC = () => {
                 </>
               )}
               <div className="flex items-center gap-2 mt-3 pt-3 border-t border-slate-800">
-                <input
-                  value={billingPeriod}
-                  onChange={(e) => setBillingPeriod(e.target.value)}
-                  placeholder="YYYY-MM"
-                  className="bg-slate-950 border border-slate-800 rounded px-2 py-1 text-xs text-slate-100"
-                />
                 <button
                   type="button"
-                  disabled={busy || preview.lineItems.length === 0}
+                  disabled={busy || !nextPeriod || preview.lineItems.length === 0}
                   onClick={handleGenerateInvoice}
                   className="text-xs bg-[#FF6B00] text-white px-3 py-1.5 rounded disabled:opacity-50"
                 >

@@ -2659,3 +2659,181 @@ one console page that happens to be careful about it today.
 - **Payment aggregator choice** (DL-044): unchanged, still unresolved.
 - **`LicenceInfo.activationCode`** (DL-028) and the **WhatsApp
   activation-request flow** (DL-041): unchanged by this addendum.
+
+## BILLING CYCLE SCHEMA ADDENDUM (2026-09-05)
+
+### DL-052: `tenants.billing_cycle`, and `billing_period` becomes a derived value backed by a real interval
+
+**Decision**: proration (DL-043) cannot be computed correctly without a
+real cycle length to measure a partial period against — `billing_period`
+was free text with no stored per-tenant recurrence setting, surfaced as a
+blocking gap during this prompt's Step 0 audit of `calculateInvoiceLineItems`
+before any proration logic was written. This addendum adds the prerequisite
+schema, and resolves it does not implement proration itself (DL-053+).
+
+`tenants` gains `billing_cycle text not null default 'monthly' check (...
+in ('monthly', 'quarterly', 'yearly'))` — text + check, matching every
+other enum-like column in this schema rather than a native Postgres `ENUM`
+type. Distinct from `fiscal_year_start_month`, which anchors fiscal-year
+*reporting*, not billing *recurrence*.
+
+`billing_invoices` gains `period_start`/`period_end` (`timestamptz`,
+half-open interval `[period_start, period_end)`) as the authoritative
+interval an invoice covers — nullable for now, since there's no reliable
+way to backfill a concrete interval from an arbitrary already-typed
+free-text string, and no generation/proration logic writes them yet.
+`billing_period` itself is **kept**, not dropped, but changes role: it
+becomes a computed display label (e.g. `'2026-09'` for monthly) derived
+from `period_start`/`billing_cycle` once the generator is updated to
+compute it, rather than accepted as caller input. It stays a plain column
+rather than a SQL `GENERATED` column because that computation depends on
+`tenants.billing_cycle`, a different table's column, which Postgres
+generated columns cannot reference.
+
+**Period anchor**: a tenant's first period starts at
+`tenants.onboarding_completed_at` — reused rather than adding a new
+column, since that field already represents "when this tenant relationship
+went live," and no free-trial concept exists anywhere in this schema today
+that would need it decoupled from billing start.
+
+**Period math is calendar-based, not fixed-day-count**: `period_end` is
+computed as `period_start + 1/3/12 months` (`compute_billing_period_end()`)
+depending on `billing_cycle`, not a flat 30/90/365-day span. This keeps
+"your March invoice" meaning the actual calendar March indefinitely, rather
+than slowly drifting away from real months/quarters/years the way a fixed
+30-day "month" would over many cycles. The tradeoff — a monthly period's
+actual length varies 28–31 days — is deliberately not hidden: proration
+math (DL-053+) must compute a period's length as
+`period_end - period_start`, never assume a constant.
+`compute_current_billing_period(anchor, billing_cycle, as_of)` walks
+forward from the anchor in whole cycle-length steps to find whichever
+period contains a given instant, for the same reason: correct across
+variable-length periods without drift, at the cost of a loop rather than
+a single arithmetic expression (not a performance concern at this scale —
+invoice generation runs at most a few times per tenant per period).
+
+**Changing an existing tenant's `billing_cycle` mid-relationship gets no
+special handling**, confirmed explicitly rather than assumed: the change
+applies prospectively only, to periods computed after it's made. The
+most-recently-generated period is left exactly as already invoiced — no
+retroactive proration of the transition itself. If a real transition rule
+(e.g. immediately closing out the current period pro-rated) turns out to
+be needed, that is a distinct future decision, not something this
+migration should quietly bake in.
+
+**Rationale**: deriving `billing_period` rather than trusting a
+hand-typed string is what makes a *scheduled* generator possible at all —
+a cron-invoked Edge Function has no human to type a period string each
+time, and needs the system itself to compute the correct next boundary
+from stored state. Calendar-based math over fixed-day-count mirrors how
+every real invoicing relationship this platform will actually bill against
+(monthly/quarterly/yearly EcoCash-aggregator subscriptions) is understood
+by the tenant receiving the invoice — a "30-day month" that drifts from
+the calendar would be a confusing invoice to receive, even if the math
+were simpler to implement.
+
+### Open items (unchanged, still explicitly not decided here)
+
+- **Mid-relationship `billing_cycle` change transition rule**: explicitly
+  out of scope, confirmed rather than assumed — see DL-052 above.
+- Every other open item carried forward unchanged (PoolWise/CashPlan
+  scope, payment aggregator choice, `LicenceInfo.activationCode`, the
+  WhatsApp activation-request flow).
+
+## MID-CYCLE PRORATION ADDENDUM (2026-09-05)
+
+### DL-053: Proration rolls into the next invoice; removal becomes a soft delete; invoices chain from the tenant's billing anchor
+
+**Decision**: DL-043's other open item — proration on mid-cycle
+branch/terminal/feature additions — is resolved: a subscription's
+line-item amount is prorated to whatever fraction of the invoice's own
+`[period_start, period_end)` it was actually active for, computed and
+billed on that period's regular invoice. There is no separate immediate
+out-of-band charge. Concretely, for each `tenant_subscriptions` row:
+
+```
+effectiveStart = max(active_since, period_start)
+effectiveEnd   = min(active_until ?? period_end, period_end)
+if effectiveStart >= effectiveEnd: excluded entirely from that invoice
+fraction = (effectiveEnd - effectiveStart) / (period_end - period_start)
+amount   = round(quantity * unit_price * fraction, 2)
+```
+
+This is uniform across every `component_type`, including `'feature'` rows
+— DL-051's flat-fee resolution is about *scale* (never scaling by
+branch/terminal count), not an exemption from proration; a flat fee can
+still be prorated for the partial period it was active. Neither copy of
+`calculateInvoiceLineItems` branches on `component_type` to achieve this,
+matching DL-047's existing discipline.
+
+**Rejected alternative**: an immediate prorated charge the moment a
+subscription is created. This needs meaningfully more machinery — a new
+mechanism to trigger an out-of-band invoice on subscription creation
+(a console-UI extra step, or a fragile DB-trigger-calls-Edge-Function
+chain), and bookkeeping in the following regular invoice to avoid
+double-billing the days already covered by that immediate charge.
+Rolling into the next invoice needs neither: each period's invoice is
+self-contained, computed fresh from `active_since`/`active_until`
+intersected with that period's own boundaries.
+
+**Removal becomes a soft delete**: `tenant_subscriptions`' hard `DELETE`
+would erase a row (and its `active_since`) before the period it was active
+during is ever invoiced, silently under-billing for days already used.
+`apps/console`'s `endTenantSubscription()` (renamed from
+`deleteTenantSubscription()` for accuracy) now sets `active_until =
+now()` instead. The `DELETE` grant and its RLS policy were revoked at the
+database level for `tenant_subscriptions` — the same discipline DL-051's
+flat-quantity trigger already applies to this table, so "soft delete
+only" is an enforced invariant, not a client-side convention a direct
+REST call could bypass.
+
+**Invoice period chaining**: `console-generate-billing-invoice` no longer
+accepts a `billingPeriod` string from the caller at all (superseding
+DL-047's original `{tenantId, billingPeriod}` contract). It determines the
+period to invoice itself: `period_start` is the tenant's most recently
+generated invoice's `period_end`, or `tenants.onboarding_completed_at` if
+this is their first invoice (DL-052's anchor); `period_end` is computed
+via the same calendar-based `compute_billing_period_end()` math. This
+always produces the next period in sequence — not "whatever period
+contains right now" — so a period is never skipped, duplicated, or
+overlapping regardless of when the function happens to be called. The
+`tenant_subscriptions` query backing this changed accordingly: it now
+selects rows overlapping `[period_start, period_end)` (`active_since <
+period_end AND (active_until IS NULL OR active_until > period_start)`),
+not "active as of right now" — the previous filter was only ever
+correct by coincidence, for a period that happened to still be the
+current one.
+
+**Explicitly not built here**: a guard against generating an invoice for
+a period that hasn't actually elapsed yet in real time (an operator could
+today click "Generate invoice" repeatedly and advance through future
+periods early). That's a natural companion to whichever future prompt
+builds the scheduled generator (DL-043's original "INVOICE GENERATION"
+step) — a scheduled job inherently only fires once a period is actually
+due, making the guard's purpose easy to reason about there; adding it to
+today's manual-only trigger without that context risked guessing at a
+policy rather than deciding one.
+
+**Rationale**: computing proration from real `active_since`/`active_until`
+timestamps against a genuine calendar-based period, both introduced by
+DL-052 specifically to make this possible, is what turns "mid-cycle
+proration" from a vague requirement into an exact, testable calculation —
+the same reason DL-052 was written as a prerequisite before this decision
+rather than alongside it. Enforcing the soft-delete invariant at the
+database level rather than trusting `apps/console` to always call the
+right function extends the exact discipline DL-051 already established
+for this same table's `quantity` column to its `active_until` column too.
+
+### Open items (unchanged, still explicitly not decided here)
+
+- **Mid-relationship `billing_cycle` change transition rule** (DL-052):
+  still out of scope, unchanged.
+- **Guard against generating a not-yet-elapsed period's invoice**: flagged
+  above as a natural companion to the not-yet-built scheduled generator,
+  not decided or built here.
+- Every other open item carried forward unchanged (PoolWise/CashPlan
+  scope, payment aggregator choice, `LicenceInfo.activationCode`, the
+  WhatsApp activation-request flow, the EcoCash/aggregator integration and
+  `PaymentProvider` abstraction, and `TerminalActivationToken` renewal on
+  successful payment — all still ahead in the original billing-engine
+  prompt this addendum's prerequisite work paused).
