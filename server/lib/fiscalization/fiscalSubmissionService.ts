@@ -220,6 +220,22 @@ function incrementAttempt(id: string) {
   db.prepare('UPDATE fiscal_submissions SET attempt_count = attempt_count + 1, updated_at = ? WHERE id = ?').run(nowIso(), id);
 }
 
+/**
+ * Resets a submission back to a retryable PENDING state — the one place
+ * both a same-terminal manual retry (server/routes/fiscalization.ts) and a
+ * cross-terminal remote retry (server/sync/fiscalDrainLoop.ts's
+ * applyRemoteRetryRequests, see DL-037) prepare a row before the next
+ * drain tick actually attempts it. Does not call attemptSubmission itself —
+ * callers either await it directly or rely on the caller's own PENDING scan
+ * picking the row up.
+ */
+export function resetSubmissionForRetry(id: string): void {
+  db.prepare(`UPDATE fiscal_submissions SET status = 'PENDING', non_retryable = 0, error_message = NULL, updated_at = ? WHERE id = ?`).run(
+    nowIso(),
+    id
+  );
+}
+
 interface SubmitOutcomeLike {
   outcome: 'SUBMITTED' | 'QUEUED_FOR_BATCH' | 'FAILED';
   fiscalReferenceNumber?: string;

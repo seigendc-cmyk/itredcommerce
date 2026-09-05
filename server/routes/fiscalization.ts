@@ -8,7 +8,7 @@ import { getSupabaseAdmin } from '../lib/supabaseAdmin';
 import { env, isSupabaseConfigured } from '../env';
 import { encryptFiscalCredentials, redactCredentialsForLogging } from '../lib/fiscalCrypto';
 import { providersForCountry, getProvider } from '../lib/fiscalization/registry';
-import { attemptSubmission } from '../lib/fiscalization/fiscalSubmissionService';
+import { attemptSubmission, resetSubmissionForRetry } from '../lib/fiscalization/fiscalSubmissionService';
 
 // Fiscalization Settings routes (Prompt 11). Registration read/write is
 // deliberately Supabase-only, with no local-SQLite fallback — the same
@@ -16,12 +16,13 @@ import { attemptSubmission } from '../lib/fiscalization/fiscalSubmissionService'
 // administration (server/routes/staff.ts), and for the same reason:
 // fiscal credentials are business-critical secrets, and trusting an
 // offline-entered credential set until it eventually syncs has no safe
-// resolution. Submission status/history reads local SQLite (today's
-// actual single-shared-backend deployment reality — see the "Second
-// Tauri flag" note in the governance doc — makes this correct now; once
-// genuine per-install separation lands this will need to read the
-// Supabase mirror instead, exactly the kind of gap already flagged
-// elsewhere in this codebase rather than solved speculatively here).
+// resolution. Submission status/history now reads the tenant-wide Supabase
+// mirror (falling back to this terminal's own local SQLite only when
+// Supabase is unreachable) — DL-037 closes the gap DL-023/the Tauri
+// Packaging Addendum flagged: under genuine per-install separation
+// (DL-033), a terminal's own local queue only ever holds submissions it
+// personally created, so Head Office needs the tenant-wide view to see
+// (and retry) another till's submission at all.
 const router = Router();
 router.use(requireAuth);
 
@@ -281,19 +282,61 @@ function mirrorRegistrationToLocalCache(row: any) {
 const PENDING_ALERT_THRESHOLD_COUNT = 5;
 const PENDING_ALERT_THRESHOLD_MINUTES = 60;
 
+function mapSubmissionRow(r: any) {
+  return {
+    id: r.id,
+    branchId: r.branch_id,
+    saleId: r.sale_id,
+    saleNumber: r.sale_number,
+    submissionMode: r.submission_mode,
+    status: r.status,
+    invoiceSequenceNumber: r.invoice_sequence_number,
+    fiscalReferenceNumber: r.fiscal_reference_number,
+    qrCodePayload: r.qr_code_payload,
+    attemptCount: r.attempt_count,
+    nonRetryable: !!r.non_retryable,
+    errorMessage: r.error_message,
+    submittedAt: r.submitted_at,
+    createdAt: r.created_at,
+  };
+}
+
 router.get(
   '/submissions',
   requireAccessRole(...FISCAL_ADMIN_ROLES),
   asyncHandler(async (req, res) => {
     const branchId = req.query.branchId ? String(req.query.branchId) : undefined;
-    const clauses: string[] = [];
-    const params: Record<string, string> = {};
-    if (branchId) {
-      clauses.push('branch_id = @branchId');
-      params.branchId = branchId;
+
+    // Tenant-wide view (every terminal's submissions, not just this one's)
+    // is the normal path now that DL-037 lets a retry actually reach the
+    // owning terminal — falls back to this terminal's own local-only view
+    // only when Supabase can't be reached, which is strictly less useful
+    // but still correct for this terminal's own submissions.
+    let rows: any[] | null = null;
+    let scope: 'tenant' | 'local' = 'local';
+
+    const supabase = isSupabaseConfigured() ? getSupabaseAdmin() : null;
+    if (supabase) {
+      let query = supabase.from('fiscal_submissions').select('*').eq('tenant_id', env.tenantId).order('created_at', { ascending: false }).limit(200);
+      if (branchId) query = query.eq('branch_id', branchId);
+      const { data, error } = await query;
+      if (!error && data) {
+        rows = data;
+        scope = 'tenant';
+      }
     }
-    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-    const rows = db.prepare(`SELECT * FROM fiscal_submissions ${where} ORDER BY created_at DESC LIMIT 200`).all(params) as any[];
+
+    if (!rows) {
+      const clauses: string[] = [];
+      const params: Record<string, string> = {};
+      if (branchId) {
+        clauses.push('branch_id = @branchId');
+        params.branchId = branchId;
+      }
+      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      rows = db.prepare(`SELECT * FROM fiscal_submissions ${where} ORDER BY created_at DESC LIMIT 200`).all(params) as any[];
+      scope = 'local';
+    }
 
     const pending = rows.filter((r) => r.status === 'PENDING' && !r.non_retryable);
     const failed = rows.filter((r) => r.status === 'FAILED' || r.non_retryable);
@@ -303,22 +346,8 @@ router.get(
         : 0;
 
     res.json({
-      submissions: rows.map((r) => ({
-        id: r.id,
-        branchId: r.branch_id,
-        saleId: r.sale_id,
-        saleNumber: r.sale_number,
-        submissionMode: r.submission_mode,
-        status: r.status,
-        invoiceSequenceNumber: r.invoice_sequence_number,
-        fiscalReferenceNumber: r.fiscal_reference_number,
-        qrCodePayload: r.qr_code_payload,
-        attemptCount: r.attempt_count,
-        nonRetryable: !!r.non_retryable,
-        errorMessage: r.error_message,
-        submittedAt: r.submitted_at,
-        createdAt: r.created_at,
-      })),
+      scope,
+      submissions: rows.map(mapSubmissionRow),
       summary: {
         pendingCount: pending.length,
         failedCount: failed.length,
@@ -334,17 +363,40 @@ router.post(
   requireAccessRole(...FISCAL_ADMIN_ROLES),
   asyncHandler(async (req, res) => {
     const id = req.params.id;
-    const row = db.prepare('SELECT * FROM fiscal_submissions WHERE id = ?').get(id) as any;
-    if (!row) throw new ApiError(404, 'Fiscal submission not found on this terminal');
+    const localRow = db.prepare('SELECT id FROM fiscal_submissions WHERE id = ?').get(id) as any;
 
-    db.prepare(`UPDATE fiscal_submissions SET status = 'PENDING', non_retryable = 0, error_message = NULL, updated_at = ? WHERE id = ?`).run(
-      nowIso(),
-      id
-    );
+    if (localRow) {
+      resetSubmissionForRetry(id);
+      void attemptSubmission(id).catch((err) => console.error(`[fiscalization] manual retry of ${id} failed:`, err));
+      res.json({ ok: true, scope: 'local' });
+      return;
+    }
 
-    void attemptSubmission(id).catch((err) => console.error(`[fiscalization] manual retry of ${id} failed:`, err));
+    // DL-037: not on this terminal's own local queue — under genuine
+    // per-install separation the submission may have been created by a
+    // different till at the same branch. Flag it in the tenant-wide
+    // Supabase mirror instead; whichever terminal actually owns the row
+    // locally will consume the flag on its own next fiscal drain tick
+    // (server/sync/fiscalDrainLoop.ts's applyRemoteRetryRequests), at most
+    // ~30s later while that terminal is online.
+    const supabase = requireSupabase();
+    const { data: remoteRow, error: fetchErr } = await supabase
+      .from('fiscal_submissions')
+      .select('id')
+      .eq('tenant_id', env.tenantId)
+      .eq('id', id)
+      .maybeSingle();
+    if (fetchErr) throw new ApiError(502, 'Failed to look up fiscal submission');
+    if (!remoteRow) throw new ApiError(404, 'Fiscal submission not found');
 
-    res.json({ ok: true });
+    const { error: updateErr } = await supabase
+      .from('fiscal_submissions')
+      .update({ retry_requested_at: nowIso() })
+      .eq('tenant_id', env.tenantId)
+      .eq('id', id);
+    if (updateErr) throw new ApiError(502, 'Failed to request remote retry');
+
+    res.json({ ok: true, scope: 'remote-queued' });
   })
 );
 

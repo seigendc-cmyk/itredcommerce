@@ -1808,6 +1808,11 @@ head-office admin clicking "retry" on a different terminal's Settings page
 has no way to see or flip that row. Not fixed here — flagged again, as
 DL-023 itself already anticipated, so it isn't lost a third time.
 
+**Resolved 2026-09-05 — see DL-037** (Tauri Desktop Packaging Addendum,
+below): a Supabase mailbox flag plus the existing fiscal drain loop now
+lets a retry issued from any terminal reach whichever terminal actually
+owns the submission locally.
+
 ### Testing performed
 
 - `cargo check` on `src-tauri` — clean.
@@ -1845,8 +1850,8 @@ DL-023 itself already anticipated, so it isn't lost a third time.
   this closes those specific "file only, not applied" gaps as a side effect
   of unblocking this prompt's required onboarding test, not as originally
   scoped work.
-- **DL-023's cross-terminal fiscal-retry routing**: see above — unresolved,
-  now concretely reachable rather than theoretical.
+- **DL-023's cross-terminal fiscal-retry routing**: was unresolved, now
+  concretely reachable rather than theoretical — closed by DL-037 below.
 
 ### DL-036: the packaged app never actually launched successfully until now — two silent packaging bugs, found only by running the real installed app
 
@@ -1896,3 +1901,78 @@ a sidecar's env/cwd contract is not a substitute for launching the actual
 packaged binary at least once — it validates the Express/SQLite layer
 correctly but cannot catch bugs in the Tauri-specific glue code connecting
 the two, which is exactly where both of these lived.
+
+### DL-037: Cross-terminal fiscal-submission retry — a Supabase mailbox flag, consumed by whichever terminal actually owns the row
+
+**Decision**: closes DL-023's "Known gap" note (re-flagged a second time in
+this addendum's own "Open items"): a manual retry issued from one terminal
+could only ever see and flip a row in *that terminal's own* local
+`fiscal_submissions` queue, never a submission created by a different till
+at the same branch — a real problem now that DL-033's per-install
+separation is genuinely in place, not a theoretical one. Fixed with a
+mailbox column rather than any live terminal-to-terminal channel (no such
+channel exists anywhere in this codebase, and building one would be a much
+larger addition than this gap warrants):
+
+- **`fiscal_submissions.retry_requested_at`** (new, Supabase only —
+  `supabase/migrations/20260905090000_fiscal_remote_retry.sql`): null in the
+  overwhelming common case. `POST /submissions/:id/retry`
+  (`server/routes/fiscalization.ts`) now checks this terminal's own local
+  SQLite first — a hit is retried exactly as before, immediately, no
+  Supabase round-trip needed. A miss means the row belongs to some other
+  terminal at this tenant (or doesn't exist at all): the route looks it up
+  in Supabase to distinguish those two cases (404 vs. genuinely
+  cross-terminal) and, if found, sets this timestamp — never writing
+  anything else about the row, since this terminal doesn't have the local
+  context (decrypted credentials, the actual sale) needed to attempt the
+  submission itself.
+- **Consumption**: every online terminal's existing 30s fiscal drain tick
+  (`server/sync/fiscalDrainLoop.ts`) now starts with
+  `applyRemoteRetryRequests()` — pull the tenant's outstanding flagged ids
+  from Supabase, and for each one, check local SQLite. Not found: skip,
+  leave the flag for whichever terminal does own it. Found: reset it to
+  `PENDING` (`fiscalSubmissionService.ts`'s new exported
+  `resetSubmissionForRetry`, the same reset both the local-immediate path
+  and this path now share) and clear the Supabase flag — the row then falls
+  straight into that same tick's existing PENDING scan, so a cross-terminal
+  retry and a same-terminal one both end up attempted within one drain
+  cycle either way. No coordination between terminals is needed to decide
+  who owns a given row: the check is a cheap local no-op for every terminal
+  that isn't the owner.
+- **`GET /submissions`** (same route file) now reads the tenant-wide
+  Supabase mirror by default — the local-only view was never going to be
+  enough for Head Office to find (let alone retry) another till's
+  submission in the first place — falling back to this terminal's own local
+  SQLite only when Supabase can't be reached, flagged via a new `scope:
+  'tenant' | 'local'` field in the response. Verified live against this
+  install's own dev environment: with the Supabase-side migration not yet
+  applied to the dev project (the `fiscal_registrations`/`fiscal_submissions`
+  tables don't exist there yet — a pre-existing, already-documented "file
+  only" gap, unrelated to this fix), the endpoint correctly fell back to
+  `scope: 'local'` rather than erroring, and a locally-inserted test
+  submission's retry correctly reset it to `PENDING` and re-attempted it
+  end-to-end (failed again as expected, since the test row referenced no
+  real fiscal registration — confirming the reset-and-reattempt wiring, not
+  a real submission). The genuinely cross-terminal path (a retry dispatched
+  from one install and consumed by another) is exercised by the same
+  already-proven pull-cache mechanics as `fiscalRegistrationPull.ts`/
+  `staffPull.ts`, not independently re-verified live here, since doing so
+  would require applying this migration to a real Supabase project first —
+  a deployment step, same as every other migration in this codebase.
+
+**Rationale**: a mailbox flag on the row Supabase already mirrors reuses
+the exact pull-cache shape (DL-012/DL-013) this codebase already trusts for
+"data authored on one terminal must reach others," rather than inventing a
+live terminal-to-terminal RPC/push channel that doesn't exist anywhere else
+in this architecture. Folding consumption into the *existing* 30s drain
+tick (rather than a new interval) means a cross-terminal retry surfaces on
+the same cadence a same-terminal one always has, and reuses the same
+connectivity gate for free.
+
+**Still not solved, by design**: a retry dispatched while the owning
+terminal is offline simply waits — the flag sits in Supabase until that
+terminal is next online and runs a drain tick, which is the same
+online-dependency every other part of this fiscal-submission system already
+has (DL-026: submission itself needs connectivity to claim a sequence
+number and reach the fiscal authority). Not a new limitation this fix
+introduces.
