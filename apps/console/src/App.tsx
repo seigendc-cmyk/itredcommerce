@@ -1,8 +1,10 @@
 import React, { useState } from 'react';
-import { Inbox, Receipt, Package } from 'lucide-react';
+import { Inbox, Receipt, Package, LogOut } from 'lucide-react';
 import { ActivationRequestsPage } from './pages/ActivationRequestsPage';
 import { BillingOverviewPage } from './pages/BillingOverviewPage';
 import { PlanComponentsPage } from './pages/PlanComponentsPage';
+import { SignInPage } from './pages/SignInPage';
+import { ConsoleAuthProvider, useConsoleAuth } from './lib/consoleAuth';
 
 // Manual page-key state rather than a router — mirrors the pattern already
 // established by the main app (src/App.tsx) and executive-pwa/src/App.tsx
@@ -16,23 +18,19 @@ const NAV_ITEMS: { key: PageKey; label: string; icon: React.ComponentType<{ clas
   { key: 'PLAN_COMPONENTS', label: 'Plan Components', icon: Package },
 ];
 
-// No sign-in gate here — deliberately. Console-operator authentication has
-// no defined mechanism yet (see the schema migration's header comment:
-// app_is_super_admin() is hardcoded false pending a dedicated addendum), so
-// building a login flow here would be exactly the "business logic" this
-// prompt's scope excludes. This shell is reachable directly for now.
-export default function App() {
+function ConsoleShellApp() {
   const [activePage, setActivePage] = useState<PageKey>('ACTIVATION_REQUESTS');
+  const { operatorEmail, signOut } = useConsoleAuth();
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex">
-      <nav className="w-56 shrink-0 bg-slate-900 border-r border-slate-800 min-h-screen">
+      <nav className="w-56 shrink-0 bg-slate-900 border-r border-slate-800 min-h-screen flex flex-col">
         <div className="h-14 flex items-center px-4 border-b border-slate-800">
           <div className="font-black text-lg tracking-tighter italic">
             iTred<span className="font-light not-italic">Console</span>
           </div>
         </div>
-        <div className="p-2 space-y-1">
+        <div className="p-2 space-y-1 flex-1">
           {NAV_ITEMS.map((item) => {
             const Icon = item.icon;
             const isActive = activePage === item.key;
@@ -51,6 +49,17 @@ export default function App() {
             );
           })}
         </div>
+        <div className="p-2 border-t border-slate-800">
+          <p className="px-3 py-1 text-xs text-slate-500 truncate">{operatorEmail}</p>
+          <button
+            type="button"
+            onClick={() => signOut()}
+            className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left text-slate-300 hover:bg-slate-800 hover:text-white"
+          >
+            <LogOut className="w-4 h-4 shrink-0" />
+            Sign out
+          </button>
+        </div>
       </nav>
 
       <div className="flex-1 min-w-0">
@@ -59,5 +68,28 @@ export default function App() {
         {activePage === 'PLAN_COMPONENTS' && <PlanComponentsPage />}
       </div>
     </div>
+  );
+}
+
+// Real console-operator sign-in (DL-045) gates everything below it — a
+// session that isn't a console operator never sees the dashboard, only
+// SignInPage with an "unauthorized" notice.
+function Gate() {
+  const { status } = useConsoleAuth();
+
+  if (status === 'loading') {
+    return <div className="min-h-screen bg-slate-950" />;
+  }
+  if (status === 'authorized') {
+    return <ConsoleShellApp />;
+  }
+  return <SignInPage unauthorized={status === 'unauthorized'} />;
+}
+
+export default function App() {
+  return (
+    <ConsoleAuthProvider>
+      <Gate />
+    </ConsoleAuthProvider>
   );
 }

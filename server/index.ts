@@ -24,6 +24,7 @@ import deliveryOrdersRouter from './routes/deliveryOrders';
 import connectivityRouter from './routes/connectivity';
 import fiscalizationRouter from './routes/fiscalization';
 import branchesRouter from './routes/branches';
+import licensingRouter from './routes/licensing';
 import onboardingRouter from './routes/onboarding';
 import businessProfileRouter from './routes/businessProfile';
 import { isSupabaseConfigured } from './env';
@@ -136,6 +137,7 @@ app.use('/api/delivery-orders', deliveryOrdersRouter);
 app.use('/api/connectivity', connectivityRouter);
 app.use('/api/fiscalization', fiscalizationRouter);
 app.use('/api/branches', branchesRouter);
+app.use('/api/licensing', licensingRouter);
 
 // --- Additional route modules are mounted here as milestones land ---
 

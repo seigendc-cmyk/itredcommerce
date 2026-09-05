@@ -2260,3 +2260,197 @@ independence model).
   `TerminalActivationToken`s and recording `activation_request`
   fulfillment): out of scope for this addendum entirely — a later prompt's
   job.
+
+## CONSOLE-OPERATOR AUTH, TOKEN ISSUANCE & BILLING CALCULATION ADDENDUM (2026-09-05)
+
+This addendum builds the real functionality the previous addendum
+deliberately left as documentation/schema/placeholder-only: a working
+console-operator identity and auth model (resolving DL-002's
+"Platform Super-Admin View... scope deferred to a future addendum" and the
+previous migration's own TODO against `app_is_super_admin()`),
+TerminalActivationToken issuance with real cryptographic signing, and a
+billing calculation engine. Two DL-043 open items — proration, and whether a
+feature add-on bills flat or scaled — remain genuinely undecided; nothing
+below resolves either, by design.
+
+### DL-045: Console-operator identity, and `app_is_super_admin()` becomes real
+
+**Decision**: a new `console_operators` table
+(`supabase/migrations/20260905120000_console_operator_auth.sql`) — `id`,
+`auth_user_id` (unique, references `auth.users`), `email`, `name`,
+`is_active` — holds the platform's own operator roster. It gets the exact
+same access model as the six Prompt-13 console tables: RLS enabled, zero
+grants to `anon`/`authenticated`, service-role only. `access_token_hook()`
+(built by Prompt 5, DL-011) gains a second lookup branch: if no `staff` row
+matches the signed-in `auth_user_id` (the only case it previously handled),
+it now also checks `console_operators` and, on a match, injects
+`platform_role: 'platform_operator'` and `console_operator_id` claims
+instead of the tenant-scoped `tenant_id`/`branch_id`/`staff_role`/`staff_id`
+claims a staff match would inject. Same function name and signature, so the
+Supabase dashboard's existing Auth Hook registration is untouched.
+`app_is_super_admin()` — hardcoded `false` since Prompt 1, with an explicit
+comment forbidding a real check "without a dedicated addendum describing how
+platform-operator sessions are authenticated and audited" — now checks that
+claim for real: `coalesce(app_jwt_claims() ->> 'platform_role', '') =
+'platform_operator'`.
+
+This one function is already wired as an `or app_is_super_admin()`
+cross-tenant bypass clause into essentially every RLS policy in the schema
+(sales, inventory, financial, purchasing, governance, identity, tax,
+delivery, generic records, tenant/branch/terminal) — it was built in Prompt 1
+specifically for this day. Making it real is therefore the entire
+mechanism, not one piece of it: a genuine console operator now has
+cross-tenant read/write everywhere that clause already appears, which is the
+correct shape for a platform operator, not an expansion of scope beyond what
+DL-002 already called for.
+
+**Sign-in**: unlike staff/executive/rider (till-side PIN identities bridged
+to a session via `verify_staff_pin` + the executive/rider-signin Edge
+Functions), console operators are real people with real email addresses —
+Supabase Auth's native `signInWithPassword` is used directly from
+`apps/console`, with no PIN bridge and no new Edge Function needed for
+sign-in itself. A thin `is_console_operator()` SQL function (`security
+invoker`, wraps `app_is_super_admin()`, granted to `authenticated`) is the
+one thing the console client calls right after sign-in to decide "show the
+dashboard" vs. "sign out, not authorized" — safe to expose since it only
+ever echoes back the caller's own claim.
+
+**Provisioning**: out-of-band — create the `auth.users` row (Supabase
+dashboard or `admin.auth.admin.createUser`) plus one `console_operators`
+insert (service-role). No self-serve signup UI is built, the same category
+of manual deployment step as `access_token_hook`'s dashboard registration
+(DL-013) and the Meta WhatsApp credentials (Open items, prior addendum) —
+each already established that some setup steps are legitimately manual
+rather than something a migration can automate.
+
+**Rationale**: reusing `access_token_hook()`/`app_is_super_admin()` rather
+than inventing a parallel claims/authorization mechanism keeps exactly one
+place in the schema deciding "is this session privileged," the same
+discipline DL-011 already applied to PIN verification. Real email/password
+auth (rather than forcing console operators through the PIN-bridge pattern
+built for till-side staff) matches who they actually are — internal
+platform staff, not a till operator — and avoids stretching a pattern
+designed for a different identity shape.
+
+### DL-046: TerminalActivationToken signing scheme
+
+**Decision**: a TerminalActivationToken (DL-039 layer 3) is a compact
+two-part string — `base64url(payload) + "." + base64url(signature)` — where
+`payload` is the JSON object `{tenantId, terminalId, planTier, issuedAt,
+expiresAt}` and `signature` is an ECDSA P-256 signature over the payload
+bytes. Signing happens once, in the new
+`console-issue-terminal-activation-token` Edge Function, using the Web
+Crypto API (`crypto.subtle.sign`) with a private key held only as a Supabase
+Edge Function secret (never committed, generated by a one-off local script,
+`scripts/generate-terminal-token-keypair.mjs`). Verification happens
+entirely offline, terminal-side, in `server/lib/terminalActivationToken.ts`,
+using Node's `crypto.verify` against the corresponding public key (not
+secret, committed as a constant) with `{ dsaEncoding: 'ieee-p1363' }` —
+required because Web Crypto's ECDSA output and Node's default ECDSA output
+use different signature encodings (raw IEEE P1363 r‖s versus DER), a
+cross-runtime detail that would silently break verification if left at
+defaults.
+
+This is deliberately a fixed-algorithm, two-part token, not a generic JWT
+(no header, no `alg` field, no library). A verifier that has to trust a
+token's own claim about which algorithm signed it is exactly the shape of
+the JWT "alg" confusion vulnerability class; a verifier hardcoded to one
+algorithm and one key has no such decision to get wrong. This is also the
+first cryptographic signing implementation anywhere in this codebase — no
+prior JWT/asymmetric-crypto convention existed to follow or deviate from.
+
+**Terminal-side primitives built now**: `verifyTerminalActivationToken()`
+(signature + expiry check) and `evaluateModuleLock()` — a pure function
+implementing DL-040's 5-working-day grace period math (default Mon–Fri
+calendar; a tenant-configurable calendar is a follow-up, not built here) —
+plus one new local endpoint pair (`POST /licensing/activate-terminal`,
+`GET /licensing/status`) that verifies a pasted token against this specific
+install's own `tenant_id`/`terminal_id` (via the existing
+`getInstallationConfig()` helper, DL-005's Business Profile onboarding
+work) and stores/reports it.
+
+**Explicitly not done here**: wiring DL-040's Sales/Purchasing module lock
+into every existing route and view, and rewiring the still-simulated
+`LicensingView`/`LicenceInfo` UI (DL-028) to this real backend. Both are
+flagged as follow-ups rather than silently left, the same discipline this
+document already applies to the still-open Tauri-packaging gap and the
+`access_token_hook` dashboard-registration step.
+
+**Rationale**: offline verification against a bundled public key (rather
+than a live entitlement check) is what DL-039/DL-040 already required — an
+asymmetric scheme is what makes that safe, since a terminal that could only
+verify with a symmetric secret would have to hold a secret capable of
+forging its own tokens. Building the primitives and one thin endpoint pair
+now, without rewiring every consuming view, keeps this addendum's surface
+area to "the issuance mechanism actually works end-to-end for one path,"
+which is what makes it verifiable, rather than a broad partial rollout
+across the whole POS app's route surface.
+
+### DL-047: Billing calculation engine — mechanical, and deliberately neutral on both open items
+
+**Decision**: `calculateInvoiceLineItems(components, subscriptions)` — a
+pure function (mirroring `server/lib/fareEngine.ts`'s "caller passes the
+exact already-selected rows, never reads 'current' implicitly" discipline,
+DL-004) — takes each tenant's active `tenant_subscriptions` row, multiplies
+its `quantity` by the referenced `plan_components.unit_price`, and labels
+the resulting line with that component's own `billing_unit` string. It never
+branches on `component_type` or on the value of `billing_unit` — it has no
+opinion on whether a `'feature'` component should be billed tenant-wide flat
+or scaled per-branch/per-terminal, and no opinion on proration, because
+neither question is decided (DL-043's open items, unchanged by this
+addendum). The function's only real job is "sum configured line items
+correctly"; deciding *what quantity should be configured* for any given
+component is left entirely to whoever populates `tenant_subscriptions` — a
+console operator today, potentially something automated later once the open
+items are actually resolved.
+
+The same ~25-line function exists in two places — `apps/console/src/lib/
+billingEngine.ts` (a live invoice preview before generation) and inside
+`console-generate-billing-invoice`'s Edge Function body (the authoritative
+write) — duplicated rather than shared, because DL-038 already committed
+`apps/console` to zero shared runtime with anything outside itself, and a
+Deno Edge Function and a Vite-bundled browser app have no build pipeline in
+common to share a single file through even if that constraint didn't exist.
+Each copy comments a cross-reference to the other so the duplication is
+visible, not accidental.
+
+Once created, a `billing_invoices` row's `total`/`line_items` are
+effectively immutable: the new RLS grant lets a console operator only
+`update(status, paid_at, payment_reference)` directly — the computed
+financial fields have no update path at all outside a service-role client.
+`plan_components` and `tenant_subscriptions` themselves get ordinary direct
+RLS-gated CRUD for `authenticated` console operators (no Edge Function
+needed) since editing a price list or a subscription's quantity carries
+neither a signing-key requirement nor a trusted-attribution requirement —
+unlike issuing a token or resolving an activation request, where `issued_by`
+/`fulfilled_by` must reflect who the server, not the client, verified was
+signed in.
+
+**Rationale**: a calculation engine that stays mechanically neutral on both
+open items is safer than one that guesses at either — DL-043 was explicit
+that implementers "must not default to one interpretation," and the way to
+honor that literally is to write code that has no interpretation baked in
+at all, rather than picking the interpretation that seems most likely and
+documenting it as provisional. Making computed financial fields
+effectively immutable post-creation (via grants, not application logic
+that could have a bug) extends the same "don't let history get corrupted"
+discipline DL-004/DL-010/DL-014 already established for rates and dispatch
+classification to billing documents specifically.
+
+### Open items (unchanged, still explicitly not decided here)
+
+- **Feature add-on billing scope** and **proration on mid-cycle additions**
+  (DL-043): both still unresolved; DL-047's calculation engine is
+  deliberately built to not need either answer yet, not a resolution of
+  either.
+- **PoolWise and CashPlan functional scope**: unchanged, still pending.
+- **Payment aggregator choice** (DL-044): unchanged, still unresolved.
+- **`LicenceInfo.activationCode` vs. `TerminalActivationToken`**: unchanged
+  — this addendum builds real issuance/verification for
+  `TerminalActivationToken` specifically and does not touch
+  `LicenceInfo.activationCode` or `LicensingView`.
+- **Module-lock enforcement wiring** (new, from DL-046): the primitives and
+  one endpoint pair exist; wiring the lock into every Sales/Purchasing
+  route and view, and a tenant-configurable working-day calendar, are not
+  built and are the natural next step for whichever prompt picks this back
+  up.

@@ -1,0 +1,175 @@
+import { supabase } from './supabaseClient';
+import type { PlanComponentRow, TenantSubscriptionRow, BillingLineItem } from './billingEngine';
+
+export type { PlanComponentRow, TenantSubscriptionRow, BillingLineItem };
+
+export interface TenantRow {
+  id: string;
+  display_name: string;
+  status: string;
+}
+
+export interface ActivationRequestRow {
+  id: string;
+  tenant_id: string;
+  terminal_id: string | null;
+  requested_at: string;
+  channel: string;
+  fulfillment_status: string;
+  fulfilled_by: string | null;
+  fulfilled_at: string | null;
+}
+
+export interface TerminalActivationTokenRow {
+  id: string;
+  tenant_id: string;
+  terminal_id: string;
+  plan_tier: string;
+  issued_at: string;
+  expires_at: string;
+  status: string;
+  issued_by: string | null;
+}
+
+export interface BillingInvoiceRow {
+  id: string;
+  tenant_id: string;
+  billing_period: string;
+  line_items: BillingLineItem[];
+  total: number;
+  currency: string;
+  status: 'pending' | 'paid' | 'overdue';
+  paid_at: string | null;
+  payment_reference: string | null;
+}
+
+function unwrap<T>({ data, error }: { data: T | null; error: { message: string } | null }): T {
+  if (error) throw new Error(error.message);
+  if (data === null) throw new Error('No data returned');
+  return data;
+}
+
+async function invokeConsoleFunction<T>(name: string, body: Record<string, unknown>): Promise<T> {
+  const { data, error } = await supabase.functions.invoke<T>(name, { body });
+  if (error) throw new Error(error.message);
+  return data as T;
+}
+
+export async function listTenants(): Promise<TenantRow[]> {
+  const res = await supabase.from('tenants').select('id, display_name, status').order('display_name');
+  return unwrap({ data: res.data ?? [], error: res.error });
+}
+
+export async function listActivationRequests(): Promise<ActivationRequestRow[]> {
+  const res = await supabase
+    .from('activation_requests')
+    .select('id, tenant_id, terminal_id, requested_at, channel, fulfillment_status, fulfilled_by, fulfilled_at')
+    .order('requested_at', { ascending: false });
+  return unwrap({ data: res.data ?? [], error: res.error });
+}
+
+export async function issueTerminalActivationToken(input: {
+  tenantId: string;
+  terminalId: string;
+  planTier: string;
+  validityDays: number;
+  activationRequestId?: string;
+}): Promise<{ id: string; token: string; expiresAt: string }> {
+  return invokeConsoleFunction('console-issue-terminal-activation-token', input);
+}
+
+export async function resolveActivationRequest(input: {
+  activationRequestId: string;
+  fulfillmentStatus: 'fulfilled' | 'rejected';
+}): Promise<{ id: string; fulfillmentStatus: string }> {
+  return invokeConsoleFunction('console-resolve-activation-request', input);
+}
+
+export async function listTerminalActivationTokens(tenantId: string): Promise<TerminalActivationTokenRow[]> {
+  const res = await supabase
+    .from('terminal_activation_tokens')
+    .select('id, tenant_id, terminal_id, plan_tier, issued_at, expires_at, status, issued_by')
+    .eq('tenant_id', tenantId)
+    .order('issued_at', { ascending: false });
+  return unwrap({ data: res.data ?? [], error: res.error });
+}
+
+export async function listPlanComponents(): Promise<PlanComponentRow[]> {
+  const res = await supabase
+    .from('plan_components')
+    .select('id, component_type, feature_key, unit_price, currency, billing_unit')
+    .order('component_type');
+  return unwrap({ data: res.data ?? [], error: res.error });
+}
+
+export async function createPlanComponent(input: Omit<PlanComponentRow, 'id'>): Promise<PlanComponentRow> {
+  const id = `PC-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const res = await supabase.from('plan_components').insert({ id, ...input }).select().single();
+  return unwrap({ data: res.data, error: res.error });
+}
+
+export async function updatePlanComponent(id: string, input: Partial<Omit<PlanComponentRow, 'id'>>): Promise<PlanComponentRow> {
+  const res = await supabase.from('plan_components').update(input).eq('id', id).select().single();
+  return unwrap({ data: res.data, error: res.error });
+}
+
+export async function deletePlanComponent(id: string): Promise<void> {
+  const { error } = await supabase.from('plan_components').delete().eq('id', id);
+  if (error) throw new Error(error.message);
+}
+
+export async function listTenantSubscriptions(tenantId: string): Promise<TenantSubscriptionRow[]> {
+  const res = await supabase
+    .from('tenant_subscriptions')
+    .select('id, plan_component_id, quantity')
+    .eq('tenant_id', tenantId);
+  return unwrap({ data: res.data ?? [], error: res.error });
+}
+
+export async function createTenantSubscription(input: {
+  tenantId: string;
+  planComponentId: string;
+  quantity: number;
+}): Promise<TenantSubscriptionRow> {
+  const id = `SUB-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const res = await supabase
+    .from('tenant_subscriptions')
+    .insert({ id, tenant_id: input.tenantId, plan_component_id: input.planComponentId, quantity: input.quantity })
+    .select('id, plan_component_id, quantity')
+    .single();
+  return unwrap({ data: res.data, error: res.error });
+}
+
+export async function updateTenantSubscriptionQuantity(id: string, quantity: number): Promise<void> {
+  const { error } = await supabase.from('tenant_subscriptions').update({ quantity }).eq('id', id);
+  if (error) throw new Error(error.message);
+}
+
+export async function deleteTenantSubscription(id: string): Promise<void> {
+  const { error } = await supabase.from('tenant_subscriptions').delete().eq('id', id);
+  if (error) throw new Error(error.message);
+}
+
+export async function generateBillingInvoice(input: {
+  tenantId: string;
+  billingPeriod: string;
+}): Promise<{ id: string; lineItems: BillingLineItem[]; total: number; currency: string }> {
+  return invokeConsoleFunction('console-generate-billing-invoice', input);
+}
+
+export async function listBillingInvoices(tenantId: string): Promise<BillingInvoiceRow[]> {
+  const res = await supabase
+    .from('billing_invoices')
+    .select('id, tenant_id, billing_period, line_items, total, currency, status, paid_at, payment_reference')
+    .eq('tenant_id', tenantId)
+    .order('billing_period', { ascending: false });
+  return unwrap({ data: res.data ?? [], error: res.error });
+}
+
+export async function markInvoicePaid(id: string, paymentReference: string): Promise<void> {
+  const { error } = await supabase
+    .from('billing_invoices')
+    .update({ status: 'paid', paid_at: new Date().toISOString(), payment_reference: paymentReference })
+    .eq('id', id);
+  if (error) throw new Error(error.message);
+}
