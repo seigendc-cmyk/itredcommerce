@@ -185,10 +185,26 @@ export async function listBillingInvoices(tenantId: string): Promise<BillingInvo
   return unwrap({ data: res.data ?? [], error: res.error });
 }
 
-export async function markInvoicePaid(id: string, paymentReference: string): Promise<void> {
-  const { error } = await supabase
-    .from('billing_invoices')
-    .update({ status: 'paid', paid_at: new Date().toISOString(), payment_reference: paymentReference })
-    .eq('id', id);
-  if (error) throw new Error(error.message);
+export interface ConfirmInvoicePaymentResult {
+  id: string;
+  status: 'paid';
+  paidAt: string;
+  renewed: boolean;
+  reason?: string;
+  periodEnd?: string;
+  terminalsRenewed: { terminalId: string; token: string; expiresAt: string }[];
+}
+
+// DL-054: no longer a direct table update — billing_invoices' RLS grant
+// for this was revoked (see the migration adding this function) so
+// payment confirmation and TerminalActivationToken renewal always happen
+// together, atomically, server-side. Verifies through the abstracted
+// PaymentProvider (DL-044's aggregator choice is still unresolved) and, on
+// success, renews a token for every one of the tenant's terminals,
+// expiring exactly when the paid period ends.
+export async function confirmInvoicePayment(input: {
+  invoiceId: string;
+  paymentReference: string;
+}): Promise<ConfirmInvoicePaymentResult> {
+  return invokeConsoleFunction('console-confirm-invoice-payment', input);
 }

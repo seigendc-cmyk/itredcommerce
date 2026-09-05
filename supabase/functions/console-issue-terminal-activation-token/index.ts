@@ -1,8 +1,11 @@
 // Console-operator action: issue a signed TerminalActivationToken (DL-039
 // layer 3) for a specific tenant/terminal, and optionally mark the
 // activation_request it fulfills. See DL-041 (issuance is a console-only
-// action, never automated), DL-046 (the signing scheme itself), and DL-048
-// (keyId-based key rotation support and the 30-day default validity).
+// action, never automated), DL-046 (the signing scheme itself), DL-048
+// (keyId-based key rotation support and the 30-day default validity), and
+// DL-054 (this function's signing/persist logic moved into
+// _shared/terminalTokenIssuance.ts so console-confirm-invoice-payment's
+// payment-triggered renewal can reuse it instead of duplicating it).
 //
 // Needs the service-role key (to write terminal_activation_tokens /
 // activation_requests, neither of which grants any authenticated write) and
@@ -10,30 +13,21 @@
 // this cannot be a direct client write, unlike plan_components/
 // tenant_subscriptions.
 import { createClient } from 'npm:@supabase/supabase-js@2';
-
-// DL-048: the key this function currently signs new tokens with. Bump this
-// (and add the corresponding TERMINAL_TOKEN_SIGNING_PRIVATE_KEY_<ID> secret)
-// when rotating — see scripts/generate-terminal-token-keypair.mjs. Never
-// remove an old key's entry from server/lib/terminalActivationToken.ts's
-// verification registry just because this constant moved past it.
-const CURRENT_KEY_ID = 'v1';
+import { importSigningKey, signAndPersistTerminalActivationToken } from '../_shared/terminalTokenIssuance.ts';
 
 // DL-048: default validity when the caller doesn't specify one.
 //
-// PLACEHOLDER — 30 days is a stand-in, not a final answer. It's a guess
-// that a monthly cycle is the norm (tenant_subscriptions/billing_invoices
-// already use a 'YYYY-MM' period, DL-043), but DL-043 itself never actually
-// pinned down billing-cycle length per tenant, and Prompt 15's billing
-// engine is what will determine whether validity should instead be
-// computed precisely from each tenant's real cycle (e.g. their next
-// billing_period boundary) rather than a flat constant here.
-// TODO(Prompt 15 - billing engine): replace this flat 30-day default with
-// whatever the billing engine decides validity should actually track once
-// it exists. Do not treat 30 as load-bearing in the meantime — it's picked
-// for "something reasonable while nothing better exists," not because 30
-// was decided as correct.
-// An explicit validityDays is still honored for operator flexibility in
-// the meantime, but is never required.
+// PLACEHOLDER — 30 days is a stand-in, not a final answer, for this
+// MANUAL/WhatsApp-triggered issuance path specifically. Payment-triggered
+// renewal (DL-054, console-confirm-invoice-payment) now computes an exact
+// expiresAt from the paid invoice's own period_end instead of this
+// constant — but this function is still reachable independently of a
+// billing cycle (e.g. issuing a fresh terminal's very first token before
+// any invoice exists), so the placeholder remains here for that case.
+// TODO: revisit whether this path should also derive validity from the
+// tenant's billing_cycle (DL-052) rather than a flat 30 days, once there's
+// a concrete reason to (e.g. a tenant on an annual cycle requesting a
+// first-ever token outside the payment-confirmation flow).
 const DEFAULT_VALIDITY_DAYS = 30;
 
 const corsHeaders = {
@@ -47,21 +41,6 @@ function json(body: unknown, status = 200) {
     status,
     headers: { ...corsHeaders, 'Content-Type': 'application/json' },
   });
-}
-
-function b64url(buf: ArrayBuffer): string {
-  const bytes = new Uint8Array(buf);
-  let bin = '';
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-// PREFIX-<epoch-ms>-<random> — same shape as server/lib/ids.ts's
-// generateId(), but a random suffix rather than an in-process counter,
-// since a stateless Edge Function invocation has no counter to keep and a
-// counter wouldn't be collision-safe across concurrent invocations anyway.
-function generateId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
 Deno.serve(async (req) => {
@@ -117,33 +96,10 @@ Deno.serve(async (req) => {
   }
   if (!operator || !operator.is_active) return json({ error: 'Not a console operator' }, 403);
 
-  // 2. Sign the payload. The private key never leaves this function; the
-  // corresponding public key is committed as a constant in
-  // server/lib/terminalActivationToken.ts's TERMINAL_TOKEN_PUBLIC_KEYS
-  // registry (keyed by CURRENT_KEY_ID) for offline, terminal-side
-  // verification (DL-046, DL-048).
-  const signingSecretName = `TERMINAL_TOKEN_SIGNING_PRIVATE_KEY_${CURRENT_KEY_ID.toUpperCase()}`;
-  const privateKeyPem = Deno.env.get(signingSecretName);
-  if (!privateKeyPem) {
-    console.error(`[console-issue-terminal-activation-token] ${signingSecretName} is not configured`);
-    return json({ error: 'Temporarily unavailable' }, 502);
-  }
-
-  const pemBody = privateKeyPem
-    .replace('-----BEGIN PRIVATE KEY-----', '')
-    .replace('-----END PRIVATE KEY-----', '')
-    .replace(/\s+/g, '');
-  const pkcs8Der = Uint8Array.from(atob(pemBody), (c) => c.charCodeAt(0));
-
+  // 2-3. Sign and persist (DL-054: shared with console-confirm-invoice-payment).
   let signingKey: CryptoKey;
   try {
-    signingKey = await crypto.subtle.importKey(
-      'pkcs8',
-      pkcs8Der,
-      { name: 'ECDSA', namedCurve: 'P-256' },
-      false,
-      ['sign']
-    );
+    signingKey = await importSigningKey();
   } catch (e) {
     console.error('[console-issue-terminal-activation-token] failed to import signing key:', e);
     return json({ error: 'Temporarily unavailable' }, 502);
@@ -151,31 +107,18 @@ Deno.serve(async (req) => {
 
   const issuedAt = new Date();
   const expiresAt = new Date(issuedAt.getTime() + validityDays * 24 * 60 * 60 * 1000);
-  const payload = { tenantId, terminalId, planTier, issuedAt: issuedAt.toISOString(), expiresAt: expiresAt.toISOString(), keyId: CURRENT_KEY_ID };
-  const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
-
-  const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, signingKey, payloadBytes);
-  const token = `${b64url(payloadBytes.buffer)}.${b64url(signature)}`;
-
-  // 3. Persist. `signature` holds the full compact token string — the
-  // actual cryptographic credential (see the schema migration's own column
-  // comment) — never re-exposed by any select grant given to authenticated
-  // clients (this function's response, returned once, is the only place
-  // the operator ever sees it).
-  const id = generateId('TAT');
-  const { error: insertErr } = await admin.from('terminal_activation_tokens').insert({
-    id,
-    tenant_id: tenantId,
-    terminal_id: terminalId,
-    plan_tier: planTier,
-    issued_at: payload.issuedAt,
-    expires_at: payload.expiresAt,
-    signature: token,
-    status: 'active',
-    issued_by: operator.email,
-  });
-  if (insertErr) {
-    console.error('[console-issue-terminal-activation-token] insert failed:', insertErr);
+  let issued;
+  try {
+    issued = await signAndPersistTerminalActivationToken(admin, signingKey, {
+      tenantId,
+      terminalId,
+      planTier,
+      issuedAt: issuedAt.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      issuedBy: operator.email,
+    });
+  } catch (e) {
+    console.error('[console-issue-terminal-activation-token] insert failed:', e);
     return json({ error: 'Failed to issue token' }, 502);
   }
 
@@ -196,5 +139,5 @@ Deno.serve(async (req) => {
     }
   }
 
-  return json({ id, token, expiresAt: payload.expiresAt });
+  return json({ id: issued.id, token: issued.token, expiresAt: issued.expiresAt });
 });

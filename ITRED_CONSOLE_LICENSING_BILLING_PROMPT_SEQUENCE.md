@@ -662,15 +662,66 @@ this detour:
 - DL-028's `LicenceInfo.activationCode` — needs inspection to decide
   retire/merge/keep-distinct relative to `TerminalActivationToken`. Still
   untouched.
-- TerminalActivationToken default validity period (30 days) — still an
-  explicit placeholder pending TerminalActivationToken renewal linkage
-  (Prompt 15 section 3) computing it from the tenant's actual `billing_cycle`
-  instead.
+- ~~TerminalActivationToken default validity period (30 days)~~ — **resolved
+  for the payment-renewal path via DL-054** (expires exactly at the paid
+  invoice's `period_end`). Still a placeholder for the manual/WhatsApp
+  issuance path specifically, since that path has no invoice to derive an
+  exact period from.
 - Tenant-configurable working-day calendar (DL-040) — still hardcoded to
   Mon–Fri; a per-tenant calendar remains unbuilt.
 - WhatsApp activation-request flow (DL-041) and `apps/console`'s issuance UI
   wiring to the real backend for that flow — unchanged, still pending Prompt
   16/17.
+- A *scheduled* invoice generator (Prompt 15 section 1 originally called for
+  one) — invoice generation is still manually console-operator-triggered,
+  not cron-driven. Not built as part of DL-054.
+- Automated payment retry — not applicable until a real aggregator exists to
+  decline a charge against in the first place (DL-054).
+
+## Prompt 15, sections 3–5 — Payment-Triggered Renewal ✅ Implemented, not yet committed (DL-054)
+
+Section 3 (TerminalActivationToken linkage), section 4 (`PaymentProvider`
+abstraction), and section 5 (renewal/retry scheduling) from the original
+Prompt 15 text were implemented together as one cohesive mechanism:
+
+- **`PaymentProvider` abstraction** — `supabase/functions/_shared/
+  paymentProvider.ts`. `ManualPaymentProvider` is the only concrete
+  implementation until DL-044's aggregator choice resolves; it trusts the
+  console operator's own confirmation, same as the direct-update flow it
+  replaces. A real aggregator becomes a new class implementing the same
+  interface with no change to invoice/renewal logic.
+- **Payment confirmation moved server-side**: a new
+  `console-confirm-invoice-payment` Edge Function replaces the old direct
+  client `update(status, paid_at, payment_reference)` on `billing_invoices`
+  — that RLS grant is revoked (same discipline as DL-051/DL-053's
+  `tenant_subscriptions` fixes), so marking an invoice paid and renewing
+  the tenant's tokens always happen together, atomically.
+- **TerminalActivationToken renewal**: on confirmed payment, every one of
+  the tenant's `terminals` gets a renewed token expiring **exactly** at the
+  paid invoice's `period_end` (DL-052) — not a recomputed 30-day window.
+  The manual/WhatsApp issuance path is untouched and keeps the DL-048
+  placeholder, since it has no invoice period to derive an exact expiry
+  from.
+- **Shared signing logic**: `console-issue-terminal-activation-token`'s
+  ECDSA signing/persistence was extracted into `supabase/functions/_shared/
+  terminalTokenIssuance.ts` and reused by both functions — no DL-038
+  boundary applies between two Edge Functions in the same Deno runtime, so
+  duplicating it a third time would have been pure duplication.
+- **Overdue escalation**: an hourly `pg_cron` job transitions a `pending`
+  invoice to `overdue` once its own `period_end` has passed unpaid. No new
+  lock mechanism — an overdue invoice just means no renewal happened, so
+  the existing DL-040/048/049 grace-period/module-lock logic takes over
+  naturally, exactly as the original prompt specified.
+- **No automated retry cadence** — there's no automated charge to retry
+  without a real aggregator (DL-044); an operator can re-attempt
+  confirmation at any time regardless of invoice status.
+- Tests: `supabase/functions/_shared/paymentProvider.test.ts` (3 tests —
+  confirmed/missing-reference/whitespace-only-reference, covering the
+  failed-payment path that skips renewal). `npm test` now also covers
+  `supabase/functions/_shared/**/*.test.ts` — **35/35 passing** total.
+- Governance doc: **DL-054** added.
+
+**Not yet committed.**
 
 ## Next in sequence
 
@@ -682,10 +733,13 @@ this detour:
 - *(unnumbered, via DL-051)* Feature add-on billing scope resolved + enforced
   via DB trigger — ✅ Committed (`5fa3d6e`).
 - **Prompt 15 (revised), steps 1–2** — Billing cycle schema (DL-052) +
-  mid-cycle proration (DL-053). ✅ Implemented and tested, **not yet
-  committed**.
+  mid-cycle proration (DL-053). ✅ Committed (`7063b30`).
 - **Prompt 15, sections 3–5** — TerminalActivationToken renewal linkage,
-  `PaymentProvider` abstraction, renewal/retry scheduling. Not yet drafted.
+  `PaymentProvider` abstraction, overdue escalation (DL-054). ✅ Implemented
+  and tested, **not yet committed**.
+- **Still unbuilt from Prompt 15's original scope**: a *scheduled* invoice
+  generator (section 1 called for cron-driven generation; it's still
+  manually console-operator-triggered).
 - **Prompt 16** — WhatsApp deep-link request flow + console-side fulfillment
   screen + two-ledger reconciliation logging — not yet drafted.
 - **Prompt 17** — Console UI wiring for the remaining pieces (activation

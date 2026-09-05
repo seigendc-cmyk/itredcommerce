@@ -2837,3 +2837,100 @@ for this same table's `quantity` column to its `active_until` column too.
   `PaymentProvider` abstraction, and `TerminalActivationToken` renewal on
   successful payment — all still ahead in the original billing-engine
   prompt this addendum's prerequisite work paused).
+
+## PAYMENT-TRIGGERED RENEWAL, PAYMENTPROVIDER ABSTRACTION & OVERDUE ESCALATION ADDENDUM (2026-09-05)
+
+### DL-054: `PaymentProvider` interface, invoice-confirmation-triggered token renewal, and overdue escalation
+
+**Decision**: Prompt 15's remaining sections (3: TerminalActivationToken
+linkage, 4: EcoCash/aggregator integration, 5: renewal scheduling) are
+implemented as one cohesive mechanism. Confirming a `billing_invoices`
+payment now goes through a new `console-confirm-invoice-payment` Edge
+Function rather than the old direct client `update(status, paid_at,
+payment_reference)` — that RLS grant is revoked, the same discipline
+DL-051/DL-053 already applied to `tenant_subscriptions`' `quantity` and
+hard-delete: an invariant only as strong as which UI button happens to
+call it isn't actually enforced. This closes a real gap the old grant
+allowed by omission — an operator could mark an invoice paid with no
+renewal happening at all.
+
+**`PaymentProvider` abstraction** (`supabase/functions/_shared/
+paymentProvider.ts`): `confirmPayment({invoiceId, amount, currency,
+reference})` returns `{confirmed, reason?}`. DL-044's aggregator choice
+(Paynow vs. an equivalent alternative) remains unresolved — the only
+concrete implementation, `ManualPaymentProvider`, trusts the console
+operator's own confirmation that a payment was received (the same trust
+assumption the direct-update path it replaces already made), rather than
+calling out to any real aggregator API. A future real aggregator becomes
+a new class implementing the same interface, swapped in via
+`getPaymentProvider()`, with no change to invoice or renewal logic.
+
+**TerminalActivationToken renewal**: on a confirmed payment,
+`console-confirm-invoice-payment` renews a token for every one of the
+tenant's `terminals`, with `expiresAt` set to the paid invoice's own
+`period_end` **exactly** — not the DL-048 30-day placeholder recomputed
+from "now." This is what "replacing the placeholder with a period tied to
+the tenant's actual billing cycle length" means concretely: the renewed
+license expires precisely when the period that was just paid for ends,
+using DL-052's `period_end` directly rather than approximating with a
+day-count. The `plan_tier` signed into each renewed token comes from the
+tenant's `license_keys` row (DL-039 layer 2) — the tenant-wide plan tier,
+distinct from the per-line-item composable billing model DL-043 later
+introduced. An invoice with no stored `period_end` (predates DL-052) or a
+tenant with no `license_keys` row skips renewal with a clear reason
+rather than guessing an expiry; payment is still recorded either way. The
+manual/WhatsApp-triggered issuance path (`console-issue-terminal-
+activation-token`) is untouched and keeps the DL-048 placeholder — it's
+still reachable independently of any billing cycle (e.g. a terminal's
+very first token, before an invoice exists).
+
+The signing/persistence logic itself (`supabase/functions/_shared/
+terminalTokenIssuance.ts`) is extracted from `console-issue-terminal-
+activation-token` and shared between both functions — the two Edge
+Functions run in the same Deno runtime with no build-pipeline boundary
+between them, unlike `apps/console`'s zero-shared-runtime rule (DL-038),
+which exists specifically because a browser bundle and a Deno function
+*do* have such a boundary. Duplicating the ECDSA signing dance a third
+time here would have been pure duplication with no isolation benefit.
+
+**Overdue escalation** (Prompt 15 section 5): a `pg_cron` job
+(`mark-overdue-billing-invoices`, hourly) transitions a `billing_invoices`
+row from `pending` to `overdue` once its own `period_end` has passed
+without payment. No separate lock mechanism is built for this, per the
+original prompt's own instruction: an overdue invoice simply means no
+renewal ever happened for that period, so the tenant's terminals' existing
+tokens run out their own `expires_at` plus the 5-working-day grace period
+and lock via the already-built DL-040/DL-048/DL-049 module-lock logic.
+
+**"Retry cadence" has no literal equivalent here, by necessity, not by
+omission**: there is no automated charge-attempt to retry — no real
+aggregator is integrated (DL-044), and every confirmation is
+operator-driven via `ManualPaymentProvider`. An operator can attempt to
+confirm payment again at any time regardless of an invoice's status; an
+automated retry schedule would have nothing to retry against until a real
+aggregator exists to actually decline a charge in the first place.
+
+**Rationale**: expiring a renewed token at the invoice's exact `period_end`
+rather than "now + N days" is what makes renewal actually track what was
+paid for — DL-052/DL-053 already went to the trouble of storing and
+computing precise period boundaries specifically so a moment like this
+could use them exactly, rather than falling back to an approximation once
+more. Revoking the direct-update grant and routing confirmation through
+one service-role-mediated function is the same "enforce it at the
+database/service boundary, not by trusting which button a UI shows"
+discipline this addendum's own predecessors (DL-051, DL-053) already
+established for this exact table.
+
+### Open items (unchanged, still explicitly not decided here)
+
+- **Payment aggregator choice** (DL-044): still unresolved —
+  `PaymentProvider` exists specifically so this can resolve later without
+  touching invoice/renewal logic.
+- **Automated payment retry**: not applicable until a real aggregator
+  exists to decline a charge against; not decided or built here.
+- Every other open item carried forward unchanged (mid-relationship
+  `billing_cycle` change transition rule, PoolWise/CashPlan scope,
+  `LicenceInfo.activationCode`, the WhatsApp activation-request flow, and
+  a scheduled — vs. manually console-operator-triggered — invoice
+  generator, which Prompt 15 section 1 originally called for and remains
+  unbuilt).

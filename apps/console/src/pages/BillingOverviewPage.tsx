@@ -10,7 +10,7 @@ import {
   endTenantSubscription,
   listBillingInvoices,
   generateBillingInvoice,
-  markInvoicePaid,
+  confirmInvoicePayment,
   type TenantRow,
   type PlanComponentRow,
   type TenantSubscriptionRow,
@@ -40,6 +40,11 @@ export const BillingOverviewPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // DL-054: renewed tokens are shown once, immediately after payment
+  // confirmation — same "shown once, never re-exposed" discipline as
+  // ActivationRequestsPage's issued-token banner, since terminal_activation_
+  // tokens.signature has no select grant to authenticated at all.
+  const [renewedTokens, setRenewedTokens] = useState<{ terminalId: string; token: string; expiresAt: string }[] | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -148,13 +153,19 @@ export const BillingOverviewPage: React.FC = () => {
     }
   }
 
-  async function handleMarkPaid(invoice: BillingInvoiceRow) {
+  async function handleConfirmPayment(invoice: BillingInvoiceRow) {
     const reference = window.prompt('Payment reference?') ?? '';
     if (!reference.trim()) return;
     setBusy(true);
     setError(null);
+    setRenewedTokens(null);
     try {
-      await markInvoicePaid(invoice.id, reference.trim());
+      const result = await confirmInvoicePayment({ invoiceId: invoice.id, paymentReference: reference.trim() });
+      if (result.renewed) {
+        setRenewedTokens(result.terminalsRenewed);
+      } else if (result.reason) {
+        setError(`Payment recorded, but no tokens were renewed: ${result.reason}`);
+      }
       await refreshTenantData(selectedTenantId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -166,6 +177,30 @@ export const BillingOverviewPage: React.FC = () => {
   return (
     <ConsoleShell title="Billing Overview" description="Cross-tenant view of invoices and active plan subscriptions.">
       {error && <p className="text-xs text-red-400 bg-red-950/40 border border-red-900 rounded px-3 py-2 mb-4">{error}</p>}
+
+      {renewedTokens && renewedTokens.length > 0 && (
+        <div className="mb-4 bg-emerald-950/40 border border-emerald-900 rounded px-3 py-3 text-sm space-y-2">
+          <p className="text-emerald-300 font-semibold">
+            Payment confirmed — {renewedTokens.length} terminal{renewedTokens.length === 1 ? '' : 's'} renewed. Relay each token to the tenant via WhatsApp now; they will not be shown again.
+          </p>
+          {renewedTokens.map((rt) => (
+            <div key={rt.terminalId} className="flex items-center gap-2">
+              <span className="text-xs text-slate-400 shrink-0 w-32 truncate">{rt.terminalId}</span>
+              <code className="flex-1 break-all bg-slate-950 border border-slate-800 rounded px-2 py-1 text-xs text-slate-200">{rt.token}</code>
+              <button
+                type="button"
+                onClick={() => navigator.clipboard.writeText(rt.token)}
+                className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-100 px-2 py-1 rounded shrink-0"
+              >
+                Copy
+              </button>
+            </div>
+          ))}
+          <button type="button" onClick={() => setRenewedTokens(null)} className="text-xs text-slate-400 underline">
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {loading ? (
         <p className="text-sm text-slate-500">Loading...</p>
@@ -304,8 +339,8 @@ export const BillingOverviewPage: React.FC = () => {
                       {inv.status}
                     </span>
                     {inv.status !== 'paid' && (
-                      <button type="button" disabled={busy} onClick={() => handleMarkPaid(inv)} className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-100 px-2 py-1 rounded">
-                        Mark paid
+                      <button type="button" disabled={busy} onClick={() => handleConfirmPayment(inv)} className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-100 px-2 py-1 rounded">
+                        Confirm payment
                       </button>
                     )}
                   </div>
