@@ -2178,12 +2178,12 @@ fee** (each additional branch beyond the default), **per-terminal fee**
 Delivery, PoolWise, CashPlan, and future modules — each independently
 toggled and priced).
 
-**⚠ OPEN DECISION — feature add-on billing scope**: whether a feature
-add-on (BI Brain, Delivery, etc.) bills as one tenant-wide flat fee or
-scales per-branch/per-terminal is **not decided**. `plan_components.
-billing_unit` is specified now specifically so it can express either shape
-without a schema change once this is decided — implementers must not
-default to one interpretation when populating it for a real add-on.
+**RESOLVED (DL-051, 2026-09-05) — feature add-on billing scope**: a feature
+add-on (BI Brain, Delivery, PoolWise, CashPlan) bills as one tenant-wide
+flat fee, never scaled by branch/terminal count. Originally left open here
+so `plan_components.billing_unit` wouldn't be pre-committed to one shape
+before this was decided; see DL-051 for the resolution, its rationale, and
+the database-level enforcement mechanism.
 
 **⚠ OPEN DECISION — proration on mid-cycle additions**: whether adding a
 branch or terminal mid-billing-cycle triggers an immediate prorated charge
@@ -2234,10 +2234,9 @@ independence model).
 
 ### Open items (explicitly not decided here)
 
-- **Feature add-on billing scope** (DL-043): tenant-wide flat fee vs.
-  per-branch/per-terminal pricing — **unresolved**. `plan_components.
-  billing_unit` is deliberately flexible enough to support either; do not
-  implement against an assumed default.
+- **Feature add-on billing scope** (DL-043): **resolved by DL-051** —
+  tenant-wide flat fee, enforced by a database trigger on
+  `tenant_subscriptions`. No longer open.
 - **Proration on mid-cycle branch/terminal additions** (DL-043): immediate
   prorated charge vs. rolled into the next cycle's invoice — **unresolved**.
   Do not implement proration logic until this is explicitly revisited.
@@ -2439,10 +2438,11 @@ classification to billing documents specifically.
 
 ### Open items (unchanged, still explicitly not decided here)
 
-- **Feature add-on billing scope** and **proration on mid-cycle additions**
-  (DL-043): both still unresolved; DL-047's calculation engine is
-  deliberately built to not need either answer yet, not a resolution of
-  either.
+- **Feature add-on billing scope** (DL-043): **resolved by DL-051**
+  (tenant-wide flat fee, enforced by a database trigger) — see that
+  addendum. **Proration on mid-cycle additions** (DL-043): still
+  unresolved; DL-047's calculation engine remains deliberately built to not
+  need that answer.
 - **PoolWise and CashPlan functional scope**: unchanged, still pending.
 - **Payment aggregator choice** (DL-044): unchanged, still unresolved.
 - **`LicenceInfo.activationCode` vs. `TerminalActivationToken`**: unchanged
@@ -2597,6 +2597,65 @@ split out from `drainLoop.ts`'s I/O.
 - **WhatsApp activation-request flow** (DL-041) and **`apps/console`'s
   issuance UI wiring to this backend**: unchanged, still pending later
   prompts.
-- Every other open item from the prior addendum (feature add-on billing
-  scope, proration, PoolWise/CashPlan scope, payment aggregator choice,
+- Feature add-on billing scope, listed as open in the prior addendum, was
+  **resolved by DL-051** (below): tenant-wide flat fee, enforced by a
+  database trigger. Every other open item from the prior addendum
+  (proration, PoolWise/CashPlan scope, payment aggregator choice,
   `LicenceInfo.activationCode`) is unchanged by this addendum.
+
+## FEATURE ADD-ON BILLING SCOPE RESOLUTION ADDENDUM (2026-09-05)
+
+### DL-051: Feature add-ons bill as one tenant-wide flat fee, enforced by a database trigger
+
+**Decision**: DL-043's open question — whether a `'feature'`-type
+`plan_component` (BI Brain, Delivery, PoolWise, CashPlan, and future
+add-ons) bills as one flat fee per tenant or scales per-branch/per-terminal
+— is resolved: **tenant-wide flat fee**. A tenant's `tenant_subscriptions`
+row for a feature component always has `quantity = 1`, regardless of how
+many branches or terminals that tenant has.
+
+This is enforced at the database level, not left as a console-UI
+convention or an operator's manual discipline: a new
+`enforce_feature_subscription_flat_quantity()` trigger function on
+`tenant_subscriptions` (`BEFORE INSERT OR UPDATE`) looks up the referenced
+`plan_components.component_type` and raises an exception (Postgres
+`23514`/`check_violation`) if it's `'feature'` and the row's `quantity` is
+anything other than `1`. This was necessary rather than optional: DL-047
+already gave `tenant_subscriptions` ordinary direct RLS-gated CRUD for any
+authenticated console operator specifically because editing a subscription
+carries no signing-key or trusted-attribution requirement — which also
+means a client-side-only check (console UI validation, or a rule enforced
+only inside `calculateInvoiceLineItems`) could always be bypassed by a
+console operator writing to the table directly via the Supabase REST API.
+A database trigger is the only enforcement point that can't be routed
+around by the same client that has legitimate direct write access.
+
+`calculateInvoiceLineItems` itself (`apps/console/src/lib/billingEngine.ts`,
+`console-generate-billing-invoice`) is **not** changed by this decision and
+still never branches on `component_type` — DL-047's mechanical-neutrality
+design already produces the correct flat-fee result once the trigger
+guarantees a feature row's `quantity` is always `1`; the calculator simply
+multiplies `1 * unit_price`. The console's "Add subscription"/quantity UI
+(`BillingOverviewPage.tsx`) locks the quantity input to `1` and disables it
+when the selected component is feature-typed, so an operator sees the rule
+up front rather than hitting the trigger's rejection after submitting.
+
+**Rationale**: resolving this via a database constraint rather than by
+teaching the calculator to special-case `component_type` keeps DL-047's
+"the calculator has no interpretation baked in" property intact for the
+one question (proration) that's genuinely still undecided, while still
+giving the *other* question a real, unbypassable answer now that it has
+one. Enforcing the invariant at the table level — the same discipline
+DL-004/DL-010/DL-014/DL-047 already apply to rates, dispatch
+classification, and computed invoice fields — means the "flat fee" answer
+holds no matter which client writes to `tenant_subscriptions`, not just the
+one console page that happens to be careful about it today.
+
+### Open items (unchanged, still explicitly not decided here)
+
+- **Proration on mid-cycle branch/terminal additions** (DL-043): still
+  unresolved.
+- **PoolWise and CashPlan functional scope**: unchanged, still pending.
+- **Payment aggregator choice** (DL-044): unchanged, still unresolved.
+- **`LicenceInfo.activationCode`** (DL-028) and the **WhatsApp
+  activation-request flow** (DL-041): unchanged by this addendum.

@@ -13,7 +13,10 @@
 // and a Vite-bundled browser app have no build pipeline in common to share
 // a file through even without that constraint. Keep the two in sync
 // manually; neither branches on component_type or billing_unit's value, so
-// there is nothing tricky to keep in sync (DL-047).
+// there is nothing tricky to keep in sync (DL-047). Feature add-on billing
+// scope IS resolved (DL-051: tenant-wide flat fee) — enforced by a database
+// trigger on tenant_subscriptions, not by either copy of this function
+// branching, so the "don't branch on component_type" invariant still holds.
 import { createClient } from 'npm:@supabase/supabase-js@2';
 
 const corsHeaders = {
@@ -61,8 +64,10 @@ interface BillingLineItem {
 
 // Never branches on component_type or billing_unit's value (DL-047) —
 // mechanically sums quantity * unit_price per subscribed component and
-// labels the line with the component's own billing_unit, taking no
-// position on either of DL-043's still-open questions.
+// labels the line with the component's own billing_unit. Takes no position
+// on DL-043's still-open proration question; feature-billing-scope is
+// resolved (DL-051) but enforced upstream (a tenant_subscriptions trigger
+// guarantees a feature row's quantity is always 1), not by a branch here.
 function calculateInvoiceLineItems(
   components: PlanComponentRow[],
   subscriptions: TenantSubscriptionRow[]

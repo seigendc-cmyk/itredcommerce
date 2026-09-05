@@ -1,6 +1,11 @@
 // Billing calculation engine (DL-047). Deliberately never branches on
 // componentType or billingUnit's value — it takes no position on DL-043's
-// still-open questions (feature add-on flat-vs-scaled billing; proration).
+// still-open proration question. Feature add-on billing scope (flat vs.
+// per-branch/per-terminal) IS resolved (DL-051: tenant-wide flat fee), but
+// not by this function branching on componentType — a database trigger on
+// tenant_subscriptions enforces that a feature-type row's quantity is
+// always 1, so this function's plain quantity * unitPrice already produces
+// the flat-fee result without needing an opinion of its own.
 // This is the live-preview copy, used before "Generate Invoice" actually
 // writes anything. The authoritative copy that runs at generation time
 // lives in supabase/functions/console-generate-billing-invoice/index.ts —

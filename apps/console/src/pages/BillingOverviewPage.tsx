@@ -172,6 +172,12 @@ export const BillingOverviewPage: React.FC = () => {
             <div className="space-y-2">
               {subscriptions.map((sub) => {
                 const component = componentsById.get(sub.plan_component_id);
+                // DL-051: feature add-ons bill as one tenant-wide flat fee —
+                // a database trigger on tenant_subscriptions rejects any
+                // quantity other than 1 for a feature-type component, so the
+                // quantity input is locked here rather than letting an
+                // operator type a value the server will just reject.
+                const isFeature = component?.component_type === 'feature';
                 return (
                   <div key={sub.id} className="bg-slate-900 border border-slate-800 rounded-lg p-3 flex items-center justify-between">
                     <div className="text-sm text-slate-100">
@@ -183,9 +189,10 @@ export const BillingOverviewPage: React.FC = () => {
                         type="number"
                         min={1}
                         value={sub.quantity}
-                        disabled={busy}
+                        disabled={busy || isFeature}
+                        title={isFeature ? 'Feature add-ons bill as one tenant-wide flat fee (DL-051)' : undefined}
                         onChange={(e) => handleQuantityChange(sub, Number(e.target.value))}
-                        className="w-16 bg-slate-950 border border-slate-800 rounded px-2 py-1 text-xs text-slate-100"
+                        className="w-16 bg-slate-950 border border-slate-800 rounded px-2 py-1 text-xs text-slate-100 disabled:opacity-50"
                       />
                       <button type="button" disabled={busy} onClick={() => handleRemoveSubscription(sub.id)} className="text-xs bg-slate-800 hover:bg-red-950 text-slate-100 px-2 py-1 rounded">Remove</button>
                     </div>
@@ -195,7 +202,14 @@ export const BillingOverviewPage: React.FC = () => {
               <div className="flex items-center gap-2">
                 <select
                   value={addComponentId}
-                  onChange={(e) => setAddComponentId(e.target.value)}
+                  onChange={(e) => {
+                    const nextId = e.target.value;
+                    setAddComponentId(nextId);
+                    // DL-051: selecting a feature add-on locks quantity to 1
+                    // immediately, matching the tenant_subscriptions trigger
+                    // that would otherwise reject anything else on submit.
+                    if (componentsById.get(nextId)?.component_type === 'feature') setAddQuantity(1);
+                  }}
                   className="bg-slate-950 border border-slate-800 rounded px-2 py-1 text-xs text-slate-100 flex-1"
                 >
                   <option value="">Add a component...</option>
@@ -207,8 +221,10 @@ export const BillingOverviewPage: React.FC = () => {
                   type="number"
                   min={1}
                   value={addQuantity}
+                  disabled={componentsById.get(addComponentId)?.component_type === 'feature'}
+                  title={componentsById.get(addComponentId)?.component_type === 'feature' ? 'Feature add-ons bill as one tenant-wide flat fee (DL-051)' : undefined}
                   onChange={(e) => setAddQuantity(Number(e.target.value))}
-                  className="w-16 bg-slate-950 border border-slate-800 rounded px-2 py-1 text-xs text-slate-100"
+                  className="w-16 bg-slate-950 border border-slate-800 rounded px-2 py-1 text-xs text-slate-100 disabled:opacity-50"
                 />
                 <button type="button" disabled={!addComponentId || busy} onClick={handleAddSubscription} className="text-xs bg-[#FF6B00] text-white px-3 py-1.5 rounded disabled:opacity-50">Add</button>
               </div>
