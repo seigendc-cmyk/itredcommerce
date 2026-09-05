@@ -1,7 +1,8 @@
 // Console-operator action: issue a signed TerminalActivationToken (DL-039
 // layer 3) for a specific tenant/terminal, and optionally mark the
 // activation_request it fulfills. See DL-041 (issuance is a console-only
-// action, never automated) and DL-046 (the signing scheme itself).
+// action, never automated), DL-046 (the signing scheme itself), and DL-048
+// (keyId-based key rotation support and the 30-day default validity).
 //
 // Needs the service-role key (to write terminal_activation_tokens /
 // activation_requests, neither of which grants any authenticated write) and
@@ -9,6 +10,20 @@
 // this cannot be a direct client write, unlike plan_components/
 // tenant_subscriptions.
 import { createClient } from 'npm:@supabase/supabase-js@2';
+
+// DL-048: the key this function currently signs new tokens with. Bump this
+// (and add the corresponding TERMINAL_TOKEN_SIGNING_PRIVATE_KEY_<ID> secret)
+// when rotating — see scripts/generate-terminal-token-keypair.mjs. Never
+// remove an old key's entry from server/lib/terminalActivationToken.ts's
+// verification registry just because this constant moved past it.
+const CURRENT_KEY_ID = 'v1';
+
+// DL-048: default validity when the caller doesn't specify one — 30 days,
+// tied to the monthly billing cycle (tenant_subscriptions/billing_invoices
+// already use a 'YYYY-MM' period, DL-043), so a re-issued token naturally
+// lines up with plan renewal. An explicit validityDays is still honored for
+// operator flexibility, but is never required.
+const DEFAULT_VALIDITY_DAYS = 30;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -59,9 +74,12 @@ Deno.serve(async (req) => {
     return json({ error: 'Invalid JSON body' }, 400);
   }
   const { tenantId, terminalId, planTier, activationRequestId } = body;
-  const validityDays = Number(body.validityDays);
-  if (!tenantId || !terminalId || !planTier || !Number.isFinite(validityDays) || validityDays <= 0) {
-    return json({ error: 'tenantId, terminalId, planTier and a positive validityDays are required' }, 400);
+  const requestedValidityDays = Number(body.validityDays);
+  const validityDays = Number.isFinite(requestedValidityDays) && requestedValidityDays > 0
+    ? requestedValidityDays
+    : DEFAULT_VALIDITY_DAYS;
+  if (!tenantId || !terminalId || !planTier) {
+    return json({ error: 'tenantId, terminalId and planTier are required' }, 400);
   }
 
   const admin = createClient(
@@ -90,11 +108,13 @@ Deno.serve(async (req) => {
 
   // 2. Sign the payload. The private key never leaves this function; the
   // corresponding public key is committed as a constant in
-  // server/lib/terminalActivationToken.ts for offline, terminal-side
-  // verification (DL-046).
-  const privateKeyPem = Deno.env.get('TERMINAL_TOKEN_SIGNING_PRIVATE_KEY');
+  // server/lib/terminalActivationToken.ts's TERMINAL_TOKEN_PUBLIC_KEYS
+  // registry (keyed by CURRENT_KEY_ID) for offline, terminal-side
+  // verification (DL-046, DL-048).
+  const signingSecretName = `TERMINAL_TOKEN_SIGNING_PRIVATE_KEY_${CURRENT_KEY_ID.toUpperCase()}`;
+  const privateKeyPem = Deno.env.get(signingSecretName);
   if (!privateKeyPem) {
-    console.error('[console-issue-terminal-activation-token] TERMINAL_TOKEN_SIGNING_PRIVATE_KEY is not configured');
+    console.error(`[console-issue-terminal-activation-token] ${signingSecretName} is not configured`);
     return json({ error: 'Temporarily unavailable' }, 502);
   }
 
@@ -120,7 +140,7 @@ Deno.serve(async (req) => {
 
   const issuedAt = new Date();
   const expiresAt = new Date(issuedAt.getTime() + validityDays * 24 * 60 * 60 * 1000);
-  const payload = { tenantId, terminalId, planTier, issuedAt: issuedAt.toISOString(), expiresAt: expiresAt.toISOString() };
+  const payload = { tenantId, terminalId, planTier, issuedAt: issuedAt.toISOString(), expiresAt: expiresAt.toISOString(), keyId: CURRENT_KEY_ID };
   const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
 
   const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, signingKey, payloadBytes);

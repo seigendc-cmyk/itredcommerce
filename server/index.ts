@@ -31,6 +31,7 @@ import { isSupabaseConfigured } from './env';
 import { pullStaffFromSupabase } from './sync/staffPull';
 import { pullFiscalRegistrationsFromSupabase } from './sync/fiscalRegistrationPull';
 import { pullTenantFromSupabase } from './sync/tenantPull';
+import { pullTerminalActivationTokenFromSupabase } from './sync/terminalActivationTokenPull';
 import { connectivityMonitor } from './sync/connectivityInstance';
 import { startPolling } from './sync/connectivity';
 import { startFiscalDrainLoop } from './sync/fiscalDrainLoop';
@@ -101,6 +102,17 @@ export function startBackgroundSync() {
   const CONNECTIVITY_POLL_INTERVAL_MS = 10 * 1000;
   void connectivityMonitor.checkNow();
   startPolling(connectivityMonitor, CONNECTIVITY_POLL_INTERVAL_MS);
+
+  // DL-039/DL-048: pull down a newer TerminalActivationToken the moment
+  // connectivity is restored, piggybacking on the same connectivity signal
+  // the outbox drain loop already subscribes to (server/sync/drainLoop.ts)
+  // rather than adding yet another independent polling interval like the
+  // pulls above — a token needs to reach the terminal as soon as it can,
+  // not up to 5 minutes later.
+  void pullTerminalActivationTokenFromSupabase();
+  connectivityMonitor.subscribe((state) => {
+    if (state === 'ONLINE') void pullTerminalActivationTokenFromSupabase();
+  });
 }
 startBackgroundSync();
 

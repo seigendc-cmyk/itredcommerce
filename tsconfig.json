@@ -29,6 +29,7 @@
     "node_modules",
     "executive-pwa",
     "rider-pwa",
-    "src-tauri"
+    "src-tauri",
+    "apps/console"
   ]
 }

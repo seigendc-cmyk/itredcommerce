@@ -2449,8 +2449,150 @@ classification to billing documents specifically.
   — this addendum builds real issuance/verification for
   `TerminalActivationToken` specifically and does not touch
   `LicenceInfo.activationCode` or `LicensingView`.
-- **Module-lock enforcement wiring** (new, from DL-046): the primitives and
-  one endpoint pair exist; wiring the lock into every Sales/Purchasing
-  route and view, and a tenant-configurable working-day calendar, are not
-  built and are the natural next step for whichever prompt picks this back
-  up.
+- **Module-lock enforcement wiring** (DL-046): **resolved by DL-048 below**
+  — Sales/Purchasing menu entries and navigation are now gated in the
+  Tauri app. A tenant-configurable working-day calendar (vs. the current
+  hardcoded Mon–Fri default) remains unbuilt and still open.
+
+## TERMINAL ACTIVATION TOKEN: KEY ROTATION, MODULE-LOCK UI, AND SYNC-DOWN ADDENDUM (2026-09-05)
+
+This addendum builds the three things DL-046 explicitly left as follow-ups:
+key-rotation support in the token format itself, wiring DL-040's module
+lock into the Tauri app's actual navigation, and a connectivity-triggered
+sync-down so a terminal picks up a newly issued token without a manual
+restart. It does not touch billing calculation, the WhatsApp request flow,
+or `apps/console`'s UI — all explicitly out of scope, per whichever later
+prompts own those.
+
+### DL-048: `keyId`-based key rotation, a unified verification status, and a 30-day default validity
+
+**Decision**: `TerminalActivationPayload` gains a `keyId` field (e.g.
+`"v1"`), and `server/lib/terminalActivationToken.ts`'s single public-key
+constant becomes a `TERMINAL_TOKEN_PUBLIC_KEYS: Record<keyId, publicKey>`
+registry. `console-issue-terminal-activation-token` signs with whatever its
+`CURRENT_KEY_ID` constant names, reading the matching private key from a
+Supabase secret named `TERMINAL_TOKEN_SIGNING_PRIVATE_KEY_<KEYID>`.
+Rotating means generating a new key under a new id
+(`scripts/generate-terminal-token-keypair.mjs --key-id v2`), adding its
+secret, appending — never replacing — its public key in the registry, and
+bumping `CURRENT_KEY_ID`. Tokens already issued under an old key stay
+verifiable for as long as their own expiry + grace period requires, since
+the old registry entry is never removed just because issuance moved past
+it. No rotation is actually performed by this addendum — only the format
+and registry shape, so a real rotation later is a config change, not a
+token-format migration.
+
+The scheme itself (ECDSA P-256, the compact `payload.signature` two-part
+string) is unchanged from DL-046 — kept deliberately rather than
+reconsidered, since it was already implemented and proven end-to-end, and
+token compactness matters concretely given tokens are relayed by hand over
+WhatsApp (DL-041); switching to Ed25519 or RSA would have re-opened a
+settled tradeoff for no functional gain (RSA in particular would multiply
+the pasted token's length).
+
+`verifyTerminalActivationToken()` is also collapsed from two functions
+(itself plus the old `evaluateModuleLock()`) into one, returning a single
+`TerminalTokenStatus`: `'valid' | 'expired-in-grace' | 'expired-locked' |
+'invalid-signature' | 'identity-mismatch'`. Order of checks matters:
+signature first (an unverified payload is never trustworthy enough to read
+even for identity), then identity match, then expiry/grace — a
+signature-valid token for a different tenant/terminal is reported as
+`identity-mismatch` before expiry is even considered. The function also
+takes an injectable public-key registry (defaulting to the real one) purely
+for testability — the real private key never leaves the Edge Function
+secret it's stored as, so tests sign against a locally generated keypair
+instead.
+
+Default validity, when a console operator doesn't specify one, is 30 days
+— tied to the monthly billing cycle (`tenant_subscriptions`/
+`billing_invoices` already use a `'YYYY-MM'` period, DL-043), so a
+re-issued token naturally lines up with plan renewal. An explicit
+`validityDays` is still honored when given, but never required.
+
+### DL-049: Module-lock UI enforcement — Sales/Purchasing gated, Reporting/EOD/Inventory untouched
+
+**Decision**: `src/utils/accessRoleGate.ts` gains a `MODULE_LOCKED_VIEWS`
+set (`SALES_CASH`, `SALES_CREDIT`, `SALES_RETURN`, `LAYAWAY`, `HELD_SALES`,
+`HELD_RECEIPTS`, `PURCHASING`, `PURCHASE_MEMO`, `PURCHASE_ORDER`) and two
+lock-aware wrappers around the existing role-gate functions:
+`canAccessViewWithModuleLock()` and `filterMenuGroupsForRoleAndLock()`.
+`SALES_HISTORY` is deliberately excluded even though it lives in the same
+menu category as the above — that `ActiveView` doubles as a Reports entry
+(`"Sales Performance & Margins"`), and DL-040 requires Reporting to stay
+available regardless of lock status; a shared `ActiveView` between a
+transactional and a reporting entry point meant the lock had to be scoped
+to the view, not the menu category.
+
+Enforcement mirrors the exact two-layer defense-in-depth pattern
+`canAccessView()`/`AccessRestrictedView` already established for the
+till-operator role gate (App.tsx's `handleNavigate` and `renderActiveView`)
+rather than inventing a new one: `handleNavigate` refuses to set a locked
+view as `activeView` at all, and `renderActiveView` re-checks as a fallback
+in case `activeView` somehow already points at one (e.g. a stale deep
+link). `AccessRestrictedView` gained a `reason: 'ROLE' | 'MODULE_LOCK'`
+prop so the shown message is accurate — telling a cashier to "contact a
+head-office administrator about your role" would be actively wrong when
+the real cause is an expired token.
+
+Lock state itself comes from a new `useModuleLock()` hook polling `GET
+/api/licensing/status` at launch and every 15 minutes, plus an explicit
+`refresh()` called from `handleNavigate` on every navigation into a
+locked-eligible view — satisfying DL-040's "not just once at startup"
+requirement without a tighter global poll interval, since the check is a
+purely local, already-offline-evaluated read (no network egress). `GET
+/status` itself dropped its back-office-only role restriction: a
+`TILL_OPERATOR` session is exactly who the Sales lock affects and must be
+able to read its own terminal's status, and nothing the route returns is
+tenant-cross-cutting or role-sensitive.
+
+A terminal with no `TerminalActivationToken` at all (`activated: false`) is
+deliberately **not** locked — DL-040 frames the lock as engaging once an
+issued token *expires*, not as a gate on ever having had one, and the
+WhatsApp request/console-issuance loop that would let a fresh install
+obtain its first token isn't built yet (DL-041, later prompts). Locking
+every never-activated install by default would disable Sales on every
+existing/dev/demo install with no path to recover, which is a materially
+different (and much larger) decision than what DL-040 actually asked for.
+
+### DL-050: TerminalActivationToken sync-down reads the raw table, not the DL-039 tenant view — and piggybacks on the connectivity signal, not a new poll
+
+**Decision**: `server/sync/terminalActivationTokenPull.ts` pulls a
+terminal's own newest active token via `getSupabaseAdmin()` (the
+service-role client already used by `staffPull.ts`/`tenantPull.ts`),
+filtered to this installation's own `tenant_id`/`terminal_id`, and is
+triggered by subscribing to `connectivityMonitor`'s `ONLINE` transitions —
+the same signal `drainLoop.ts` already subscribes to — rather than adding
+another independent `setInterval` alongside the staff/tenant/fiscal pulls.
+
+This deliberately reads `terminal_activation_tokens` directly rather than
+Prompt 13's `v_tenant_terminal_activation_tokens` view, even though the
+original instruction for this pull was to use that view: the view
+excludes `signature` specifically because any authenticated staff session
+at the tenant can read it, and a leaked signature is a bearer credential —
+exactly the field this pull needs to cache a usable token locally. That
+exclusion protects a *browser-facing* authenticated role; `getSupabaseAdmin()`
+already bypasses RLS entirely for this trusted, server-side-only process,
+identical to how `pullStaffFromSupabase()`/`pullTenantFromSupabase()` also
+read their raw tables directly rather than through any view. Following the
+view instruction literally here would have made the feature non-functional
+(no way to fetch the real credential) for a security boundary that doesn't
+actually apply to this caller.
+
+A remote row only ever replaces the local cache when it's both genuinely
+newer (by `issued_at`) and passes signature + identity verification — this
+is a cache refresh, not an authority, and must never let a stale or
+corrupted/misdirected row overwrite a good local one. That decision logic
+is split into a pure, independently testable `decideTerminalTokenSync()`
+function, the same way `conflictResolution.ts`/`backoff.ts` are already
+split out from `drainLoop.ts`'s I/O.
+
+### Open items (unchanged, still explicitly not decided here)
+
+- **Tenant-configurable working-day calendar** (DL-040): still hardcoded to
+  Mon–Fri; a per-tenant calendar remains unbuilt.
+- **WhatsApp activation-request flow** (DL-041) and **`apps/console`'s
+  issuance UI wiring to this backend**: unchanged, still pending later
+  prompts.
+- Every other open item from the prior addendum (feature add-on billing
+  scope, proration, PoolWise/CashPlan scope, payment aggregator choice,
+  `LicenceInfo.activationCode`) is unchanged by this addendum.

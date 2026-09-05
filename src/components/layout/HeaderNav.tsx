@@ -24,7 +24,7 @@ import {
 } from 'lucide-react';
 import { StaffMember, ActiveView, MenuGroup, MenuItem } from '../../types';
 import { APPLICATION_MENU_GROUPS } from '../../data/mockData';
-import { filterMenuGroupsForRole } from '../../utils/accessRoleGate';
+import { filterMenuGroupsForRoleAndLock } from '../../utils/accessRoleGate';
 
 export interface HeaderNavProps {
   currentStaff: StaffMember;
@@ -32,6 +32,8 @@ export interface HeaderNavProps {
   onNavigate: (view: ActiveView, customParams?: any) => void;
   onLockSession: () => void;
   onSwitchStaff: () => void;
+  // DL-040/DL-048: hides Sales/Purchasing menu entries when true.
+  moduleLocked: boolean;
 }
 
 export const HeaderNav: React.FC<HeaderNavProps> = ({
@@ -40,6 +42,7 @@ export const HeaderNav: React.FC<HeaderNavProps> = ({
   onNavigate,
   onLockSession,
   onSwitchStaff,
+  moduleLocked,
 }) => {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [isAccordionDrawerOpen, setIsAccordionDrawerOpen] = useState<boolean>(false);
@@ -58,12 +61,13 @@ export const HeaderNav: React.FC<HeaderNavProps> = ({
   const menuContainerRef = useRef<HTMLDivElement>(null);
   const drawerSearchInputRef = useRef<HTMLInputElement>(null);
 
-  // DL-002/DL-005: hide head-office-only modules from a till-operator
-  // session's menus entirely, rather than just relying on the deeper
-  // App.tsx-level navigation gate. See src/utils/accessRoleGate.ts.
+  // DL-002/DL-005/DL-040/DL-048: hide head-office-only modules from a
+  // till-operator session's menus entirely, and hide Sales/Purchasing
+  // when the module lock is engaged — rather than just relying on the
+  // deeper App.tsx-level navigation gate. See src/utils/accessRoleGate.ts.
   const menuGroups = useMemo(
-    () => filterMenuGroupsForRole(APPLICATION_MENU_GROUPS, currentStaff.accessRole),
-    [currentStaff.accessRole]
+    () => filterMenuGroupsForRoleAndLock(APPLICATION_MENU_GROUPS, currentStaff.accessRole, moduleLocked),
+    [currentStaff.accessRole, moduleLocked]
   );
 
   useEffect(() => {

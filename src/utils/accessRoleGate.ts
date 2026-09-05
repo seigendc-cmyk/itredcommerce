@@ -46,3 +46,47 @@ export function filterMenuGroupsForRole(groups: MenuGroup[], accessRole: StaffAc
     .map((g) => ({ ...g, items: g.items.filter((item) => BRANCH_TERMINAL_VIEWS.has(item.viewTarget)) }))
     .filter((g) => g.items.length > 0);
 }
+
+// DL-040/DL-048: the Sales/Purchasing views a module lock disables when a
+// TerminalActivationToken has expired past its grace period. Deliberately
+// excludes SALES_HISTORY — that ActiveView doubles as a Reports entry
+// ("Sales Performance & Margins", src/data/mockData.ts) — and every
+// Reporting/EOD/Inventory-viewing view, since DL-040 requires those to stay
+// available regardless of lock status; only actions that create or resume a
+// sale or purchase transaction are in scope.
+export const MODULE_LOCKED_VIEWS: ReadonlySet<ActiveView> = new Set<ActiveView>([
+  'SALES_CASH',
+  'SALES_CREDIT',
+  'SALES_RETURN',
+  'LAYAWAY',
+  'HELD_SALES',
+  'HELD_RECEIPTS',
+  'PURCHASING',
+  'PURCHASE_MEMO',
+  'PURCHASE_ORDER',
+]);
+
+export function isModuleLockedView(view: ActiveView): boolean {
+  return MODULE_LOCKED_VIEWS.has(view);
+}
+
+export function canAccessViewWithModuleLock(
+  accessRole: StaffAccessRole | undefined,
+  view: ActiveView,
+  moduleLocked: boolean
+): boolean {
+  if (moduleLocked && isModuleLockedView(view)) return false;
+  return canAccessView(accessRole, view);
+}
+
+export function filterMenuGroupsForRoleAndLock(
+  groups: MenuGroup[],
+  accessRole: StaffAccessRole | undefined,
+  moduleLocked: boolean
+): MenuGroup[] {
+  const roleFiltered = filterMenuGroupsForRole(groups, accessRole);
+  if (!moduleLocked) return roleFiltered;
+  return roleFiltered
+    .map((g) => ({ ...g, items: g.items.filter((item) => !isModuleLockedView(item.viewTarget)) }))
+    .filter((g) => g.items.length > 0);
+}

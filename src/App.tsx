@@ -160,7 +160,8 @@ import { RestoreDataView } from './components/views/system/RestoreDataView';
 import { DatabaseIntegrityView } from './components/views/system/DatabaseIntegrityView';
 import { InventoryAttentionCenterView } from './components/views/inventory/InventoryAttentionCenterView';
 import { AccessRestrictedView } from './components/common/AccessRestrictedView';
-import { canAccessView, isBackOfficeAccessRole } from './utils/accessRoleGate';
+import { canAccessView, canAccessViewWithModuleLock, isBackOfficeAccessRole, isModuleLockedView } from './utils/accessRoleGate';
+import { useModuleLock } from './hooks/useModuleLock';
 import { 
   generateReorderRecommendations, 
   evaluateStocktakeRiskSignals, 
@@ -178,6 +179,11 @@ export default function App() {
   const [appStage, setAppStage] = useState<AppStage>('SPLASH');
   const [currentStaff, setCurrentStaff] = useState<StaffMember>(INITIAL_STAFF_MEMBERS[0]);
   const [activeView, setActiveView] = useState<ActiveView>('LANDING');
+  // DL-040/DL-048: polled at launch + every 15 minutes, and re-checked on
+  // navigation into a locked-eligible view below (handleNavigate) — so a
+  // terminal left open across the expiry+grace boundary still locks out
+  // Sales/Purchasing without requiring a restart.
+  const moduleLock = useModuleLock();
   const [navigationParams, setNavigationParams] = useState<any>(null);
 
   // Application State for Transactions and Commerce Entities
@@ -767,11 +773,17 @@ export default function App() {
   }, [appStage, currentStaff.accessRole]);
 
   const handleNavigate = (view: ActiveView, params?: any) => {
-    // DL-002/DL-005 app-surface gate — every user-initiated navigation
+    // DL-002/DL-005/DL-040/DL-048 gate — every user-initiated navigation
     // (menu clicks, hotkeys, in-view "back to X" buttons) funnels through
     // here, so this is the single point that keeps a till-operator session
-    // out of head-office-only views. See src/utils/accessRoleGate.ts.
-    if (!canAccessView(currentStaff.accessRole, view)) return;
+    // out of head-office-only views, and a locked terminal out of
+    // Sales/Purchasing. See src/utils/accessRoleGate.ts.
+    if (!canAccessViewWithModuleLock(currentStaff.accessRole, view, moduleLock.locked)) return;
+    // Re-check the lock itself (not just gate on the last poll) whenever a
+    // session is about to enter a view the lock could affect — DL-040's own
+    // "not just once at startup" requirement, cheaper than a tighter global
+    // poll interval since this only fires on relevant navigation.
+    if (isModuleLockedView(view)) moduleLock.refresh();
     setActiveView(view);
     setNavigationParams(params || null);
     window.scrollTo({ top: 0, behavior: 'instant' });
@@ -1635,11 +1647,15 @@ export default function App() {
   // Render view router for MAIN_APP stage
   const renderActiveView = () => {
     // Defense-in-depth: handleNavigate and HeaderNav's menu filtering already
-    // keep activeView from ever being set to a head-office-only view for a
-    // non-back-office session, but this catches it if it somehow happens
-    // anyway (e.g. a stale navigationParams-driven deep link).
+    // keep activeView from ever being set to a head-office-only or
+    // module-locked view, but this catches it if it somehow happens anyway
+    // (e.g. a stale navigationParams-driven deep link, or the lock engaging
+    // mid-session on an already-open view).
     if (!canAccessView(currentStaff.accessRole, activeView)) {
-      return <AccessRestrictedView onBackToLanding={() => handleNavigate('LANDING')} />;
+      return <AccessRestrictedView reason="ROLE" onBackToLanding={() => handleNavigate('LANDING')} />;
+    }
+    if (moduleLock.locked && isModuleLockedView(activeView)) {
+      return <AccessRestrictedView reason="MODULE_LOCK" onBackToLanding={() => handleNavigate('LANDING')} />;
     }
     switch (activeView) {
       case 'LANDING':
@@ -2546,6 +2562,7 @@ export default function App() {
             onNavigate={handleNavigate}
             onLockSession={handleLockSession}
             onSwitchStaff={handleSwitchStaff}
+            moduleLocked={moduleLock.locked}
           />
           <main className="flex-1 pb-10">{renderActiveView()}</main>
 
