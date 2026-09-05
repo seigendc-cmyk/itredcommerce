@@ -18,11 +18,22 @@ import { createClient } from 'npm:@supabase/supabase-js@2';
 // verification registry just because this constant moved past it.
 const CURRENT_KEY_ID = 'v1';
 
-// DL-048: default validity when the caller doesn't specify one — 30 days,
-// tied to the monthly billing cycle (tenant_subscriptions/billing_invoices
-// already use a 'YYYY-MM' period, DL-043), so a re-issued token naturally
-// lines up with plan renewal. An explicit validityDays is still honored for
-// operator flexibility, but is never required.
+// DL-048: default validity when the caller doesn't specify one.
+//
+// PLACEHOLDER — 30 days is a stand-in, not a final answer. It's a guess
+// that a monthly cycle is the norm (tenant_subscriptions/billing_invoices
+// already use a 'YYYY-MM' period, DL-043), but DL-043 itself never actually
+// pinned down billing-cycle length per tenant, and Prompt 15's billing
+// engine is what will determine whether validity should instead be
+// computed precisely from each tenant's real cycle (e.g. their next
+// billing_period boundary) rather than a flat constant here.
+// TODO(Prompt 15 - billing engine): replace this flat 30-day default with
+// whatever the billing engine decides validity should actually track once
+// it exists. Do not treat 30 as load-bearing in the meantime — it's picked
+// for "something reasonable while nothing better exists," not because 30
+// was decided as correct.
+// An explicit validityDays is still honored for operator flexibility in
+// the meantime, but is never required.
 const DEFAULT_VALIDITY_DAYS = 30;
 
 const corsHeaders = {

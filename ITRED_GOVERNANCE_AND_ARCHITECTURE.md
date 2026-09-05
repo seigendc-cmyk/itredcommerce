@@ -2503,11 +2503,15 @@ for testability — the real private key never leaves the Edge Function
 secret it's stored as, so tests sign against a locally generated keypair
 instead.
 
-Default validity, when a console operator doesn't specify one, is 30 days
-— tied to the monthly billing cycle (`tenant_subscriptions`/
-`billing_invoices` already use a `'YYYY-MM'` period, DL-043), so a
-re-issued token naturally lines up with plan renewal. An explicit
-`validityDays` is still honored when given, but never required.
+Default validity, when a console operator doesn't specify one, is 30 days —
+marked as an explicit **placeholder** in code (`DEFAULT_VALIDITY_DAYS`'s own
+comment), not a final answer. It's a guess that a monthly cycle is the norm
+(`tenant_subscriptions`/`billing_invoices` already use a `'YYYY-MM'`
+period, DL-043), but DL-043 never actually pinned down billing-cycle length
+per tenant — Prompt 15's billing engine is what will determine whether
+validity should instead be computed precisely from each tenant's real cycle
+rather than a flat constant. An explicit `validityDays` is still honored
+when given, but never required.
 
 ### DL-049: Module-lock UI enforcement — Sales/Purchasing gated, Reporting/EOD/Inventory untouched
 
