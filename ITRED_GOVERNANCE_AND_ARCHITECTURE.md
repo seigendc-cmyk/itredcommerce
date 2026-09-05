@@ -1976,3 +1976,287 @@ online-dependency every other part of this fiscal-submission system already
 has (DL-026: submission itself needs connectivity to claim a sequence
 number and reach the fiscal authority). Not a new limitation this fix
 introduces.
+
+## CONSOLE, LICENSING & BILLING SUBSYSTEM ADDENDUM (2026-09-05)
+
+This addendum captures the architectural decisions for a platform console
+(vendor-side, staff-facing), a three-layer licensing/activation model, and a
+composable billing model — none of it implemented yet. Per the prompt that
+produced this addendum, **this is documentation only**: no code, schema, or
+UI referenced below exists in the repository at the time of writing. These
+decisions are binding for whichever future prompt(s) actually build this
+subsystem, the same role Section 1's baseline and the MULTI-TENANT &
+DELIVERY SUBSYSTEM ADDENDUM played for the work that followed them. Three
+items are explicitly **not** decided here and must not be silently assumed
+by later implementation work — see the Decision Log entries and Open items
+below, both marked accordingly.
+
+### DL-038: Console is a separate deployable, in-repo now, zero shared runtime, extraction-ready
+
+**Decision**: the platform console lives at `apps/console/` — its own
+`package.json`, own build, own top-level folder — with **zero shared
+runtime code** with the Tauri POS/Head-Office apps (`src/`, `src-tauri/`,
+`server/`) or with the existing PWAs (`executive-pwa/`, `rider-pwa/`).
+Always-online, no offline durability requirement, not a Tauri install. The
+"handshake" between console and every other surface is the shared Supabase
+Postgres schema and Edge Functions **only** — never shared frontend code,
+never a direct reach into POS-app internals (no importing from `src/` or
+`server/`, no shared local process, no assumption of a shared filesystem
+with the Express sidecar). Console-specific tables (DL-039/DL-041/DL-042/
+DL-043 below) live in the same Supabase project as everything else, RLS-
+scoped so only the console's own service-role/platform-admin path can
+write to them; a tenant may only read narrow views of its own current
+plan/activation status, never another tenant's and never the console's
+operational tables directly.
+
+Built in-repo first, for iteration speed, but with **explicit intent to
+extract `apps/console/` into its own repository later** — every choice
+above is designed against that eventual extraction, not just compatible
+with it: no relative imports reaching outside `apps/console/`, no `@shared`
+alias of the kind DL-002 established for the Executive/Rider PWAs' UI
+component reuse, no dependency on anything running in the same process or
+on the same machine as a POS install.
+
+**Rationale**: DL-002 already established independent data-access layers
+per surface as this platform's norm, and permitted sharing UI/type code
+where practical via `@shared`. Console goes one step further and shares
+*nothing* at the runtime level, specifically because — unlike the
+Executive/Rider PWAs, which have no stated extraction plan — this surface
+is explicitly slated to leave the monorepo. Any coupling accepted now
+(a shared type import, a shared component) becomes extraction debt later;
+zero coupling from day one is cheaper than untangling it retroactively.
+Supabase-as-the-only-handshake mirrors the Executive PWA's own model (reads
+Supabase directly under RLS, DL-013) but console sits on the *write* side
+of that boundary for its own tables — the platform-operator-facing inverse
+of DL-013's tenant-scoped read pattern, not a new integration style.
+
+### DL-039: Three-layer licensing model — Tenant Identity, License Key, Activation Code
+
+**Decision**: licensing is modeled as three distinct layers, each with a
+different lifetime and scope:
+
+1. **Tenant Identity** — created once at signup, tied to a primary email.
+   Conceptually this is the existing `tenants` row (Section 1.6/DL-001),
+   not a new parallel identity concept — whichever prompt implements this
+   should extend `tenants`, not introduce a second "account" table.
+2. **License Key** — bound to `tenant_id` + email, identifies the tenant's
+   whole ecosystem (every branch/terminal) and encodes plan tier/
+   entitlements. Long-lived, rarely changes, tenant-wide.
+3. **Activation Code** — short-lived, cryptographically signed (JWT or
+   equivalent), issued **per terminal, not per tenant** — payload contains
+   `tenant_id`, `terminal_id`, `plan_tier`, `issued_at`, `expires_at`, and a
+   signature. Terminal apps verify the signature **offline**, against a
+   bundled public key — validating an already-issued code never requires a
+   network call.
+
+The License Key stays tenant-wide; only Activation Codes are
+terminal-scoped, which is what lets one terminal be revoked (by simply not
+renewing/reissuing its code) without invalidating the tenant's License Key
+or any other terminal's already-valid code.
+
+**Naming collision, flagged now rather than discovered mid-implementation**:
+this document already uses "activation code" for a different, existing
+concept — `LicenceInfo.activationCode` (format `ITR-PRO-XXXX-XXXX-202X`),
+surfaced in `LicensingView` and in the pre-login `ACTIVATION` app stage
+DL-028 introduced. DL-028 was explicit that this existing concept is a
+*product/plan purchase credential issued by iTred support*, unrelated to
+tenant identity, and deliberately kept separate from the Tenant Pairing
+Code it introduced for exactly that reason — and that `LicensingView`
+itself (renewal, entitlements, expiry countdown) remains **untouched and
+still simulated**, not real. This new per-terminal Activation Code is a
+third, different concept that happens to share the same English term. Not
+resolved here — a future implementation prompt must explicitly decide
+whether these two "activation code" concepts are unified, one subsumes the
+other, or they coexist under different names, rather than two independent
+code paths silently growing under the same name.
+
+**Naming resolution**: to avoid exactly the ambiguity flagged above, the
+per-terminal, signed, expiry-bearing token this addendum introduces is
+named **`TerminalActivationToken`**, not "Activation Code," from this point
+forward. This is a deliberate *naming separation*, not a merge,
+supersession, or deprecation of DL-028 — `LicenceInfo.activationCode`
+remains exactly as DL-028 left it: untouched, unrenamed, and unexamined by
+this addendum or this note. Only the naming collision itself is resolved
+here (so future prompts have one unambiguous term — `TerminalActivationToken`
+— to build against); whether `LicenceInfo.activationCode` should eventually
+be retired, merged into `TerminalActivationToken`, or kept permanently
+distinct is still not decided (see the corresponding Open items entry).
+
+**Rationale**: matching entity lifetime to entity scope (identity: once;
+license: rarely; per-terminal activation: frequently) is what makes
+per-terminal revocation possible at all without an all-or-nothing tenant
+lockout. Offline signature verification (rather than a live entitlement
+check) is required for the same reason DL-040's lock evaluation must be
+offline-capable — a branch terminal that can't validate its own license
+without connectivity would violate this platform's offline-first premise
+(DL-002) the moment licensing became load-bearing to it.
+
+### DL-040: Module-lock enforcement — 5 working-day grace period, offline-evaluated, narrow lock scope
+
+**Decision**: when a TerminalActivationToken expires, a 5-working-day grace period
+begins — the working-day calendar is a tenant setting (default Mon–Fri).
+If the grace period elapses with no renewed code, the **Sales** and
+**Purchasing** module menus lock on that terminal specifically. Reporting,
+EOD reconciliation, and inventory viewing remain available regardless of
+lock state. Lock/grace-period state is evaluated **entirely locally**, from
+the signed TerminalActivationToken's own expiry field plus the local clock — this
+must produce the correct lock state even if the terminal never reconnects
+after the code expires, which is why DL-039 specified offline signature
+verification in the first place.
+
+**Rationale**: mirrors this codebase's existing offline-first discipline
+(branch terminals must function without connectivity — Section 1.6, DL-002)
+applied to licensing enforcement itself rather than only to business data;
+a lock mechanism that needed a live network call to evaluate would defeat
+the terminal's own offline-first premise at exactly the moment licensing
+became load-bearing. Scoping the lock to Sales/Purchasing only — not the
+whole app — treats this as a payment-enforcement mechanism, not a punitive
+kill switch: a lapsed tenant can still reconcile, report on, and view the
+stock/history that's already theirs.
+
+### DL-041: WhatsApp activation-request flow — a `wa.me` deep link, not the Cloud API
+
+**Decision**: when online, the Head Office app exposes a "Request
+TerminalActivationToken" action that opens a `wa.me` deep link, pre-filled with
+`tenant_id`/License Key context, sent through the user's **own** WhatsApp
+client to a vendor support number. No Meta Cloud API involvement and no
+template approval requirement for this specific flow — it is a distinct
+mechanism from the existing WhatsApp Business Cloud API integration
+(DL-021/DL-022) already built for delivery notifications, which is
+unrelated and untouched by this decision. Every request that arrives this
+way is logged in the console as an `activation_request` record (`tenant_id`,
+`requested_at`, `terminal_id` if known, fulfillment status). Console staff
+manually verify payment and issue a new signed TerminalActivationToken against the
+specific tenant/terminal from the console UI — that console UI itself is
+explicitly out of scope here (a later prompt's job, referenced in the
+originating prompt as "Prompt 17").
+
+**Rationale**: consistent with this document's established preference for
+the structurally simplest mechanism that has no live external dependency
+when one isn't yet warranted (DL-018's manually-entered FX rate, DL-024's
+manual out-of-band key distribution) — a `wa.me` link needs no backend
+integration, no Meta app review, and works today, matching the reality
+that no console exists yet to receive an automated request. Logging every
+request as a durable `activation_request` row regardless of the channel it
+arrived through is what makes DL-042's two-ledger reconciliation possible
+at all — a request that only ever existed as a WhatsApp message, with no
+corresponding console-side record, would leave that ledger permanently
+incomplete for every code issued this way.
+
+### DL-042: Two-ledger reconciliation — independent issuance and activation logs, reconciled by (tenant_id, terminal_id, code)
+
+**Decision**: the platform console keeps the authoritative log of
+"TerminalActivationToken X issued to tenant Y for terminal Z, at time T, by console
+operator O." The tenant's own SysAdmin (Head Office app) independently
+keeps its own log of "TerminalActivationToken X received and activated on terminal
+Z, at time T." The two are reconciled by `tenant_id` + `terminal_id` +
+`code`, rather than one side treating the other as sole source of truth.
+
+**Rationale**: an audit trail that exists on only one side — either the
+vendor's issuance record or the tenant's own activation record — has a
+single point of failure; if the console's record is lost or tampered with,
+the tenant's own independently-kept record is still checkable, and vice
+versa. This is the same general pattern this codebase already applies to
+another compliance-relevant event with two interested parties: fiscal
+submissions keep both a terminal-local record and a Supabase-mirrored one
+(DL-023–DL-027, now DL-037), rather than trusting a single ledger — reused
+here rather than inventing a new audit shape for a structurally similar
+problem.
+
+### DL-043: Composable billing model — `plan_components` + `tenant_subscriptions`, tenant-level UI only
+
+**Decision**: billing lives entirely on the tenant SysAdmin's Billing page
+(Head Office app) — **never** surfaced per-individual-terminal in the UI,
+even though TerminalActivationTokens themselves are logged per terminal (DL-039/
+DL-042). Modeled as composable line items: `plan_components`
+(`component_type`, `unit_price`, `billing_unit`) describes what can be
+billed; `tenant_subscriptions` records which components, and what
+quantities, are active for a given tenant. Four component types are
+named now: **base fee** (covers one default warehouse/branch), **per-branch
+fee** (each additional branch beyond the default), **per-terminal fee**
+(each terminal, regardless of branch), and **feature add-ons** (BI Brain,
+Delivery, PoolWise, CashPlan, and future modules — each independently
+toggled and priced).
+
+**⚠ OPEN DECISION — feature add-on billing scope**: whether a feature
+add-on (BI Brain, Delivery, etc.) bills as one tenant-wide flat fee or
+scales per-branch/per-terminal is **not decided**. `plan_components.
+billing_unit` is specified now specifically so it can express either shape
+without a schema change once this is decided — implementers must not
+default to one interpretation when populating it for a real add-on.
+
+**⚠ OPEN DECISION — proration on mid-cycle additions**: whether adding a
+branch or terminal mid-billing-cycle triggers an immediate prorated charge
+or simply rolls into the next cycle's invoice is **not decided**. No
+proration logic should be implemented until a future prompt revisits this
+explicitly and confirms one.
+
+**⚠ OPEN DECISION / PLACEHOLDER — PoolWise and CashPlan scope**: both are
+named here only as billable feature add-ons; **neither module's functional
+scope is defined anywhere in this document**. These are placeholder
+entries so they aren't silently dropped from future planning, not a
+commitment to any particular feature set — do not build feature logic for
+either until its scope is defined in a future addendum.
+
+**Rationale**: modeling billing as composable line items rather than a
+single fixed per-plan price is what would let DL-004's versioning
+discipline extend to billing later (a `plan_components` price change
+should not retroactively alter an already-issued invoice) even though no
+such versioning mechanism is built by this documentation-only pass. Keeping
+the Billing UI entirely at the tenant level — never per-terminal — mirrors
+DL-039's own split: terminals are where TerminalActivationTokens and module locks
+live, but billing is inherently a tenant-level commercial relationship, not
+a per-till one, the same distinction DL-001's Tenant → Branch → Terminal
+hierarchy already draws for data ownership generally.
+
+### DL-044: Payment integration — aggregator-mediated EcoCash, connectivity required by design
+
+**Decision**: EcoCash acceptance goes through a payment gateway aggregator
+(e.g. Paynow, or an equivalent Zimbabwe-market aggregator covering
+EcoCash/OneMoney/cards) rather than a direct-to-EcoCash merchant
+integration. **⚠ OPEN DECISION — which aggregator**: not chosen; documented
+as open rather than defaulted to a specific vendor. Billing and payment
+actions always require connectivity — an explicit, intentional exception
+to this platform's offline-first principle (DL-002/DL-008), made because
+payment processing has no meaningful offline mode to fall back to.
+
+**Rationale**: an aggregator avoids taking on a direct EcoCash merchant
+integration with no single published protocol until formally engaged with
+the fiscal/payment authority in question — the same category of problem
+DL-027 already hit with ZIMRA's hardware-fiscal path, resolved there by
+picking the option with an actual published contract rather than guessing
+at an unpublished one. Stating the offline-first exception explicitly,
+rather than leaving it implicit, matches this document's own discipline of
+naming every deliberate deviation from an established principle rather
+than letting it be discovered later as an inconsistency (DL-023 did the
+same for fiscal-registration sharing breaking the usual per-terminal
+independence model).
+
+### Open items (explicitly not decided here)
+
+- **Feature add-on billing scope** (DL-043): tenant-wide flat fee vs.
+  per-branch/per-terminal pricing — **unresolved**. `plan_components.
+  billing_unit` is deliberately flexible enough to support either; do not
+  implement against an assumed default.
+- **Proration on mid-cycle branch/terminal additions** (DL-043): immediate
+  prorated charge vs. rolled into the next cycle's invoice — **unresolved**.
+  Do not implement proration logic until this is explicitly revisited.
+- **PoolWise and CashPlan functional scope**: referenced only as billable
+  placeholders (DL-043) — **scope pending**, do not build feature logic for
+  either until defined in a future addendum.
+- **Payment aggregator choice** (DL-044): Paynow vs. an equivalent
+  alternative — **unresolved**, not defaulted.
+- **"Activation Code" naming collision** (DL-039): the naming itself is
+  now resolved — this addendum's per-terminal signed token is named
+  `TerminalActivationToken` specifically so it no longer collides with
+  DL-028's existing `LicenceInfo.activationCode`. What remains unresolved is
+  the relationship between the two concepts, not what to call either of
+  them.
+- **DL-028's `LicenceInfo.activationCode` needs inspection** to determine
+  whether it should later be retired, merged into `TerminalActivationToken`,
+  or kept distinct — do not touch that field until this is explicitly
+  revisited.
+- **Console UI itself** (referenced in DL-041 as issuing
+  `TerminalActivationToken`s and recording `activation_request`
+  fulfillment): out of scope for this addendum entirely — a later prompt's
+  job.

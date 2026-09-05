@@ -1,0 +1,28 @@
+{
+  "name": "itred-console",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "iTred Commerce platform console — vendor-side, always-online, staff-facing admin surface for licensing, activation, and billing (DL-038). Zero shared runtime code with the Tauri POS/Head-Office apps or the tenant-facing PWAs; built in-repo for now with explicit intent to extract into its own repository later.",
+  "scripts": {
+    "dev": "vite --port=3300 --host=0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.112.4",
+    "@tailwindcss/vite": "^4.1.14",
+    "lucide-react": "^0.546.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "tailwindcss": "^4.1.14"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^5.0.4",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.3"
+  }
+}
