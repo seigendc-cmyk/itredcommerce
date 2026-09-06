@@ -27,15 +27,19 @@ import branchesRouter from './routes/branches';
 import licensingRouter from './routes/licensing';
 import onboardingRouter from './routes/onboarding';
 import businessProfileRouter from './routes/businessProfile';
+import biRulesRouter from './routes/biRules';
 import { isSupabaseConfigured } from './env';
 import { pullStaffFromSupabase } from './sync/staffPull';
 import { pullFiscalRegistrationsFromSupabase } from './sync/fiscalRegistrationPull';
 import { pullTenantFromSupabase } from './sync/tenantPull';
 import { pullTerminalActivationTokenFromSupabase } from './sync/terminalActivationTokenPull';
+import { pullBiRulesFromSupabase } from './sync/biRulesPull';
 import { connectivityMonitor } from './sync/connectivityInstance';
 import { startPolling } from './sync/connectivity';
 import { startFiscalDrainLoop } from './sync/fiscalDrainLoop';
 import { startTerminalActivationConfirmationDrainLoop } from './sync/terminalActivationConfirmationDrainLoop';
+import { startBiRuleSettingsPush } from './sync/biRuleSettingsPush';
+import { startBiRuleGatedActionReconciler } from './sync/biRuleGatedActionReconciler';
 import { bootstrapTenantIdFromLocal } from './lib/installationConfig';
 
 runMigrations();
@@ -67,6 +71,18 @@ startFiscalDrainLoop();
 // connectivity per tick itself, so like that one it doesn't need to wait
 // for isSupabaseConfigured() at start time either.
 startTerminalActivationConfirmationDrainLoop();
+
+// DL-058-063 BI Brain: pull-cache refresh + reconciliation (same cadence
+// class as staff/tenant pulls above), its own dirty-flag push loop (same
+// "own small loop, not the dead general outbox" reasoning as the
+// TerminalActivationToken confirmation push), and the reconnect-triggered
+// gated-action reconciler (DL-062) — subscribes to the same connectivityMonitor
+// signal the TerminalActivationToken pull below already does.
+const BI_RULES_PULL_INTERVAL_MS = 5 * 60 * 1000;
+void pullBiRulesFromSupabase();
+setInterval(() => void pullBiRulesFromSupabase(), BI_RULES_PULL_INTERVAL_MS);
+startBiRuleSettingsPush();
+startBiRuleGatedActionReconciler();
 
 // DL-005/DL-011/Prompt-11/DL-008's background sync jobs all depend on a
 // configured tenant, which — since the Business Profile onboarding wizard
@@ -157,6 +173,7 @@ app.use('/api/connectivity', connectivityRouter);
 app.use('/api/fiscalization', fiscalizationRouter);
 app.use('/api/branches', branchesRouter);
 app.use('/api/licensing', licensingRouter);
+app.use('/api/bi-rules', biRulesRouter);
 
 // --- Additional route modules are mounted here as milestones land ---
 

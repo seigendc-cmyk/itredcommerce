@@ -967,6 +967,7 @@ export const APPLICATION_MENU_GROUPS: MenuGroup[] = [
       { id: 'sys-payments', label: 'Payment Methods Configuration', category: 'System', viewTarget: 'PAYMENT_METHODS', description: 'Cash, Mobile Money, Debit Cards & Customer Credit rules' },
       { id: 'sys-licensing', label: 'Licensing & Activation', category: 'System', viewTarget: 'LICENSING', description: 'Cryptographic node licensing, workstation seat & validity' },
       { id: 'sys-business-profile', label: 'Business Profile', category: 'System', viewTarget: 'BUSINESS_PROFILE', description: 'Legal, contact, branding & financial profile for this tenant' },
+      { id: 'sys-bi-config', label: 'BI Brain Rule Configuration', category: 'System', viewTarget: 'BI_CONFIG', description: 'Enable/disable BI rules and tune parameters within platform-set bounds' },
       { id: 'sys-updates', label: 'Software Updates & Channel', category: 'System', viewTarget: 'SOFTWARE_UPDATES', description: 'Release channels, changelogs and verified patch updates' },
       { id: 'sys-backup', label: 'Data Protection & Backup', category: 'System', viewTarget: 'DATA_PROTECTION', description: 'Encrypted snapshot archives and automated backup scheduling' },
       { id: 'sys-restore', label: 'Restore Previous Snapshot', category: 'System', viewTarget: 'RESTORE_DATA', description: 'Restore verified point-in-time database snapshots' },

@@ -3106,3 +3106,275 @@ rather than inventing a new one.
 - Every other open item carried forward unchanged (payment aggregator
   choice, automated payment retry, mid-relationship `billing_cycle` change
   transition rule, PoolWise/CashPlan scope, `LicenceInfo.activationCode`).
+
+## BI BRAIN: DATA-DRIVEN RULES ENGINE ADDENDUM (2026-09-06)
+
+Documentation-only pass, drafted and premise-checked against the actual
+codebase before being recorded here — several of the draft's original
+assumptions about existing infrastructure turned out to be wrong (an
+"Override Vault" table that doesn't exist, a version-lock discipline
+attributed to the wrong file, a wiring point with no actual restock logic)
+and were corrected before landing in this addendum. No implementation in
+this pass; schema/engine/Config-page implementation is a separate,
+not-yet-run prompt.
+
+### DL-058: BI Brain is the shared execution substrate for the four BI engines, not a fifth engine
+
+**Decision**: BI Brain is the rule storage, versioning, evaluation, and
+approval-gating mechanism used **by** the four BI engines (Capital
+Velocity, Budget Variance Advisor, Forensic Theft Guard, Dead Stock/
+Seasonal Disposal) — it is not a fifth engine alongside them. Each of the
+four is implemented as a category of BI Brain rules, not a separate
+codebase with its own rule storage/versioning/approval logic. As of this
+addendum, only Dead Stock has any existing code to reconcile with (the
+`BIRuleType` enum, mock alert data, and the `BIActivityView` activity
+feed); Capital Velocity, Budget Variance Advisor, and Forensic Theft Guard
+are net-new, with nothing existing to migrate or break.
+
+**Rationale**: avoids four parallel reinventions of rule storage and keeps
+a single BI Config page and a single audit trail for tenants and support
+staff to reason about, rather than four engines each inventing their own
+versioning/approval mechanics independently.
+
+### DL-059: Rules are platform-authored; only declared parameters are tenant-tunable
+
+**Decision**: rule LOGIC (facts checked, conditions, event fired) is
+authored and versioned by the platform only — tenants cannot write or edit
+rule JSON. Each platform rule declares which of its internal values are
+exposed as tenant-tunable PARAMETERS (e.g. a `sales_since_last_request`
+threshold), each with a type, default, and platform-set min/max bound.
+Tenants adjust exposed parameters and enable/disable rules from a BI
+Config page — a genuinely new page; the existing `BIActivityView` is an
+alerts/activity feed, not a rules-configuration surface. Tenants cannot
+exceed platform-declared bounds or alter rule structure.
+
+**Rationale**: keeps rule quality and safety centrally controlled while
+still letting each business tune strictness to its own risk tolerance —
+the same tenant-configurable-value-within-platform-bounds shape already
+used for fare components, applied here to BI policy instead of pricing.
+
+### DL-060: Versioning follows `rate_config`'s insert-only immutability pattern, not `deterministicRulesEngine.ts`
+
+**Decision**: `bi_rules` reuses the same insert-only, no-UPDATE-policy
+discipline already established for `rate_config`
+(`server/db/migrations/005_rate_config.sql`,
+`supabase/migrations/20260830090000_rate_config.sql`): a new rule version
+is a new row, never an edit to an existing one, so a rule's past behavior
+stays permanently reconstructable. Every approval ticket (DL-063)
+snapshots `rule_id`, `rule_version`, and the tenant's `parameter_values`
+active at the moment of evaluation — never a live reference to current
+settings — so historical tickets stay auditable independent of later rule
+or parameter changes. When a rule version changes its declared parameter
+set, existing `tenant_bi_rule_settings` rows must be migrated: new
+parameters default in, orphaned parameters are flagged rather than
+silently dropped.
+
+**Correction from the original draft**: `deterministicRulesEngine.ts` was
+initially cited as this pattern's source. It isn't — that file is a static
+array of hardcoded rule functions (reorder recommendations, stocktake risk
+scoring, price-floor checks) with no immutability mechanism of its own.
+The actual "never retroactively reinterpret a past decision" discipline is
+`rate_config`'s (enforced via RLS: no UPDATE policy exists at all).
+`deterministicRulesEngine.ts` remains relevant only as a structural
+precedent for the new rule-evaluation module's own file layout (pure,
+testable evaluator functions separate from UI call sites) — not as the
+source of the versioning guarantee.
+
+### DL-061: Advisory-with-a-gate is consistent with "advisory-only"
+
+**Decision**: BI Brain rules that fire a `REDIRECT_TO_APPROVAL` event do
+not automate an action themselves — they block/redirect a staff-initiated
+action pending human (manager) approval, consistent with this platform's
+existing principle that BI engines are advisory-only: no rule executes a
+business action without a human decision in the loop. Rules whose event is
+purely informational (flag/log for later executive review, no approval
+required) are not connectivity-gated and continue to write locally and
+sync via the normal outbox path when offline.
+
+**Rationale**: a redirect-to-approval gate still leaves the actual
+decision to a person; it constrains *when* a staff-initiated action can
+proceed unsupervised, it doesn't take the action itself — the same
+distinction that already separates an alert (informational) from a lock
+(DL-040's module-lock) elsewhere in this document.
+
+### DL-062: Approval-gated rules are offline-blocked, not queued
+
+**Decision**: rule fact-evaluation happens locally against local SQLite
+and works fully offline, consistent with Tier 1 offline-first
+requirements. However, when an evaluation result requires
+`REDIRECT_TO_APPROVAL`, ticket creation and manager notification require
+connectivity — if the terminal is offline at that point, the gated action
+is BLOCKED outright, not queued for later approval, mirroring
+`delivery_orders`' existing mechanism exactly
+(`server/routes/deliveryOrders.ts`: a synchronous
+`connectivityMonitor.checkNow()` live probe at the point of the action,
+throwing a 503/`OFFLINE` error rather than queuing). The blocked action is
+not manually retried by staff — the gating route subscribes to the
+existing `connectivityMonitor` ONLINE signal
+(`server/sync/connectivityInstance.ts`, the same singleton
+`server/index.ts` already subscribes to for the TerminalActivationToken
+sync-down pull) and automatically re-evaluates the rule against current
+facts on reconnect, resuming the approval path if it still fires or
+letting the original action through cleanly if underlying facts have
+since changed.
+
+**Correction from the original draft**: this reconnect-reevaluate behavior
+was initially framed as reusing an existing client-side (React)
+subscription pattern. No such pattern exists — `useModuleLock` polls a
+local, non-Supabase-connectivity-related endpoint every 15 minutes and
+isn't a fit. The actual precedent is server-side: `connectivityMonitor`'s
+subscribe/`checkNow()` mechanism, already used by `deliveryOrders.ts` and
+the TerminalActivationToken pull. This gating logic belongs in the Express
+route handling the gated action, not as new client-side plumbing.
+
+**Rationale**: mirrors an already-accepted precedent (delivery-order
+creation disabled, not queued, when offline) for a structurally identical
+problem — an action whose completion depends on a live, connectivity-
+requiring side effect (dispatch there, manager notification here) has no
+sound offline-queued equivalent, since the point of the gate is a human
+decision made *now*, not eventually.
+
+### DL-063: Platform schema — `bi_rules` (service-role-owned) + `tenant_bi_rule_settings` (tenant-owned); approval-ticket storage left open
+
+**Decision**: `bi_rules` (platform-owned, versioned rule definitions,
+including declared tunable parameters and BI-engine category) follows the
+`apps/console` RLS convention (Prompt 13/DL-039): service-role-only
+writes, narrow read-only access for tenant sessions — **not**
+`rate_config`/`tax_config`'s tenant-back-office-write convention, since
+rule logic must never be tenant-authored. `tenant_bi_rule_settings`
+(tenant_id, rule_id, rule_version, enabled, parameter_values) follows the
+ordinary tenant-scoped read/write convention instead, since this table IS
+tenant-owned data.
+
+**⚠ OPEN DECISION — approval-ticket storage shape**: whether a BI Brain
+approval ticket extends the existing `approval_requests` table
+(`server/db/migrations/001_init.sql` — local SQLite,
+`SINGLE_OWNER_WORKFLOW` sync category, no confirmed Supabase mirror) or
+needs its own new table is **not decided here**. `approval_requests`'
+current shape (request_number/type/title/amount/decider-oriented) may or
+may not fit a rule-fired ticket (rule_id/rule_version/
+parameter_values_snapshot-oriented) well — the implementation prompt must
+propose which before writing either.
+
+**Correction from the original draft**: the draft assumed an existing
+"Override Vault" / `approval_tickets` table that this addendum would
+merely extend. No such table exists anywhere in the schema. This is
+recorded here as an open decision rather than a settled extension.
+
+**Rationale**: the RLS split mirrors the same reasoning DL-039's console
+tables already established — a mechanism whose correctness depends on
+tenants never being able to author its logic needs a platform-side write
+boundary enforced at the database level, not by client-side convention
+alone (the same discipline DL-051/DL-053 already applied to
+`tenant_subscriptions`).
+
+### Open items (explicitly not decided here)
+
+- **Approval-ticket storage shape** (DL-063): extend `approval_requests`
+  vs. a new table — **unresolved**, propose in the implementation prompt.
+- **Relationship to `deterministicRulesEngine.ts`**: that file's existing
+  hardcoded rules (reorder recommendations, stocktake risk scoring,
+  price-floor checks) and BI Brain's new data-driven JSON rules will
+  coexist as two separate evaluation paradigms once BI Brain ships.
+  Whether `deterministicRulesEngine.ts`'s logic eventually migrates into
+  BI Brain rules, or the two remain permanently distinct, is **not decided
+  here** — flagged rather than assumed either way.
+- **Rule-engine library choice**: propose (custom minimal evaluator vs. an
+  existing JSON-rules-engine package) in the implementation prompt, don't
+  assume one going in.
+- **Capital Velocity, Budget Variance Advisor, Forensic Theft Guard**:
+  named as BI-engine categories this substrate must support, but none has
+  any defined functional scope yet — same "placeholder, don't build
+  feature logic until defined" treatment DL-043 already gave PoolWise/
+  CashPlan.
+
+### DL-064: BI Brain implementation — schema, evaluator, connectivity gate, Config page, and one example rule end-to-end
+
+**Decision**: DL-058-063 implemented in full, closing the two items the
+addendum left open:
+
+- **Approval-ticket storage** (DL-063): extends `approval_requests` as
+  proposed, not a new table — inserted with `type = 'BI_RULE_REDIRECT'`,
+  `reference_id`/`reference_type` pointing at the gated inventory sku, and
+  `rule_id`/`rule_version`/`parameter_values_snapshot` inside `meta`. No
+  schema migration needed for that table.
+- **Rule-engine library choice**: a minimal custom evaluator
+  (`server/lib/biRuleEngine.ts`) — AND/OR/NOT composition over fact
+  comparisons, parameter references resolved against a tenant's current
+  values or the rule's own default. No comparable dependency existed
+  anywhere in this repo's `package.json`; the actual need was small enough
+  that a package (e.g. `json-rules-engine`) would have added a dependency
+  and its own DSL for no benefit over ~150 lines of typed TS.
+
+**Schema**: `bi_rules` + `tenant_bi_rule_settings` (Supabase migration
+`20260906120000_bi_brain_rules_engine.sql`, matching DL-063's RLS split
+exactly) plus local SQLite mirrors (`012_bi_brain.sql`): a pull-only
+`bi_rules_cache`, a mutable `tenant_bi_rule_settings` with a `dirty` flag,
+and `bi_rule_gated_actions` — the durable local queue an offline-blocked
+`REDIRECT_TO_APPROVAL` rule writes to (DL-062).
+
+**Sync**: `server/sync/biRulesPull.ts` refreshes the local rule catalog and
+runs DL-060's migration-reconciliation (new parameters default in, dropped
+ones move to `orphaned_parameters` rather than vanishing) — deliberately
+treating an existing local settings row as authoritative over whatever the
+same pull just read from Supabase, so a reconciliation pass can never
+clobber a locally-edited, not-yet-pushed BI Config change with stale
+remote data. `server/sync/biRuleSettingsPush.ts` pushes `dirty` rows back
+up. Both are their own small dedicated loops, same reasoning as
+`fiscalDrainLoop.ts`/`terminalActivationConfirmationDrainLoop.ts` — the
+general outbox (`server/sync/drainLoop.ts`) still has no live caller
+anywhere (DL-057's Open Items), so nothing new was built on top of it.
+
+**Connectivity gate**: `server/lib/biRuleGate.ts`'s `evaluateAndGate()` —
+loads the latest locally-cached rule + this tenant's settings, evaluates
+against caller-supplied facts, and for a firing `REDIRECT_TO_APPROVAL`
+rule calls `connectivityMonitor.checkNow()` (a fresh probe, matching
+`deliveryOrders.ts` exactly) before branching: online creates the
+approval ticket immediately; offline writes to `bi_rule_gated_actions`
+and blocks the request (503), never queuing it. `server/sync/
+biRuleGatedActionReconciler.ts` subscribes to the same `connectivityMonitor`
+ONLINE transition the TerminalActivationToken pull already does, and on
+reconnect re-evaluates every pending gated action against **current**
+facts (never the stored snapshot) — creating the ticket if the rule still
+fires, or replaying the original action directly if it no longer does.
+
+**Example rule shipped end-to-end**: `BI-DEADSTOCK-RESTOCK-001` (seeded in
+the Supabase migration) — redirects to approval when a restock is
+requested for a sku with sales at or below a tenant-tunable
+`sales_threshold` (default 0) since that sku's last restock request.
+Wired into `POST /api/purchasing/memos` (`server/routes/purchasing/
+memos.ts`) — not `PurchasingView.tsx`, which has no restock logic; the
+actual staff-initiated action is `ReorderReviewView.tsx`'s "Create
+Purchase Memo" button, confirmed before wiring. The memo-insert logic was
+factored into an exported `insertPurchaseMemoRecord()` so the reconnect
+reconciler can replay it identically to the original route.
+
+**BI Config page**: `src/components/views/bi/BIConfigView.tsx`, a new
+head-office-only `ActiveView` (`BI_CONFIG` — absent from
+`BRANCH_TERMINAL_VIEWS`, gated the same way every other head-office view
+is). Lists rules grouped by category, an enable/disable toggle, per-
+parameter inputs enforcing platform min/max/type bounds (both client-side
+and server-side, `server/routes/biRules.ts`), a reset-to-default action,
+and a dismissible notice for any `orphaned_parameters`.
+
+**Tests**: `server/lib/biRuleEngine.test.ts` (8 tests — condition
+composition, parameter resolution/validation, defaults). `npm test` —
+**49/49 passing**. Root typecheck introduces zero new errors (verified
+against the pre-existing baseline, which already had unrelated failures in
+`LicensingView.tsx`/`PaymentMethodsConfigView.tsx`/`transfers/*`/the Deno
+`supabase/functions` tree, none of them touched by this work).
+
+**Known gaps, flagged rather than silently left implicit**:
+- **No approval-resolution UI exists yet** for a `BI_RULE_REDIRECT`
+  ticket once created — `approval_requests` has no route or UI reading it
+  anywhere in this app (confirmed before extending it), and the
+  `approvalRequests` state already in `App.tsx` is unconnected mock data,
+  not wired to the real table. A manager currently has no way to actually
+  act on a ticket this mechanism creates. Building that resolution UI is
+  a natural next prompt, not attempted here — this prompt's scope was the
+  gate mechanics (evaluate → block/redirect → reconnect-reevaluate), which
+  are complete and tested independent of who eventually resolves a ticket.
+- **Relationship to `deterministicRulesEngine.ts`**: still unresolved, per
+  DL-060/DL-063's Open Items — unchanged by this implementation pass.
+- Capital Velocity, Budget Variance Advisor, Forensic Theft Guard: still
+  placeholders with no functional scope — unchanged.

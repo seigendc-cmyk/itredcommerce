@@ -105,6 +105,7 @@ import { ActivationScreen, ResolvedTenant } from './components/onboarding/Activa
 import { OnboardingWizard } from './components/onboarding/OnboardingWizard';
 import { JoinTenantConfirm } from './components/onboarding/JoinTenantConfirm';
 import { BusinessProfileView } from './components/views/system/BusinessProfileView';
+import { BIConfigView } from './components/views/bi/BIConfigView';
 import { HeaderNav } from './components/layout/HeaderNav';
 import { LandingPage } from './components/views/LandingPage';
 import { SalesView } from './components/views/sales/SalesView';
@@ -2235,6 +2236,14 @@ export default function App() {
       case 'BUSINESS_PROFILE':
         return (
           <BusinessProfileView
+            currentStaff={currentStaff}
+            onBackToLanding={() => handleNavigate('LANDING')}
+          />
+        );
+
+      case 'BI_CONFIG':
+        return (
+          <BIConfigView
             currentStaff={currentStaff}
             onBackToLanding={() => handleNavigate('LANDING')}
           />

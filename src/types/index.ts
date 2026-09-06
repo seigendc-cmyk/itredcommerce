@@ -123,6 +123,7 @@ export type ActiveView =
   | 'ONLINE_UPGRADE'
   | 'LICENSING'
   | 'BUSINESS_PROFILE'
+  | 'BI_CONFIG'
   | 'UPDATES'
   | 'SOFTWARE_UPDATES'
   | 'PAYMENT_METHODS'
