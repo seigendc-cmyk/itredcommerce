@@ -35,6 +35,7 @@ import { pullTerminalActivationTokenFromSupabase } from './sync/terminalActivati
 import { connectivityMonitor } from './sync/connectivityInstance';
 import { startPolling } from './sync/connectivity';
 import { startFiscalDrainLoop } from './sync/fiscalDrainLoop';
+import { startTerminalActivationConfirmationDrainLoop } from './sync/terminalActivationConfirmationDrainLoop';
 import { bootstrapTenantIdFromLocal } from './lib/installationConfig';
 
 runMigrations();
@@ -60,6 +61,12 @@ bootstrapTenantIdFromLocal();
 // comment for why. Unlike the pull loops below, this one doesn't depend on
 // isSupabaseConfigured() at start time — it already checks per-submission.
 startFiscalDrainLoop();
+
+// DL-057's two-ledger reconciliation push, same "own dedicated loop, not
+// the general outbox" reasoning as the fiscal drain loop above — checks
+// connectivity per tick itself, so like that one it doesn't need to wait
+// for isSupabaseConfigured() at start time either.
+startTerminalActivationConfirmationDrainLoop();
 
 // DL-005/DL-011/Prompt-11/DL-008's background sync jobs all depend on a
 // configured tenant, which — since the Business Profile onboarding wizard

@@ -6,6 +6,8 @@ import { BACK_OFFICE_WRITE_ROLES } from '../lib/accessRoles';
 import { nowIso } from '../lib/ids';
 import { getInstallationConfig } from '../lib/installationConfig';
 import { verifyTerminalActivationToken } from '../lib/terminalActivationToken';
+import { recordTerminalActivationConfirmation } from '../lib/terminalActivationConfirmations';
+import { getSupabaseAdmin } from '../lib/supabaseAdmin';
 
 // DL-039/DL-040/DL-046/DL-048: accepts a TerminalActivationToken relayed
 // manually (via WhatsApp, per DL-041) from a console operator, verifies it
@@ -108,12 +110,70 @@ router.post(
       activatedAt,
     });
 
+    // DL-057: this manual paste-in *is* the "received and activated" event
+    // for this path — log it for two-ledger reconciliation against the
+    // console's own terminal_activation_tokens issuance record.
+    recordTerminalActivationConfirmation({
+      tenantId: payload.tenantId,
+      terminalId: payload.terminalId,
+      tokenIssuedAt: payload.issuedAt,
+      eventType: 'manual_paste',
+      confirmedAt: activatedAt,
+    });
+
     res.status(201).json({
       activated: true,
       status: verification.status,
       graceDaysRemaining: verification.graceDaysRemaining,
       payload,
     });
+  })
+);
+
+// DL-041/DL-056: logs the outbound WhatsApp "Request Activation Code"
+// action as an activation_requests row so it shows up in the console's
+// ActivationRequestsPage queue (apps/console, built ahead of plan in
+// bc264b6). Written directly and synchronously via the service-role admin
+// client — same as delivery_orders (DL-015) — rather than queued through
+// the local outbox: opening a wa.me link inherently requires connectivity,
+// so there is no offline case to make durable here. Best-effort: a failed
+// write is reported to the caller but never blocks the WhatsApp link itself
+// from opening, since getting the tenant into a WhatsApp conversation with
+// support matters more than the console's audit-trail row succeeding on
+// the first try.
+router.post(
+  '/request-activation',
+  requireAccessRole(...BACK_OFFICE_WRITE_ROLES),
+  asyncHandler(async (_req, res) => {
+    const installation = getInstallationConfig();
+    if (!installation?.tenantId) {
+      throw new ApiError(409, 'This install has not completed onboarding yet — no tenant to request activation for', 'NOT_ONBOARDED');
+    }
+
+    const supabase = getSupabaseAdmin();
+    if (!supabase) {
+      throw new ApiError(502, 'Not connected to the licensing backend — try again once online');
+    }
+
+    const requestedAt = nowIso();
+    const { data, error } = await supabase
+      .from('activation_requests')
+      .insert({
+        tenant_id: installation.tenantId,
+        terminal_id: installation.terminalId,
+        requested_at: requestedAt,
+        channel: 'whatsapp',
+        fulfillment_status: 'pending',
+      })
+      .select('id')
+      .single();
+
+    if (error) {
+      console.error('[licensing] failed to log activation request:', error);
+      throw new ApiError(502, 'Could not log the activation request — try again once online');
+    }
+
+    res.status(201).json({ id: data!.id as string, requestedAt });
   })
 );
 

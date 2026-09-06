@@ -2,6 +2,7 @@ import { db } from '../db/connection';
 import { getSupabaseAdmin } from '../lib/supabaseAdmin';
 import { getInstallationConfig } from '../lib/installationConfig';
 import { verifyTerminalActivationToken, type TerminalTokenStatus } from '../lib/terminalActivationToken';
+import { recordTerminalActivationConfirmation } from '../lib/terminalActivationConfirmations';
 import { nowIso } from '../lib/ids';
 
 export interface RemoteTerminalTokenRow {
@@ -111,6 +112,7 @@ export async function pullTerminalActivationTokenFromSupabase(): Promise<{ pulle
   });
   const payload = verification.payload!;
 
+  const activatedAt = nowIso();
   db.prepare(
     `INSERT INTO terminal_activation_state (id, token, tenant_id, terminal_id, plan_tier, issued_at, expires_at, activated_at)
      VALUES (1, @token, @tenantId, @terminalId, @planTier, @issuedAt, @expiresAt, @activatedAt)
@@ -129,7 +131,18 @@ export async function pullTerminalActivationTokenFromSupabase(): Promise<{ pulle
     planTier: payload.planTier,
     issuedAt: payload.issuedAt,
     expiresAt: payload.expiresAt,
-    activatedAt: nowIso(),
+    activatedAt,
+  });
+
+  // DL-057: this replace *is* the "received and activated" event for the
+  // sync-down path — log it for two-ledger reconciliation against the
+  // console's own terminal_activation_tokens issuance record.
+  recordTerminalActivationConfirmation({
+    tenantId: payload.tenantId,
+    terminalId: payload.terminalId,
+    tokenIssuedAt: payload.issuedAt,
+    eventType: 'sync_down',
+    confirmedAt: activatedAt,
   });
 
   console.log('[terminalActivationTokenPull] synced a newer TerminalActivationToken');

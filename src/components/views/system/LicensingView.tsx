@@ -25,6 +25,7 @@ import { StatusBadge } from '../../ui/StatusBadge';
 import { Modal } from '../../ui/Modal';
 import { Input } from '../../ui/Input';
 import { Alert } from '../../ui/Alert';
+import { apiPost } from '../../../api/client';
 
 interface LicensingViewProps {
   licenceInfo: LicenceInfo;
@@ -46,6 +47,7 @@ export const LicensingView: React.FC<LicensingViewProps> = ({
   const [activationSuccess, setActivationSuccess] = useState<string | null>(null);
   const [isDetailsModalOpen, setIsDetailsModalOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [requestLogError, setRequestLogError] = useState<string | null>(null);
 
   const handleCopy = (text: string, fieldName: string) => {
     navigator.clipboard.writeText(text);
@@ -123,6 +125,22 @@ export const LicensingView: React.FC<LicensingViewProps> = ({
   );
 
   const whatsappUrl = `https://wa.me/${licenceInfo.supportContactWhatsApp.replace('+', '')}?text=${whatsappMessage}`;
+
+  // DL-056: logs this outbound request as an activation_requests row (so
+  // it appears in the console's ActivationRequestsPage queue) alongside
+  // opening the wa.me link — never blocking it. The WhatsApp conversation
+  // itself is the actual support channel; a failed console-side log is
+  // surfaced as a non-blocking notice rather than stopping the tenant from
+  // reaching support. Deliberately does not touch handleActivateSubmit or
+  // licenceInfo.activationCode — DL-028 leaves that mock flow untouched.
+  const handleRequestActivationClick = () => {
+    setRequestLogError(null);
+    void apiPost('/licensing/request-activation').catch(() => {
+      setRequestLogError(
+        'Could not reach the licensing server to log this request — your WhatsApp message will still go through, but console staff may not see it queued automatically.'
+      );
+    });
+  };
 
   return (
     <div className="w-full max-w-7xl mx-auto px-4 py-4 space-y-4 select-none">
@@ -379,12 +397,19 @@ export const LicensingView: React.FC<LicensingViewProps> = ({
                 href={whatsappUrl}
                 target="_blank"
                 rel="noopener noreferrer"
+                onClick={handleRequestActivationClick}
                 className="inline-flex items-center justify-center gap-2 w-full px-3 py-2 text-xs font-bold text-emerald-800 bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 rounded transition"
               >
                 <MessageSquare className="w-3.5 h-3.5 text-emerald-600" />
                 Buy Activation Code via WhatsApp
                 <ExternalLink className="w-3 h-3 text-emerald-500" />
               </a>
+
+              {requestLogError && (
+                <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5">
+                  {requestLogError}
+                </p>
+              )}
 
               <Button
                 variant="outline"

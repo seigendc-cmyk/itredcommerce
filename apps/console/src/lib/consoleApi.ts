@@ -33,6 +33,15 @@ export interface TerminalActivationTokenRow {
   issued_by: string | null;
 }
 
+export interface TerminalActivationConfirmationRow {
+  id: string;
+  tenant_id: string;
+  terminal_id: string;
+  token_issued_at: string;
+  event_type: 'manual_paste' | 'sync_down';
+  confirmed_at: string;
+}
+
 export interface BillingInvoiceRow {
   id: string;
   tenant_id: string;
@@ -98,6 +107,19 @@ export async function listTerminalActivationTokens(tenantId: string): Promise<Te
     .select('id, tenant_id, terminal_id, plan_tier, issued_at, expires_at, status, issued_by')
     .eq('tenant_id', tenantId)
     .order('issued_at', { ascending: false });
+  return unwrap({ data: res.data ?? [], error: res.error });
+}
+
+// DL-057: the tenant-side half of two-ledger reconciliation — read-only,
+// via the console_read RLS policy the migration adds (no write grant to
+// `authenticated` exists for this table at all; every row here was written
+// by a tenant's own trusted local server via the service-role client).
+export async function listTerminalActivationConfirmations(tenantId: string): Promise<TerminalActivationConfirmationRow[]> {
+  const res = await supabase
+    .from('terminal_activation_confirmations')
+    .select('id, tenant_id, terminal_id, token_issued_at, event_type, confirmed_at')
+    .eq('tenant_id', tenantId)
+    .order('confirmed_at', { ascending: false });
   return unwrap({ data: res.data ?? [], error: res.error });
 }
 

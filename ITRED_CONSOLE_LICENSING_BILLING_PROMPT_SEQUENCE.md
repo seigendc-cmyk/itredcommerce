@@ -771,6 +771,121 @@ than a third copy of the billing math in plpgsql):
   values, and `BILLING_INVOICE_GENERATOR_SECRET` needs setting on the Edge
   Function's environment, before this sweep does anything.
 
+## Prompt 16 — WhatsApp request-logging + two-ledger reconciliation ✅ Implemented, not yet committed
+
+Before drafting this literally, a premise check against the actual repo
+(rather than the doc's framing) was run — it changed the scope materially:
+
+- **The console-side "fulfillment screen"** this prompt's original one-line
+  description named is not a gap at all — `ActivationRequestsPage.tsx` +
+  `console-issue-terminal-activation-token`/`console-resolve-activation-request`
+  already do exactly that, built ahead of plan in `bc264b6` (see the
+  "Sequence drift" note above). Nothing needed building there.
+- **`LicensingView.tsx`'s `wa.me` button** (DL-041) turned out to be pure
+  mock UI wired to nothing — no `activation_requests` insert existed
+  anywhere in the codebase before this prompt, confirmed by a repo-wide
+  grep. It shares the file with, but is entirely independent of, the
+  `handleActivateSubmit`/`LicenceInfo.activationCode` mock flow DL-028
+  explicitly forbids touching — so only the button's own `onClick` was
+  in scope here.
+- **Two-ledger reconciliation (DL-042)** was genuinely greenfield: the
+  console's issuance ledger (`terminal_activation_tokens`) existed, but no
+  independent tenant-side "received and activated" log existed anywhere —
+  confirmed by grepping for "ledger"/"reconcil" across `server/` and
+  `apps/console/`.
+- A real, tested, already-working `POST /api/licensing/activate-terminal`
+  endpoint (DL-039/DL-046) turned out to have **no frontend caller
+  anywhere** — a pre-existing gap, left exactly as found; wiring it would
+  mean reworking `LicensingView.tsx`'s mock activation UI, which DL-028
+  blocks until explicitly revisited.
+
+Given that, the prompt actually run was narrower than the doc's original
+one-liner:
+
+```
+Wire LicensingView.tsx's existing "Request Activation Code via WhatsApp"
+button to actually log the request, and close DL-042's two-ledger
+reconciliation gap. Do not touch handleActivateSubmit, LicenceInfo.activationCode,
+or anything else in LicensingView.tsx's mock activation-code-paste flow —
+DL-028 leaves that untouched until explicitly revisited. Do not attempt to
+wire /api/licensing/activate-terminal to any UI — that's a separate,
+larger decision about replacing this component's mock flow, out of scope
+here.
+
+1. WhatsApp request logging: add a server route that logs a real
+   activation_requests row (tenant_id/terminal_id from this install's own
+   binding) the moment the WhatsApp button is clicked, without blocking the
+   link itself from opening — connectivity is required to open WhatsApp
+   anyway, so log synchronously rather than queuing for later.
+
+2. Two-ledger reconciliation: build the tenant-side half of DL-042 — an
+   independent log of "this terminal received and activated
+   TerminalActivationToken X at time T," written at both existing places a
+   token becomes locally active (manual paste-in and sync-down
+   replacement), pushed to a new console-visible Supabase table, and
+   reconciled against terminal_activation_tokens in a new console page.
+   Propose where this push mechanism should live before building it if the
+   existing general outbox isn't actually a live, wired path — don't build
+   on top of something unverified.
+
+Write a unit test for the reconciliation matching logic.
+```
+
+**Result:**
+
+- **WhatsApp request logging**: `POST /api/licensing/request-activation`
+  (`server/routes/licensing.ts`) — same `getSupabaseAdmin()` direct-write
+  pattern as `delivery_orders` (DL-015), gated by `BACK_OFFICE_WRITE_ROLES`
+  like `/activate-terminal`. `LicensingView.tsx`'s `<a href={whatsappUrl}>`
+  gained an `onClick` that fires the log request and lets the browser's
+  default navigation open WhatsApp regardless of the outcome; a failed log
+  surfaces as a small non-blocking amber notice, never an error that stops
+  the tenant from reaching support.
+- **Premise check paid off mid-prompt**: `server/sync/drainLoop.ts` (the
+  general `applyWithOutbox`/`entityRules.ts` outbox, DL-006/DL-007) has
+  `startDrainLoop` defined but **no live caller anywhere in
+  `server/index.ts`** — a pre-existing, unrelated gap. Building the
+  reconciliation push on top of it would have made its durability an
+  unverified promise, so it instead mirrors `fiscalDrainLoop.ts`'s proven,
+  already-live pattern: its own small dedicated loop
+  (`server/sync/terminalActivationConfirmationDrainLoop.ts`, 60s interval,
+  wired into `server/index.ts` next to `startFiscalDrainLoop()`). The
+  dormant general outbox is flagged in the governance doc's Open Items
+  rather than fixed silently as a side effect.
+- **Two-ledger schema**: `terminal_activation_confirmations` — a new
+  Supabase table (`20260906100000_...sql`, console-read-only RLS, no
+  write grant to `authenticated` at all — every row is written by a
+  tenant's own trusted local server via the service-role client, same
+  DL-005/DL-011 trust model DL-050 already established) plus a same-named
+  local SQLite queue table (`011_...sql`) drained up to it.
+  `server/lib/terminalActivationConfirmations.ts`'s
+  `recordTerminalActivationConfirmation()` is called from both existing
+  activation call sites: `POST /activate-terminal` (`event_type:
+  'manual_paste'`) and `terminalActivationTokenPull.ts`'s `REPLACE` branch
+  (`event_type: 'sync_down'`).
+- **Console reconciliation UI**: `apps/console/src/lib/tokenReconciliation.ts`'s
+  `reconcileTerminalActivationTokens()` — pure matching logic (exact
+  `tenant_id`/`terminal_id`/`issued_at` equality, not nearest-in-time, so a
+  near-miss never masks a genuine gap), unit-tested
+  (`tokenReconciliation.test.ts`, 6 tests). Consumed by a new
+  `TokenReconciliationPage` (nav entry added to `apps/console/src/App.tsx`)
+  listing each tenant's issued tokens against `confirmed`/`awaiting
+  confirmation`.
+- **Explicitly not touched**: `handleActivateSubmit`,
+  `LicenceInfo.activationCode`, and every other part of `LicensingView.tsx`'s
+  mock flow — untouched per DL-028. `/api/licensing/activate-terminal`
+  still has no frontend caller anywhere; that gap is now flagged explicitly
+  in the governance doc's Open Items rather than left implicit.
+- Tests: `apps/console/src/lib/tokenReconciliation.test.ts` (6 new tests).
+  `npm test` — **41/41 passing**. Root and `apps/console` typechecks clean.
+- Governance doc: **DL-056** (WhatsApp request logging) and **DL-057**
+  (two-ledger reconciliation) added.
+
+**Not yet committed** — implemented and verified, sitting in the working
+tree as of this writing.
+
+---
+
 ## Next in sequence
 
 - ~~**Prompt 13** — Console scaffold + schema/RLS.~~ ✅ Committed (`61f901d`).
@@ -788,8 +903,14 @@ than a third copy of the billing math in plpgsql):
 - **Prompt 15, section 1 (revisited)** — Scheduled invoice generation
   (DL-055). ✅ Committed (`e9643f1`). Prompt 15's original scope is now fully
   closed.
-- **Prompt 16** — WhatsApp deep-link request flow + console-side fulfillment
-  screen + two-ledger reconciliation logging — not yet drafted.
-- **Prompt 17** — Console UI wiring for the remaining pieces (activation
-  requests issuance UI already exists from the `bc264b6` work; confirm what's
-  left before drafting) — only after 15–16 are logic-tested.
+- **Prompt 16** — WhatsApp request-logging + two-ledger reconciliation
+  (DL-056/DL-057). ✅ Implemented, not yet committed. The console-side
+  fulfillment screen this prompt's original description named was already
+  built (`bc264b6`) — no changes needed there.
+- **Prompt 17** — Console UI wiring for the remaining pieces. Narrowed by
+  Prompt 16's findings: the activation-requests issuance UI already exists;
+  what's actually left is wiring `/api/licensing/activate-terminal` to a
+  real frontend (blocked on a DL-28 decision about `LicensingView.tsx`'s
+  mock flow) and the general outbox drain loop's dead wiring
+  (`server/sync/drainLoop.ts`, flagged in DL-057's Open Items) — confirm
+  scope before drafting.

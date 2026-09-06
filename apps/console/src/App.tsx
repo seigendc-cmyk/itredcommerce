@@ -1,8 +1,9 @@
 import React, { useState } from 'react';
-import { Inbox, Receipt, Package, LogOut } from 'lucide-react';
+import { Inbox, Receipt, Package, LogOut, ShieldCheck } from 'lucide-react';
 import { ActivationRequestsPage } from './pages/ActivationRequestsPage';
 import { BillingOverviewPage } from './pages/BillingOverviewPage';
 import { PlanComponentsPage } from './pages/PlanComponentsPage';
+import { TokenReconciliationPage } from './pages/TokenReconciliationPage';
 import { SignInPage } from './pages/SignInPage';
 import { ConsoleAuthProvider, useConsoleAuth } from './lib/consoleAuth';
 
@@ -10,12 +11,13 @@ import { ConsoleAuthProvider, useConsoleAuth } from './lib/consoleAuth';
 // established by the main app (src/App.tsx) and executive-pwa/src/App.tsx
 // rather than introducing a new routing dependency/convention for this
 // surface alone.
-type PageKey = 'ACTIVATION_REQUESTS' | 'BILLING_OVERVIEW' | 'PLAN_COMPONENTS';
+type PageKey = 'ACTIVATION_REQUESTS' | 'BILLING_OVERVIEW' | 'PLAN_COMPONENTS' | 'TOKEN_RECONCILIATION';
 
 const NAV_ITEMS: { key: PageKey; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { key: 'ACTIVATION_REQUESTS', label: 'Activation Requests', icon: Inbox },
   { key: 'BILLING_OVERVIEW', label: 'Billing Overview', icon: Receipt },
   { key: 'PLAN_COMPONENTS', label: 'Plan Components', icon: Package },
+  { key: 'TOKEN_RECONCILIATION', label: 'Token Reconciliation', icon: ShieldCheck },
 ];
 
 function ConsoleShellApp() {
@@ -66,6 +68,7 @@ function ConsoleShellApp() {
         {activePage === 'ACTIVATION_REQUESTS' && <ActivationRequestsPage />}
         {activePage === 'BILLING_OVERVIEW' && <BillingOverviewPage />}
         {activePage === 'PLAN_COMPONENTS' && <PlanComponentsPage />}
+        {activePage === 'TOKEN_RECONCILIATION' && <TokenReconciliationPage />}
       </div>
     </div>
   );
