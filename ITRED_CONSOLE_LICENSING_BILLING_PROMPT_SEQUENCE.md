@@ -725,7 +725,7 @@ Prompt 15 text were implemented together as one cohesive mechanism:
 
 ---
 
-## Prompt 15, section 1 (revisited) — Scheduled Invoice Generation ✅ Implemented (DL-055)
+## Prompt 15, section 1 (revisited) — Scheduled Invoice Generation ✅ Committed (`e9643f1`, DL-055)
 
 The one piece of Prompt 15's original scope still unbuilt after DL-052/053/054:
 invoice generation was exclusively console-operator-triggered, with no guard
@@ -786,8 +786,8 @@ than a third copy of the billing math in plpgsql):
   `PaymentProvider` abstraction, overdue escalation (DL-054). ✅ Committed
   (`22794c5`).
 - **Prompt 15, section 1 (revisited)** — Scheduled invoice generation
-  (DL-055). ✅ Implemented, not yet committed. Prompt 15's original scope is
-  now fully closed.
+  (DL-055). ✅ Committed (`e9643f1`). Prompt 15's original scope is now fully
+  closed.
 - **Prompt 16** — WhatsApp deep-link request flow + console-side fulfillment
   screen + two-ledger reconciliation logging — not yet drafted.
 - **Prompt 17** — Console UI wiring for the remaining pieces (activation
