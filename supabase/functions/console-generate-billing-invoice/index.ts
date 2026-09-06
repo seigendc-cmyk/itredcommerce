@@ -7,6 +7,15 @@
 // RLS grant only lets a console operator update status/paid_at/payment_reference
 // afterward.
 //
+// Also callable by the scheduled generator (DL-055,
+// trigger_billing_invoice_generation) via an `x-drain-secret` header
+// matching BILLING_INVOICE_GENERATOR_SECRET — the same shared-secret shape
+// whatsapp-notify already uses for its own pg_cron-driven caller — instead
+// of a console-operator JWT. That caller isn't a person clicking "Generate"
+// in the console UI, so it has no operator session to present; everything
+// past the auth check below (period chaining, subscription lookup, line
+// items, insert) is identical either way.
+//
 // calculateInvoiceLineItems (and the period-math helpers below it) are
 // intentionally duplicated from apps/console/src/lib/billingEngine.ts (used
 // there for the live preview before generation) rather than shared —
@@ -143,10 +152,6 @@ Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
   if (req.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
 
-  const authHeader = req.headers.get('Authorization') ?? '';
-  const callerJwt = authHeader.replace(/^Bearer\s+/i, '');
-  if (!callerJwt) return json({ error: 'Missing Authorization header' }, 401);
-
   let body: { tenantId?: string };
   try {
     body = await req.json();
@@ -164,19 +169,32 @@ Deno.serve(async (req) => {
     { auth: { persistSession: false } }
   );
 
-  const { data: userData, error: userErr } = await admin.auth.getUser(callerJwt);
-  if (userErr || !userData.user) return json({ error: 'Not authenticated' }, 401);
+  // DL-055: the scheduled generator has no console-operator session to
+  // present — it authenticates with a shared secret instead, the same
+  // shape whatsapp-notify's pg_cron caller already uses.
+  const drainSecret = req.headers.get('x-drain-secret');
+  const isScheduledCaller =
+    !!drainSecret && drainSecret === Deno.env.get('BILLING_INVOICE_GENERATOR_SECRET');
 
-  const { data: operator, error: operatorErr } = await admin
-    .from('console_operators')
-    .select('is_active')
-    .eq('auth_user_id', userData.user.id)
-    .maybeSingle();
-  if (operatorErr) {
-    console.error('[console-generate-billing-invoice] operator lookup failed:', operatorErr);
-    return json({ error: 'Temporarily unavailable' }, 502);
+  if (!isScheduledCaller) {
+    const authHeader = req.headers.get('Authorization') ?? '';
+    const callerJwt = authHeader.replace(/^Bearer\s+/i, '');
+    if (!callerJwt) return json({ error: 'Missing Authorization header' }, 401);
+
+    const { data: userData, error: userErr } = await admin.auth.getUser(callerJwt);
+    if (userErr || !userData.user) return json({ error: 'Not authenticated' }, 401);
+
+    const { data: operator, error: operatorErr } = await admin
+      .from('console_operators')
+      .select('is_active')
+      .eq('auth_user_id', userData.user.id)
+      .maybeSingle();
+    if (operatorErr) {
+      console.error('[console-generate-billing-invoice] operator lookup failed:', operatorErr);
+      return json({ error: 'Temporarily unavailable' }, 502);
+    }
+    if (!operator || !operator.is_active) return json({ error: 'Not a console operator' }, 403);
   }
-  if (!operator || !operator.is_active) return json({ error: 'Not a console operator' }, 403);
 
   // 1. Determine which period this invoice covers (DL-052/DL-053): chained
   // from the tenant's most recently generated invoice, or from their

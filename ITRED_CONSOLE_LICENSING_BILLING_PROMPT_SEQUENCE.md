@@ -672,13 +672,13 @@ this detour:
 - WhatsApp activation-request flow (DL-041) and `apps/console`'s issuance UI
   wiring to the real backend for that flow — unchanged, still pending Prompt
   16/17.
-- A *scheduled* invoice generator (Prompt 15 section 1 originally called for
-  one) — invoice generation is still manually console-operator-triggered,
-  not cron-driven. Not built as part of DL-054.
+- ~~A *scheduled* invoice generator~~ — **resolved via DL-055** (daily
+  `pg_cron` + `pg_net` calling the existing `console-generate-billing-invoice`
+  Edge Function). No longer open.
 - Automated payment retry — not applicable until a real aggregator exists to
   decline a charge against in the first place (DL-054).
 
-## Prompt 15, sections 3–5 — Payment-Triggered Renewal ✅ Implemented, not yet committed (DL-054)
+## Prompt 15, sections 3–5 — Payment-Triggered Renewal ✅ Committed (`22794c5`, DL-054)
 
 Section 3 (TerminalActivationToken linkage), section 4 (`PaymentProvider`
 abstraction), and section 5 (renewal/retry scheduling) from the original
@@ -721,7 +721,55 @@ Prompt 15 text were implemented together as one cohesive mechanism:
   `supabase/functions/_shared/**/*.test.ts` — **35/35 passing** total.
 - Governance doc: **DL-054** added.
 
-**Not yet committed.**
+**Committed** — `22794c5`.
+
+---
+
+## Prompt 15, section 1 (revisited) — Scheduled Invoice Generation ✅ Implemented (DL-055)
+
+The one piece of Prompt 15's original scope still unbuilt after DL-052/053/054:
+invoice generation was exclusively console-operator-triggered, with no guard
+against a tenant's next period quietly going un-invoiced if nobody clicked
+"Generate." Closed via a design decision confirmed before implementing
+(pg_cron → Edge Function via pg_net, reusing the existing function, rather
+than a third copy of the billing math in plpgsql):
+
+- **`tenants_due_for_billing_invoice()`** (SQL) — reuses DL-052's
+  `compute_billing_period_end()` to chain from each `ACTIVE` tenant's latest
+  invoice `period_end` (or `onboarding_completed_at` for a first invoice),
+  returning tenants whose next period has already fully elapsed.
+- **`trigger_billing_invoice_generation()`** (SECURITY DEFINER) — for each
+  due tenant, calls `console-generate-billing-invoice` via `pg_net.http_post`.
+  URL + shared secret live in `platform_settings` (seeded `null`, same
+  deployment-step pattern as `whatsapp_edge_function_url`/`whatsapp_drain_secret`);
+  does nothing while unconfigured rather than erroring on every run.
+- **`console-generate-billing-invoice`** now also accepts an `x-drain-secret`
+  header matching `BILLING_INVOICE_GENERATOR_SECRET`, checked ahead of (and
+  instead of) the console-operator JWT path — the scheduled caller has no
+  operator session to present. Mirrors `whatsapp-notify`'s own drain-secret
+  check exactly rather than a new convention. Everything past the auth
+  check (period chaining, subscription lookup, line items, insert) is
+  unchanged and shared with the manual-trigger path.
+- Cadence: daily (`0 2 * * *`), not hourly — a billing period elapsing has
+  no reason to be caught inside the same hour it ends, unlike
+  `mark-overdue-billing-invoices` (payment deadline) or
+  `drain-whatsapp-notifications` (message latency).
+- Catch-up is not special-cased: each call only advances a tenant by one
+  chained period, same as manual triggering; a tenant several periods
+  behind catches up over that many days of runs. Acceptable since nothing
+  downstream is time-critical to the day.
+- Migration: `supabase/migrations/20260906090000_scheduled_billing_invoice_generation.sql`.
+- Governance doc: **DL-055** added; the scheduled-invoice-generator open
+  item marked resolved.
+- No new automated tests: `console-generate-billing-invoice` has no
+  existing test coverage to extend (Edge Functions doing live DB round
+  trips aren't part of this repo's `node:test` suite — only pure logic
+  modules are), and the new SQL functions aren't unit-tested for the same
+  reason no other migration's SQL functions are.
+- **Deployment step still pending, same as the WhatsApp drain's own**:
+  `platform_settings.billing_invoice_generator_url`/`_secret` need real
+  values, and `BILLING_INVOICE_GENERATOR_SECRET` needs setting on the Edge
+  Function's environment, before this sweep does anything.
 
 ## Next in sequence
 
@@ -735,11 +783,11 @@ Prompt 15 text were implemented together as one cohesive mechanism:
 - **Prompt 15 (revised), steps 1–2** — Billing cycle schema (DL-052) +
   mid-cycle proration (DL-053). ✅ Committed (`7063b30`).
 - **Prompt 15, sections 3–5** — TerminalActivationToken renewal linkage,
-  `PaymentProvider` abstraction, overdue escalation (DL-054). ✅ Implemented
-  and tested, **not yet committed**.
-- **Still unbuilt from Prompt 15's original scope**: a *scheduled* invoice
-  generator (section 1 called for cron-driven generation; it's still
-  manually console-operator-triggered).
+  `PaymentProvider` abstraction, overdue escalation (DL-054). ✅ Committed
+  (`22794c5`).
+- **Prompt 15, section 1 (revisited)** — Scheduled invoice generation
+  (DL-055). ✅ Implemented, not yet committed. Prompt 15's original scope is
+  now fully closed.
 - **Prompt 16** — WhatsApp deep-link request flow + console-side fulfillment
   screen + two-ledger reconciliation logging — not yet drafted.
 - **Prompt 17** — Console UI wiring for the remaining pieces (activation
