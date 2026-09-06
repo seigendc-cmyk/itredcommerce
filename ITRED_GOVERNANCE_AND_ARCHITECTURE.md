@@ -3365,16 +3365,64 @@ against the pre-existing baseline, which already had unrelated failures in
 `supabase/functions` tree, none of them touched by this work).
 
 **Known gaps, flagged rather than silently left implicit**:
-- **No approval-resolution UI exists yet** for a `BI_RULE_REDIRECT`
-  ticket once created — `approval_requests` has no route or UI reading it
-  anywhere in this app (confirmed before extending it), and the
-  `approvalRequests` state already in `App.tsx` is unconnected mock data,
-  not wired to the real table. A manager currently has no way to actually
-  act on a ticket this mechanism creates. Building that resolution UI is
-  a natural next prompt, not attempted here — this prompt's scope was the
-  gate mechanics (evaluate → block/redirect → reconnect-reevaluate), which
-  are complete and tested independent of who eventually resolves a ticket.
+- ~~No approval-resolution UI exists yet for a `BI_RULE_REDIRECT`
+  ticket once created~~ — **Decision Flows visibility resolved via
+  DL-065.** A manager can now see and filter these tickets; taking action
+  on one (approve/decline) is still not wired — see DL-065's own Known
+  gaps.
 - **Relationship to `deterministicRulesEngine.ts`**: still unresolved, per
   DL-060/DL-063's Open Items — unchanged by this implementation pass.
 - Capital Velocity, Budget Variance Advisor, Forensic Theft Guard: still
   placeholders with no functional scope — unchanged.
+
+### DL-065: BI Brain tickets get Decision Flows visibility; every executive-pwa data page gets an offline last-known-good fallback
+
+**Decision — Decision Flows visibility**: `BI_RULE_REDIRECT` rows in
+`approval_requests` are now a third source in `executive-pwa`'s Decision
+Flows list, alongside exceptions and (mock) approvals. Each ticket's
+generic `type` string is resolved against the `bi_rules` catalog back to
+its actual engine category (e.g. "Dead Stock Restock") for display, rather
+than showing `BI_RULE_REDIRECT` verbatim. Branch and decided-by/decided-at
+columns and filters were added, matching what exception tickets already
+had. `approval_requests` has no `branch_id`/FK column — it's a freeform
+`location_name` display field — so `server/lib/biRuleGate.ts`'s
+`createApprovalTicket()` now looks up the gating installation's branch
+name and writes it there at ticket-creation time, the only place this
+information is known; there was no retrofit needed for confirmed offline
+tickets since the reconciler in `biRuleGatedActionReconciler.ts` calls the
+same `createApprovalTicket()` path.
+
+**Decision — offline data fallback**: every `executive-pwa` data page
+(`BankCashPage`, `DebtorsCreditorsPage`, `DecisionFlowsPage`,
+`ExpensesPage`, `FinancialStatementsPage`, `InventoryAgeingPage`,
+`InventoryTurnoverPage`, `InventoryValuationPage`, `PendingTasksPage`,
+`ReservesPage`, `SalesGrowthPage`, `SalesSummaryPage`) now caches its last
+successful Supabase read to `localStorage` (`offlineCache.ts`) and falls
+back to it, with a `StaleDataBanner`, when a live fetch fails. This app
+carries no offline durability requirement of its own (DL-002/DL-013 — it's
+read-only and Supabase-only, unlike the branch terminal's local-first
+model), so this is deliberately a last-known-good display fallback, not a
+write-capable offline mode: the service worker still precaches only the
+static app shell, nothing added to queue or replay writes.
+
+**Rationale**: closes the gap DL-064 flagged rather than leaving a
+BI-Brain-generated ticket invisible to the manager who would act on it,
+without overreaching into building the actual resolution (approve/decline)
+UI — that still requires deciding how a `BI_RULE_REDIRECT` ticket's
+resolution feeds back into the gated action (e.g. releasing the blocked
+purchase memo), which is a separate decision from just surfacing the
+ticket. The offline fallback was a drive-by fix bundled into the same
+commit — a dropped connection previously produced a blank data page in
+`executive-pwa`, which is a worse failure mode than a visibly stale one,
+independent of BI Brain.
+
+**Known gaps**:
+- **Ticket resolution is still unbuilt.** A manager can now see a
+  `BI_RULE_REDIRECT` ticket in Decision Flows but still cannot act on it —
+  `approval_requests` has no route accepting an approve/decline decision
+  for any ticket type, mock or real. Building that, and deciding what
+  "approve" does to the gated action it references (e.g. actually
+  releasing `deadStockRestockFacts.ts`'s blocked purchase memo), remains
+  the natural next prompt.
+- `executive-pwa`'s offline fallback is read-only by design (per above) —
+  not a gap, but noted so it isn't mistaken for one later.
