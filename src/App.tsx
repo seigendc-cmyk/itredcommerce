@@ -670,7 +670,7 @@ export default function App() {
 
     (async () => {
       try {
-        const [memos, orders, transfers, sessions, allItems, salesHistory, shiftsHistory] = await Promise.all([
+        const [memos, orders, transfers, sessions, allItems, salesHistory, shiftsHistory, approvals] = await Promise.all([
           apiGet<PurchaseMemo[]>('/purchasing/memos'),
           apiGet<PurchaseOrder[]>('/purchasing/orders'),
           apiGet<StockTransfer[]>('/transfers'),
@@ -681,6 +681,10 @@ export default function App() {
           // Full history for Reports Center (REPORTS_CENTER is head-office-only).
           apiGet<SaleTransaction[]>('/sales'),
           apiGet<Shift[]>('/shifts'),
+          // Real approval_requests rows (DL-065 follow-up) — replaces the
+          // mock-only INITIAL_APPROVAL_REQUESTS seed, which never reflected
+          // BI Brain-generated BI_RULE_REDIRECT tickets or any real decision.
+          apiGet<ApprovalRequest[]>('/approvals'),
         ]);
         setPurchaseMemos(memos);
         setPurchaseOrders(orders);
@@ -688,6 +692,7 @@ export default function App() {
         setStocktakeSessions(sessions);
         setInventoryItems(allItems);
         setSalesTransactions(salesHistory);
+        setApprovalRequests(approvals);
         // Preserve whichever shift the shift-check effect established for
         // this terminal; backfill full cross-terminal history around it.
         setShifts((prev) => {
@@ -1489,26 +1494,42 @@ export default function App() {
     }
   };
 
-  const handleApprovalDecision = (requestId: string, status: 'APPROVED' | 'REJECTED', notes: string) => {
+  // Server round trip added as this route's first real caller (DL-065
+  // follow-up) — approval_requests previously had no route at all, so a
+  // decision only ever existed in this component's local state and never
+  // reached the real table biRuleGate.ts writes BI_RULE_REDIRECT tickets
+  // into, nor Supabase (so executive-pwa's Decision Flows never saw it).
+  // Awaited rather than fire-and-forget, unlike handleUpdateReorderStatus's
+  // optimistic pattern, because APPROVED can have a real side effect here
+  // (creating the purchase memo the ticket blocked) that only the server
+  // can perform — local state must reflect what actually happened, not
+  // what was requested.
+  const handleApprovalDecision = async (requestId: string, status: 'APPROVED' | 'REJECTED', notes: string) => {
     const decisionTimeStr = new Date().toISOString().replace('T', ' ').slice(0, 16);
     const targetReq = approvalRequests.find((r) => r.id === requestId);
 
-    setApprovalRequests((prev) =>
-      prev.map((req) => {
-        if (req.id === requestId) {
-          return {
-            ...req,
-            status,
-            decidedByStaffId: currentStaff.id,
-            decidedByStaffName: currentStaff.name,
-            decidedByRole: currentStaff.roleTitle,
-            decisionDateTime: decisionTimeStr,
-            decisionNotes: notes,
-          };
+    let decided: ApprovalRequest;
+    try {
+      const result = await apiPatch<{ request: ApprovalRequest; createdPurchaseMemo: PurchaseMemo | null }>(
+        `/approvals/${encodeURIComponent(requestId)}/decide`,
+        {
+          status,
+          decisionNotes: notes,
+          decidedByStaffId: currentStaff.id,
+          decidedByStaffName: currentStaff.name,
+          decidedByRole: currentStaff.roleTitle,
         }
-        return req;
-      })
-    );
+      );
+      decided = result.request;
+      if (result.createdPurchaseMemo) {
+        setPurchaseMemos((prev) => [result.createdPurchaseMemo as PurchaseMemo, ...prev]);
+      }
+    } catch (err) {
+      console.error('Failed to record approval decision', err);
+      return;
+    }
+
+    setApprovalRequests((prev) => prev.map((req) => (req.id === requestId ? decided : req)));
 
     // Record Activity Event for manager sign-off
     const apprvEvt: ActivityEvent = {

@@ -1120,7 +1120,11 @@ export type ApprovalType =
   | 'CASH_VARIANCE'
   | 'STOCKTAKE_VARIANCE'
   | 'UNRESOLVED_HELD_SALE'
-  | 'SENSITIVE_CONFIG_CHANGE';
+  | 'SENSITIVE_CONFIG_CHANGE'
+  // BI Brain's REDIRECT_TO_APPROVAL rule consequence (DL-061/062/065) —
+  // server/lib/biRuleGate.ts's createApprovalTicket() is the only writer.
+  // `title` is already the rule's own description text, not this constant.
+  | 'BI_RULE_REDIRECT';
 
 export type ApprovalStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
 

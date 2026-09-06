@@ -3366,10 +3366,9 @@ against the pre-existing baseline, which already had unrelated failures in
 
 **Known gaps, flagged rather than silently left implicit**:
 - ~~No approval-resolution UI exists yet for a `BI_RULE_REDIRECT`
-  ticket once created~~ — **Decision Flows visibility resolved via
-  DL-065.** A manager can now see and filter these tickets; taking action
-  on one (approve/decline) is still not wired — see DL-065's own Known
-  gaps.
+  ticket once created~~ — **Resolved: visibility via DL-065, decide route
+  and approve/decline wiring via DL-066.** A manager can now see, filter,
+  and act on these tickets end to end.
 - **Relationship to `deterministicRulesEngine.ts`**: still unresolved, per
   DL-060/DL-063's Open Items — unchanged by this implementation pass.
 - Capital Velocity, Budget Variance Advisor, Forensic Theft Guard: still
@@ -3417,12 +3416,73 @@ commit — a dropped connection previously produced a blank data page in
 independent of BI Brain.
 
 **Known gaps**:
-- **Ticket resolution is still unbuilt.** A manager can now see a
-  `BI_RULE_REDIRECT` ticket in Decision Flows but still cannot act on it —
-  `approval_requests` has no route accepting an approve/decline decision
-  for any ticket type, mock or real. Building that, and deciding what
-  "approve" does to the gated action it references (e.g. actually
-  releasing `deadStockRestockFacts.ts`'s blocked purchase memo), remains
-  the natural next prompt.
+- ~~Ticket resolution is still unbuilt.~~ — **Built in DL-066.**
+  `approval_requests` now has a real decide route and the head-office app
+  is wired to it instead of local-only mock state.
 - `executive-pwa`'s offline fallback is read-only by design (per above) —
   not a gap, but noted so it isn't mistaken for one later.
+
+### DL-066: `approval_requests` gets its first real route — GET + a decide endpoint that dispatches an approved ticket's gated action by `actionType`
+
+**Decision**: added `server/routes/approvals.ts` — until now `approval_requests`
+had no route at all (not even a read one); the head-office app's
+`approvalRequests` state was `INITIAL_APPROVAL_REQUESTS` mock data end to
+end, `handleApprovalDecision` only ever mutated that local state, and
+nothing ever reached the real table `biRuleGate.ts` writes
+`BI_RULE_REDIRECT` tickets into or its Supabase mirror. `GET /` lists every
+row (`BACK_OFFICE_READ_ROLES`); `PATCH /:id/decide` (`BACK_OFFICE_WRITE_ROLES`)
+records the decision — rejecting a non-`PENDING` ticket with 409 rather than
+allowing a second decision — and mirrors it to Supabase the same direct
+(non-outbox) way `createApprovalTicket()` already does, since without that
+write executive-pwa's Decision Flows (reads Supabase directly) would show a
+ticket forever `PENDING` no matter what a manager decided locally.
+`src/App.tsx`'s head-office data fetch now pulls real rows from `GET
+/approvals`, and `handleApprovalDecision` awaits the decide call instead of
+optimistically mutating state first — unlike
+`handleUpdateReorderStatus`'s fire-and-forget precedent — because an
+`APPROVED` decision here can have a real side effect only the server can
+perform.
+
+**Decision — what "approve" does**: a `BI_RULE_REDIRECT` ticket's
+`meta.actionType`/`meta.payload` (set at creation time in
+`createApprovalTicket()`) is dispatched in a small switch, exactly
+mirroring `biRuleGatedActionReconciler.ts`'s own `action_type` switch (same
+"ships only the one pairing this prompt's example rule needs, extend the
+switch rather than inventing a parallel mechanism" reasoning) — today just
+`CREATE_PURCHASE_MEMO`, calling `insertPurchaseMemoRecord()` with the
+memo payload that was captured (and never inserted) at gate time. Rejecting
+does nothing further — the memo was already never created, so there is
+nothing to undo. An approved ticket whose `actionType` isn't recognized
+still records the decision (it's an audit record first) but logs an error
+and performs no downstream action, rather than throwing and leaving the
+ticket stuck `PENDING`.
+
+**Rationale**: closes DL-065's flagged gap. Dispatch-by-`actionType` was
+chosen over a generic "replay the original request" mechanism because the
+original request was never durably queued anywhere generic — it only
+exists as whatever `meta.payload` the specific gate call happened to
+capture — so there is no action-agnostic way to "resume" it; each
+`actionType` inherently needs its own handler, same conclusion the
+reconciler already reached for the offline-block path.
+
+**Known gaps, flagged rather than silently left implicit**:
+- **No server-side self-approval or role-tier check.** The existing
+  `ApprovalDetailModal.tsx` UI already enforces "must be `STORE_MANAGER` or
+  `SYS_ADMIN`, and not the original requester" client-side, but
+  `requireAccessRole(...BACK_OFFICE_WRITE_ROLES)` is the only server-side
+  gate — the same coarse `StaffAccessRole` (app-surface) tier every other
+  back-office write route uses, not the finer job-title `StaffRole` the
+  client check uses (the server has no access to that finer tier — see
+  `server/lib/accessRoles.ts`'s own header comment on the two role
+  systems). This is the same trust model `purchasing/memos.ts` already
+  documented for its own client-supplied staff ids, not a new gap this
+  route introduces, but worth restating here since a decide endpoint is a
+  more consequential place for it to matter than a memo's `requestedBy`
+  field.
+- **No integration test.** Verified by `tsc --noEmit` (clean on every file
+  touched — pre-existing, unrelated failures elsewhere in the tree are
+  untouched by this work) and 49/49 server unit tests passing, plus a
+  manual smoke test confirming both routes mount and are auth-gated
+  correctly; no supertest-style route test was added since none of
+  `biRuleGate.ts`, `biRules.ts`, or `purchasing/memos.ts` — the routes this
+  one most directly extends — have one either.

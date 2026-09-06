@@ -28,6 +28,7 @@ import licensingRouter from './routes/licensing';
 import onboardingRouter from './routes/onboarding';
 import businessProfileRouter from './routes/businessProfile';
 import biRulesRouter from './routes/biRules';
+import approvalsRouter from './routes/approvals';
 import { isSupabaseConfigured } from './env';
 import { pullStaffFromSupabase } from './sync/staffPull';
 import { pullFiscalRegistrationsFromSupabase } from './sync/fiscalRegistrationPull';
@@ -174,6 +175,7 @@ app.use('/api/fiscalization', fiscalizationRouter);
 app.use('/api/branches', branchesRouter);
 app.use('/api/licensing', licensingRouter);
 app.use('/api/bi-rules', biRulesRouter);
+app.use('/api/approvals', approvalsRouter);
 
 // --- Additional route modules are mounted here as milestones land ---
 
