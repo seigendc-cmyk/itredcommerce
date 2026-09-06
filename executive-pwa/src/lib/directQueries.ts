@@ -90,33 +90,67 @@ export async function fetchCashBankTransactionsForAccount(accountId: string, lim
   return data ?? [];
 }
 
-// Decision flows: union of operational_exceptions + approval_requests,
-// read-only (per your answer, option (a)) — no decide/resolve actions here,
-// those stay in the back-office apps.
+// Decision flows: union of operational_exceptions + approval_requests
+// (original scope, kept per your answer to keep both sources) plus BI Brain
+// engine output as a third source — approval_requests rows of
+// type = 'BI_RULE_REDIRECT' are exactly BI Brain's REDIRECT_TO_APPROVAL
+// output (server/lib/biRuleGate.ts's createApprovalTicket()), so no new
+// table was introduced; `engine` is resolved from meta.ruleId against the
+// `bi_rules` catalog (read-only, granted to `authenticated` tenant-wide —
+// see supabase/migrations/20260906120000_bi_brain_rules_engine.sql) to get
+// the actual category rather than the generic 'BI_RULE_REDIRECT' string.
+// Still read-only — no decide/resolve actions here, those stay in the
+// back-office apps.
+export type BiEngineCategory = 'CAPITAL_VELOCITY' | 'BUDGET_VARIANCE_ADVISOR' | 'FORENSIC_THEFT_GUARD' | 'DEAD_STOCK_SEASONAL_DISPOSAL';
+
+// Only DEAD_STOCK_SEASONAL_DISPOSAL has any rule with real computation logic
+// today (server/lib/biRules/deadStockRestockFacts.ts) — the other three
+// categories exist only as an allowed `bi_rules.category` value with no
+// seeded rule and no facts computation anywhere in the codebase, confirmed
+// by a full-repo search before this page was built. They stay listed here
+// (not removed) so this filter needs no further change once each engine
+// actually ships; until then, selecting one will correctly show zero rows.
+export const BI_ENGINE_LABELS: Record<BiEngineCategory, string> = {
+  DEAD_STOCK_SEASONAL_DISPOSAL: 'Dead Stock / Seasonal Disposal',
+  CAPITAL_VELOCITY: 'Capital Velocity (not yet implemented)',
+  BUDGET_VARIANCE_ADVISOR: 'Budget Variance Advisor (not yet implemented)',
+  FORENSIC_THEFT_GUARD: 'Forensic Theft Guard (not yet implemented)',
+};
+
 export interface DecisionFlowEntry {
   kind: 'EXCEPTION' | 'APPROVAL';
   id: string;
   refNumber: string;
   title: string;
   category: string;
+  engine: BiEngineCategory | null;
   branchName: string | null;
   severity: string;
   status: string;
   dateTime: string;
+  decidedBy: string | null;
+  decidedAt: string | null;
+}
+
+async function fetchBiRuleCategories(): Promise<Map<string, BiEngineCategory>> {
+  const { data, error } = await supabase.from('bi_rules').select('rule_id, category');
+  if (error) throw error;
+  return new Map((data ?? []).map((r) => [r.rule_id, r.category as BiEngineCategory]));
 }
 
 export async function fetchDecisionFlows(): Promise<DecisionFlowEntry[]> {
-  const [exceptionsRes, approvalsRes] = await Promise.all([
+  const [exceptionsRes, approvalsRes, ruleCategories] = await Promise.all([
     supabase
       .from('operational_exceptions')
-      .select('id, exception_number, title, category, branch_name, severity, status, date_time')
+      .select('id, exception_number, title, category, branch_name, severity, status, date_time, assigned_or_reviewed_by, reviewed_date_time')
       .order('date_time', { ascending: false })
       .limit(200),
     supabase
       .from('approval_requests')
-      .select('id, request_number, title, type, location_name, priority, status, requested_date_time')
+      .select('id, request_number, title, type, location_name, priority, status, requested_date_time, meta, decided_by_staff_name, decision_date_time')
       .order('requested_date_time', { ascending: false })
       .limit(200),
+    fetchBiRuleCategories(),
   ]);
   if (exceptionsRes.error) throw exceptionsRes.error;
   if (approvalsRes.error) throw approvalsRes.error;
@@ -127,22 +161,32 @@ export async function fetchDecisionFlows(): Promise<DecisionFlowEntry[]> {
     refNumber: r.exception_number,
     title: r.title,
     category: r.category,
+    engine: null,
     branchName: r.branch_name,
     severity: r.severity,
     status: r.status,
     dateTime: r.date_time,
+    decidedBy: r.assigned_or_reviewed_by,
+    decidedAt: r.reviewed_date_time,
   }));
-  const approvals: DecisionFlowEntry[] = (approvalsRes.data ?? []).map((r) => ({
-    kind: 'APPROVAL',
-    id: r.id,
-    refNumber: r.request_number,
-    title: r.title,
-    category: r.type,
-    branchName: r.location_name,
-    severity: r.priority,
-    status: r.status,
-    dateTime: r.requested_date_time,
-  }));
+  const approvals: DecisionFlowEntry[] = (approvalsRes.data ?? []).map((r) => {
+    const ruleId = r.type === 'BI_RULE_REDIRECT' ? (r.meta as { ruleId?: string } | null)?.ruleId : undefined;
+    const engine = ruleId ? ruleCategories.get(ruleId) ?? null : null;
+    return {
+      kind: 'APPROVAL',
+      id: r.id,
+      refNumber: r.request_number,
+      title: r.title,
+      category: r.type,
+      engine,
+      branchName: r.location_name,
+      severity: r.priority,
+      status: r.status,
+      dateTime: r.requested_date_time,
+      decidedBy: r.decided_by_staff_name,
+      decidedAt: r.decision_date_time,
+    };
+  });
 
   return [...exceptions, ...approvals].sort((a, b) => (a.dateTime < b.dateTime ? 1 : -1));
 }

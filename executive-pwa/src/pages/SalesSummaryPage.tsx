@@ -2,30 +2,50 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { PageShell } from '../components/PageShell';
 import { PeriodFilter, resolvePeriod, type PeriodPreset } from '../components/PeriodFilter';
 import { DataTable, type Column } from '@shared/components/ui/DataTable';
+import { StaleDataBanner } from '../components/StaleDataBanner';
+import { readCache, writeCache } from '../lib/offlineCache';
 import { fetchDailySales, fetchLastRefreshed, type DailySalesRow } from '../lib/rollups';
 
 export interface SalesSummaryPageProps {
   onBack: () => void;
 }
 
+interface CachedShape {
+  rows: DailySalesRow[];
+  asOf: string | null;
+}
+
 export const SalesSummaryPage: React.FC<SalesSummaryPageProps> = ({ onBack }) => {
   const [preset, setPreset] = useState<PeriodPreset>('30d');
   const [rows, setRows] = useState<DailySalesRow[]>([]);
   const [asOf, setAsOf] = useState<string | null>(null);
+  const [staleAsOf, setStaleAsOf] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const period = useMemo(() => resolvePeriod(preset), [preset]);
+  const cacheKey = `sales-summary:${period.from}:${period.to}`;
 
   useEffect(() => {
     setIsLoading(true);
     setError(null);
+    setStaleAsOf(null);
     Promise.all([fetchDailySales(period.from, period.to), fetchLastRefreshed('mv_daily_sales_summary')])
       .then(([sales, refreshed]) => {
         setRows(sales);
         setAsOf(refreshed);
+        writeCache<CachedShape>(cacheKey, { rows: sales, asOf: refreshed });
       })
-      .catch((err) => setError(err.message || 'Failed to load sales summary'))
+      .catch((err) => {
+        const cached = readCache<CachedShape>(cacheKey);
+        if (cached) {
+          setRows(cached.data.rows);
+          setAsOf(cached.data.asOf);
+          setStaleAsOf(cached.cachedAt);
+        } else {
+          setError(err.message || 'Failed to load sales summary');
+        }
+      })
       .finally(() => setIsLoading(false));
   }, [period.from, period.to]);
 
@@ -66,6 +86,7 @@ export const SalesSummaryPage: React.FC<SalesSummaryPageProps> = ({ onBack }) =>
         </div>
       </div>
 
+      {staleAsOf && <StaleDataBanner cachedAt={staleAsOf} />}
       {error && <div className="text-xs text-rose-400 mb-3">{error}</div>}
       {isLoading ? (
         <div className="text-xs text-slate-500">Loading…</div>

@@ -1,24 +1,39 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { PageShell } from '../components/PageShell';
 import { DataTable, type Column } from '@shared/components/ui/DataTable';
+import { StaleDataBanner } from '../components/StaleDataBanner';
+import { readCache, writeCache } from '../lib/offlineCache';
 import { fetchPendingTasks, type PendingTaskEntry } from '../lib/directQueries';
 
 export interface PendingTasksPageProps {
   onBack: () => void;
 }
 
+const CACHE_KEY = 'pending-tasks';
 const KIND_FILTERS = ['ALL', 'APPROVAL', 'PURCHASE_ORDER'] as const;
 
 export const PendingTasksPage: React.FC<PendingTasksPageProps> = ({ onBack }) => {
   const [entries, setEntries] = useState<PendingTaskEntry[]>([]);
+  const [staleAsOf, setStaleAsOf] = useState<string | null>(null);
   const [kindFilter, setKindFilter] = useState<(typeof KIND_FILTERS)[number]>('ALL');
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchPendingTasks()
-      .then(setEntries)
-      .catch((err) => setError(err.message || 'Failed to load pending tasks'))
+      .then((data) => {
+        setEntries(data);
+        writeCache<PendingTaskEntry[]>(CACHE_KEY, data);
+      })
+      .catch((err) => {
+        const cached = readCache<PendingTaskEntry[]>(CACHE_KEY);
+        if (cached) {
+          setEntries(cached.data);
+          setStaleAsOf(cached.cachedAt);
+        } else {
+          setError(err.message || 'Failed to load pending tasks');
+        }
+      })
       .finally(() => setIsLoading(false));
   }, []);
 
@@ -55,6 +70,7 @@ export const PendingTasksPage: React.FC<PendingTasksPageProps> = ({ onBack }) =>
         </div>
       </div>
 
+      {staleAsOf && <StaleDataBanner cachedAt={staleAsOf} />}
       {error && <div className="text-xs text-rose-400 mb-3">{error}</div>}
       {isLoading ? (
         <div className="text-xs text-slate-500">Loading…</div>

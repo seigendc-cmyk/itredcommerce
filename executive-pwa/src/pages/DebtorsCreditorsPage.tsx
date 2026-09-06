@@ -1,16 +1,26 @@
 import React, { useEffect, useState } from 'react';
 import { PageShell } from '../components/PageShell';
 import { DataTable, type Column } from '@shared/components/ui/DataTable';
+import { StaleDataBanner } from '../components/StaleDataBanner';
+import { readCache, writeCache } from '../lib/offlineCache';
 import { fetchDebtorAging, fetchCreditorAging, type DebtorAgingRow, type CreditorAgingRow } from '../lib/rollups';
 
 export interface DebtorsCreditorsPageProps {
   onBack: () => void;
 }
 
+interface CachedShape {
+  debtors: DebtorAgingRow[];
+  creditors: CreditorAgingRow[];
+}
+
+const CACHE_KEY = 'debtors-creditors';
+
 export const DebtorsCreditorsPage: React.FC<DebtorsCreditorsPageProps> = ({ onBack }) => {
   const [tab, setTab] = useState<'DEBTORS' | 'CREDITORS'>('DEBTORS');
   const [debtors, setDebtors] = useState<DebtorAgingRow[]>([]);
   const [creditors, setCreditors] = useState<CreditorAgingRow[]>([]);
+  const [staleAsOf, setStaleAsOf] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -19,8 +29,18 @@ export const DebtorsCreditorsPage: React.FC<DebtorsCreditorsPageProps> = ({ onBa
       .then(([d, c]) => {
         setDebtors(d);
         setCreditors(c);
+        writeCache<CachedShape>(CACHE_KEY, { debtors: d, creditors: c });
       })
-      .catch((err) => setError(err.message || 'Failed to load ageing data'))
+      .catch((err) => {
+        const cached = readCache<CachedShape>(CACHE_KEY);
+        if (cached) {
+          setDebtors(cached.data.debtors);
+          setCreditors(cached.data.creditors);
+          setStaleAsOf(cached.cachedAt);
+        } else {
+          setError(err.message || 'Failed to load ageing data');
+        }
+      })
       .finally(() => setIsLoading(false));
   }, []);
 
@@ -66,6 +86,7 @@ export const DebtorsCreditorsPage: React.FC<DebtorsCreditorsPageProps> = ({ onBa
         </button>
       </div>
 
+      {staleAsOf && <StaleDataBanner cachedAt={staleAsOf} />}
       {error && <div className="text-xs text-rose-400 mb-3">{error}</div>}
       {isLoading ? (
         <div className="text-xs text-slate-500">Loading…</div>

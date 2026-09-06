@@ -121,6 +121,19 @@ export async function createApprovalTicket(rule: LoadedRule, params: GateParams)
   const installation = getInstallationConfig();
   const id = randomUUID();
   const requestedAt = new Date().toISOString();
+
+  // Branch name, not just id — approval_requests.location_name is a freeform
+  // display field (no branch_id/FK column on this table), but Decision Flows'
+  // branch filter needs something human-readable to filter on, the same way
+  // it already works for exceptions (which do have a real branch_id).
+  let locationName: string | null = null;
+  if (installation?.branchId) {
+    const branchRow = db.prepare(`SELECT name FROM branches WHERE id = ?`).get(installation.branchId) as
+      | { name: string }
+      | undefined;
+    locationName = branchRow?.name ?? null;
+  }
+
   const meta = {
     ruleId: rule.definition.ruleId,
     ruleVersion: rule.definition.version,
@@ -130,14 +143,15 @@ export async function createApprovalTicket(rule: LoadedRule, params: GateParams)
   };
 
   db.prepare(
-    `INSERT INTO approval_requests (id, type, title, reference_id, reference_type, requested_by_staff_id, requested_by_staff_name, requested_date_time, status, meta)
-     VALUES (@id, @type, @title, @referenceId, @referenceType, @requestedByStaffId, @requestedByStaffName, @requestedDateTime, @status, @meta)`
+    `INSERT INTO approval_requests (id, type, title, reference_id, reference_type, location_name, requested_by_staff_id, requested_by_staff_name, requested_date_time, status, meta)
+     VALUES (@id, @type, @title, @referenceId, @referenceType, @locationName, @requestedByStaffId, @requestedByStaffName, @requestedDateTime, @status, @meta)`
   ).run({
     id,
     type: 'BI_RULE_REDIRECT',
     title: rule.definition.description,
     referenceId: params.referenceId,
     referenceType: params.referenceType,
+    locationName,
     requestedByStaffId: params.requestedByStaffId,
     requestedByStaffName: params.requestedByStaffName,
     requestedDateTime: requestedAt,
@@ -154,6 +168,7 @@ export async function createApprovalTicket(rule: LoadedRule, params: GateParams)
       title: rule.definition.description,
       reference_id: params.referenceId,
       reference_type: params.referenceType,
+      location_name: locationName,
       requested_by_staff_id: params.requestedByStaffId,
       requested_by_staff_name: params.requestedByStaffName,
       requested_date_time: requestedAt,

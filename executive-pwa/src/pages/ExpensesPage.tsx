@@ -2,10 +2,18 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { PageShell } from '../components/PageShell';
 import { PeriodFilter, resolvePeriod, priorPeriod, type PeriodPreset } from '../components/PeriodFilter';
+import { StaleDataBanner } from '../components/StaleDataBanner';
+import { readCache, writeCache } from '../lib/offlineCache';
 import { fetchExpenseRollup, fetchLastRefreshed, type ExpenseRollupRow } from '../lib/rollups';
 
 export interface ExpensesPageProps {
   onBack: () => void;
+}
+
+interface CachedShape {
+  rows: ExpenseRollupRow[];
+  asOf: string | null;
+  priorTotal: number | null;
 }
 
 export const ExpensesPage: React.FC<ExpensesPageProps> = ({ onBack }) => {
@@ -14,25 +22,40 @@ export const ExpensesPage: React.FC<ExpensesPageProps> = ({ onBack }) => {
   const [rows, setRows] = useState<ExpenseRollupRow[]>([]);
   const [priorTotal, setPriorTotal] = useState<number | null>(null);
   const [asOf, setAsOf] = useState<string | null>(null);
+  const [staleAsOf, setStaleAsOf] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const period = useMemo(() => resolvePeriod(preset), [preset]);
   const prior = useMemo(() => priorPeriod(period), [period]);
+  const cacheKey = `expenses:${period.from}:${period.to}:${compareEnabled}`;
 
   useEffect(() => {
     setIsLoading(true);
     setError(null);
+    setStaleAsOf(null);
     const calls: Promise<any>[] = [fetchExpenseRollup(period.from, period.to), fetchLastRefreshed('mv_expense_rollup')];
     if (compareEnabled) calls.push(fetchExpenseRollup(prior.from, prior.to));
 
     Promise.all(calls)
       .then(([current, refreshed, priorRows]) => {
+        const priorTotalValue = priorRows ? priorRows.reduce((s: number, r: ExpenseRollupRow) => s + Number(r.total_amount), 0) : null;
         setRows(current);
         setAsOf(refreshed);
-        setPriorTotal(priorRows ? priorRows.reduce((s: number, r: ExpenseRollupRow) => s + Number(r.total_amount), 0) : null);
+        setPriorTotal(priorTotalValue);
+        writeCache<CachedShape>(cacheKey, { rows: current, asOf: refreshed, priorTotal: priorTotalValue });
       })
-      .catch((err) => setError(err.message || 'Failed to load expenses'))
+      .catch((err) => {
+        const cached = readCache<CachedShape>(cacheKey);
+        if (cached) {
+          setRows(cached.data.rows);
+          setAsOf(cached.data.asOf);
+          setPriorTotal(cached.data.priorTotal);
+          setStaleAsOf(cached.cachedAt);
+        } else {
+          setError(err.message || 'Failed to load expenses');
+        }
+      })
       .finally(() => setIsLoading(false));
   }, [period.from, period.to, compareEnabled, prior.from, prior.to]);
 
@@ -71,6 +94,7 @@ export const ExpensesPage: React.FC<ExpensesPageProps> = ({ onBack }) => {
         ledger. See Chart of Accounts / P&amp;L page for the GL-linked view.
       </p>
 
+      {staleAsOf && <StaleDataBanner cachedAt={staleAsOf} />}
       {error && <div className="text-xs text-rose-400 mb-3">{error}</div>}
       {isLoading ? (
         <div className="text-xs text-slate-500">Loading…</div>

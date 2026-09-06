@@ -4,10 +4,14 @@ import { PeriodFilter, resolvePeriod, type PeriodPreset } from '../components/Pe
 import { fetchDailySales, fetchExpenseRollup } from '../lib/rollups';
 import { fetchCashBankAccounts } from '../lib/directQueries';
 import { supabase } from '../lib/supabaseClient';
+import { StaleDataBanner } from '../components/StaleDataBanner';
+import { readCache, writeCache } from '../lib/offlineCache';
 
 export interface FinancialStatementsPageProps {
   onBack: () => void;
 }
+
+const BALANCE_SHEET_CACHE_KEY = 'financial-statements:balance-sheet';
 
 // Approximated from existing transaction aggregates, NOT derived from a
 // real double-entry general ledger (no posting engine exists in this
@@ -17,22 +21,36 @@ export const FinancialStatementsPage: React.FC<FinancialStatementsPageProps> = (
   const [preset, setPreset] = useState<PeriodPreset>('30d');
   const [pnl, setPnl] = useState<{ revenue: number; cogs: number; expenses: number } | null>(null);
   const [balanceSheet, setBalanceSheet] = useState<{ cash: number; inventory: number; debtors: number; creditors: number } | null>(null);
+  const [staleAsOf, setStaleAsOf] = useState<string | null>(null);
+  const [balanceSheetStaleAsOf, setBalanceSheetStaleAsOf] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const period = useMemo(() => resolvePeriod(preset), [preset]);
+  const pnlCacheKey = `financial-statements:pnl:${period.from}:${period.to}`;
 
   useEffect(() => {
     setIsLoading(true);
     setError(null);
+    setStaleAsOf(null);
     Promise.all([fetchDailySales(period.from, period.to), fetchExpenseRollup(period.from, period.to)])
       .then(([sales, expenses]) => {
         const revenue = sales.reduce((s, r) => s + Number(r.net_revenue || 0), 0);
         const cogs = sales.reduce((s, r) => s + Number(r.cost_basis || 0), 0);
         const expenseTotal = expenses.reduce((s, r) => s + Number(r.total_amount || 0), 0);
-        setPnl({ revenue, cogs, expenses: expenseTotal });
+        const value = { revenue, cogs, expenses: expenseTotal };
+        setPnl(value);
+        writeCache(pnlCacheKey, value);
       })
-      .catch((err) => setError(err.message || 'Failed to load P&L'))
+      .catch((err) => {
+        const cached = readCache<{ revenue: number; cogs: number; expenses: number }>(pnlCacheKey);
+        if (cached) {
+          setPnl(cached.data);
+          setStaleAsOf(cached.cachedAt);
+        } else {
+          setError(err.message || 'Failed to load P&L');
+        }
+      })
       .finally(() => setIsLoading(false));
   }, [period.from, period.to]);
 
@@ -43,9 +61,17 @@ export const FinancialStatementsPage: React.FC<FinancialStatementsPageProps> = (
         const inventory = (inv.data ?? []).reduce((s: number, r: any) => s + Number(r.valuation_at_cost || 0), 0);
         const debtorsTotal = (debtors.data ?? []).reduce((s: number, r: any) => s + Number(r.total_outstanding || 0), 0);
         const creditorsTotal = (creditors.data ?? []).reduce((s: number, r: any) => s + Number(r.total_outstanding || 0), 0);
-        setBalanceSheet({ cash, inventory, debtors: debtorsTotal, creditors: creditorsTotal });
+        const value = { cash, inventory, debtors: debtorsTotal, creditors: creditorsTotal };
+        setBalanceSheet(value);
+        writeCache(BALANCE_SHEET_CACHE_KEY, value);
       })
-      .catch(() => {});
+      .catch(() => {
+        const cached = readCache<{ cash: number; inventory: number; debtors: number; creditors: number }>(BALANCE_SHEET_CACHE_KEY);
+        if (cached) {
+          setBalanceSheet(cached.data);
+          setBalanceSheetStaleAsOf(cached.cachedAt);
+        }
+      });
   }, []);
 
   const net = pnl ? pnl.revenue - pnl.cogs - pnl.expenses : 0;
@@ -74,6 +100,7 @@ export const FinancialStatementsPage: React.FC<FinancialStatementsPageProps> = (
       {tab === 'PNL' && (
         <>
           <PeriodFilter value={preset} onChange={setPreset} />
+          {staleAsOf && <StaleDataBanner cachedAt={staleAsOf} />}
           {isLoading || !pnl ? (
             <div className="text-xs text-slate-500">Loading…</div>
           ) : (
@@ -89,6 +116,7 @@ export const FinancialStatementsPage: React.FC<FinancialStatementsPageProps> = (
 
       {tab === 'BALANCE_SHEET' && (
         <>
+          {balanceSheetStaleAsOf && <StaleDataBanner cachedAt={balanceSheetStaleAsOf} />}
           {!balanceSheet ? (
             <div className="text-xs text-slate-500">Loading…</div>
           ) : (

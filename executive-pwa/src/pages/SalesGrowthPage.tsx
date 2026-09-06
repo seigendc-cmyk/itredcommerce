@@ -2,6 +2,8 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { PageShell } from '../components/PageShell';
 import { PeriodFilter, resolvePeriod, priorPeriod, type PeriodPreset } from '../components/PeriodFilter';
+import { StaleDataBanner } from '../components/StaleDataBanner';
+import { readCache, writeCache } from '../lib/offlineCache';
 import { fetchDailySales, fetchLastRefreshed } from '../lib/rollups';
 
 export interface SalesGrowthPageProps {
@@ -14,21 +16,30 @@ interface ChartPoint {
   prior?: number;
 }
 
+interface CachedShape {
+  chartData: ChartPoint[];
+  asOf: string | null;
+  growthPercent: number | null;
+}
+
 export const SalesGrowthPage: React.FC<SalesGrowthPageProps> = ({ onBack }) => {
   const [preset, setPreset] = useState<PeriodPreset>('30d');
   const [compareEnabled, setCompareEnabled] = useState(true);
   const [chartData, setChartData] = useState<ChartPoint[]>([]);
   const [asOf, setAsOf] = useState<string | null>(null);
   const [growthPercent, setGrowthPercent] = useState<number | null>(null);
+  const [staleAsOf, setStaleAsOf] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const period = useMemo(() => resolvePeriod(preset), [preset]);
   const prior = useMemo(() => priorPeriod(period), [period]);
+  const cacheKey = `sales-growth:${period.from}:${period.to}:${compareEnabled}`;
 
   useEffect(() => {
     setIsLoading(true);
     setError(null);
+    setStaleAsOf(null);
     const calls: Promise<any>[] = [fetchDailySales(period.from, period.to), fetchLastRefreshed('mv_daily_sales_summary')];
     if (compareEnabled) calls.push(fetchDailySales(prior.from, prior.to));
 
@@ -41,19 +52,30 @@ export const SalesGrowthPage: React.FC<SalesGrowthPageProps> = ({ onBack }) => {
 
         const points: ChartPoint[] = current.map((r: any, i: number) => ({ day: i + 1, current: Number(r.net_revenue || 0) }));
 
+        let growth: number | null = null;
         if (priorRows) {
           const priorTotal = priorRows.reduce((s: number, r: any) => s + Number(r.net_revenue || 0), 0);
-          setGrowthPercent(priorTotal > 0 ? ((currentTotal - priorTotal) / priorTotal) * 100 : null);
+          growth = priorTotal > 0 ? ((currentTotal - priorTotal) / priorTotal) * 100 : null;
           priorRows.forEach((r: any, i: number) => {
             if (points[i]) points[i].prior = Number(r.net_revenue || 0);
             else points.push({ day: i + 1, current: 0, prior: Number(r.net_revenue || 0) });
           });
-        } else {
-          setGrowthPercent(null);
         }
+        setGrowthPercent(growth);
         setChartData(points);
+        writeCache<CachedShape>(cacheKey, { chartData: points, asOf: refreshed, growthPercent: growth });
       })
-      .catch((err) => setError(err.message || 'Failed to load sales growth data'))
+      .catch((err) => {
+        const cached = readCache<CachedShape>(cacheKey);
+        if (cached) {
+          setChartData(cached.data.chartData);
+          setAsOf(cached.data.asOf);
+          setGrowthPercent(cached.data.growthPercent);
+          setStaleAsOf(cached.cachedAt);
+        } else {
+          setError(err.message || 'Failed to load sales growth data');
+        }
+      })
       .finally(() => setIsLoading(false));
   }, [period.from, period.to, compareEnabled, prior.from, prior.to]);
 
@@ -71,6 +93,7 @@ export const SalesGrowthPage: React.FC<SalesGrowthPageProps> = ({ onBack }) => {
         </div>
       )}
 
+      {staleAsOf && <StaleDataBanner cachedAt={staleAsOf} />}
       {error && <div className="text-xs text-rose-400 mb-3">{error}</div>}
       {isLoading ? (
         <div className="text-xs text-slate-500">Loading…</div>

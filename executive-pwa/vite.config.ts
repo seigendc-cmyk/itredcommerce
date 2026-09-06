@@ -30,12 +30,13 @@ export default defineConfig({
         ],
       },
       workbox: {
-        // App-shell caching only (per the prompt) — this PWA's data is
-        // always live Supabase reads, never cached/replayed offline; only
-        // the static shell (JS/CSS/HTML) is precached so the app *opens*
-        // offline, not so it can transact offline (DL-002: "no offline
-        // durability requirement" is Rider's line, but Executive is
-        // explicitly read-only/Supabase-only too — same spirit).
+        // App-shell caching (static JS/CSS/HTML) so the app *opens* offline —
+        // this PWA still has no offline write/transact capability (DL-002:
+        // read-only/Supabase-only). Per-page data itself is never cached by
+        // the service worker; each page instead keeps its own last-successful
+        // rollup result in localStorage (src/lib/offlineCache.ts) and falls
+        // back to it on a failed live fetch, so a dropped connection shows
+        // stale-but-present figures rather than a blank screen.
         globPatterns: ['**/*.{js,css,html,svg,png,ico}'],
       },
     }),

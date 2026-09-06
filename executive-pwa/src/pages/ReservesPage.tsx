@@ -1,15 +1,25 @@
 import React, { useEffect, useState } from 'react';
 import { PageShell } from '../components/PageShell';
 import { DataTable, type Column } from '@shared/components/ui/DataTable';
+import { StaleDataBanner } from '../components/StaleDataBanner';
+import { readCache, writeCache } from '../lib/offlineCache';
 import { fetchReserves, fetchReserveTransfers, type ReserveRow, type ReserveTransferRow } from '../lib/directQueries';
 
 export interface ReservesPageProps {
   onBack: () => void;
 }
 
+interface CachedShape {
+  reserves: ReserveRow[];
+  transfers: ReserveTransferRow[];
+}
+
+const CACHE_KEY = 'reserves';
+
 export const ReservesPage: React.FC<ReservesPageProps> = ({ onBack }) => {
   const [reserves, setReserves] = useState<ReserveRow[]>([]);
   const [transfers, setTransfers] = useState<ReserveTransferRow[]>([]);
+  const [staleAsOf, setStaleAsOf] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -18,8 +28,18 @@ export const ReservesPage: React.FC<ReservesPageProps> = ({ onBack }) => {
       .then(([r, t]) => {
         setReserves(r);
         setTransfers(t);
+        writeCache<CachedShape>(CACHE_KEY, { reserves: r, transfers: t });
       })
-      .catch((err) => setError(err.message || 'Failed to load reserves'))
+      .catch((err) => {
+        const cached = readCache<CachedShape>(CACHE_KEY);
+        if (cached) {
+          setReserves(cached.data.reserves);
+          setTransfers(cached.data.transfers);
+          setStaleAsOf(cached.cachedAt);
+        } else {
+          setError(err.message || 'Failed to load reserves');
+        }
+      })
       .finally(() => setIsLoading(false));
   }, []);
 
@@ -66,6 +86,7 @@ export const ReservesPage: React.FC<ReservesPageProps> = ({ onBack }) => {
         </div>
       </div>
 
+      {staleAsOf && <StaleDataBanner cachedAt={staleAsOf} />}
       {error && <div className="text-xs text-rose-400 mb-3">{error}</div>}
       {isLoading ? (
         <div className="text-xs text-slate-500">Loading…</div>

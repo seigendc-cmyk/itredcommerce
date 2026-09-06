@@ -1,17 +1,26 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { PageShell } from '../components/PageShell';
 import { DataTable, type Column } from '@shared/components/ui/DataTable';
+import { StaleDataBanner } from '../components/StaleDataBanner';
+import { readCache, writeCache } from '../lib/offlineCache';
 import { fetchInventoryTurnover, fetchLastRefreshed, type InventoryTurnoverRow } from '../lib/rollups';
 
 export interface InventoryTurnoverPageProps {
   onBack: () => void;
 }
 
+interface CachedShape {
+  rows: InventoryTurnoverRow[];
+  asOf: string | null;
+}
+
+const CACHE_KEY = 'inventory-turnover';
 const CLASS_FILTERS = ['ALL', 'FAST', 'NORMAL', 'SLOW', 'DEAD'] as const;
 
 export const InventoryTurnoverPage: React.FC<InventoryTurnoverPageProps> = ({ onBack }) => {
   const [rows, setRows] = useState<InventoryTurnoverRow[]>([]);
   const [asOf, setAsOf] = useState<string | null>(null);
+  const [staleAsOf, setStaleAsOf] = useState<string | null>(null);
   const [classFilter, setClassFilter] = useState<(typeof CLASS_FILTERS)[number]>('ALL');
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -21,8 +30,18 @@ export const InventoryTurnoverPage: React.FC<InventoryTurnoverPageProps> = ({ on
       .then(([t, refreshed]) => {
         setRows(t);
         setAsOf(refreshed);
+        writeCache<CachedShape>(CACHE_KEY, { rows: t, asOf: refreshed });
       })
-      .catch((err) => setError(err.message || 'Failed to load inventory turnover'))
+      .catch((err) => {
+        const cached = readCache<CachedShape>(CACHE_KEY);
+        if (cached) {
+          setRows(cached.data.rows);
+          setAsOf(cached.data.asOf);
+          setStaleAsOf(cached.cachedAt);
+        } else {
+          setError(err.message || 'Failed to load inventory turnover');
+        }
+      })
       .finally(() => setIsLoading(false));
   }, []);
 
@@ -76,6 +95,7 @@ export const InventoryTurnoverPage: React.FC<InventoryTurnoverPageProps> = ({ on
         ))}
       </div>
 
+      {staleAsOf && <StaleDataBanner cachedAt={staleAsOf} />}
       {error && <div className="text-xs text-rose-400 mb-3">{error}</div>}
       {isLoading ? (
         <div className="text-xs text-slate-500">Loading…</div>

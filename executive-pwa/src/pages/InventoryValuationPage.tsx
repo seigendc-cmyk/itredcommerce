@@ -1,11 +1,20 @@
 import React, { useEffect, useState } from 'react';
 import { PageShell } from '../components/PageShell';
 import { DataTable, type Column } from '@shared/components/ui/DataTable';
+import { StaleDataBanner } from '../components/StaleDataBanner';
+import { readCache, writeCache } from '../lib/offlineCache';
 import { fetchInventoryValuation, fetchLastRefreshed, type InventoryValuationRow } from '../lib/rollups';
 
 export interface InventoryValuationPageProps {
   onBack: () => void;
 }
+
+interface CachedShape {
+  rows: InventoryValuationRow[];
+  asOf: string | null;
+}
+
+const CACHE_KEY = 'inventory-valuation';
 
 // "Periodic comparison" for valuation means comparing this rollup's totals
 // against the previously-refreshed snapshot — the rollup only ever holds
@@ -16,6 +25,7 @@ export interface InventoryValuationPageProps {
 export const InventoryValuationPage: React.FC<InventoryValuationPageProps> = ({ onBack }) => {
   const [rows, setRows] = useState<InventoryValuationRow[]>([]);
   const [asOf, setAsOf] = useState<string | null>(null);
+  const [staleAsOf, setStaleAsOf] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -24,8 +34,18 @@ export const InventoryValuationPage: React.FC<InventoryValuationPageProps> = ({ 
       .then(([v, refreshed]) => {
         setRows(v);
         setAsOf(refreshed);
+        writeCache<CachedShape>(CACHE_KEY, { rows: v, asOf: refreshed });
       })
-      .catch((err) => setError(err.message || 'Failed to load inventory valuation'))
+      .catch((err) => {
+        const cached = readCache<CachedShape>(CACHE_KEY);
+        if (cached) {
+          setRows(cached.data.rows);
+          setAsOf(cached.data.asOf);
+          setStaleAsOf(cached.cachedAt);
+        } else {
+          setError(err.message || 'Failed to load inventory valuation');
+        }
+      })
       .finally(() => setIsLoading(false));
   }, []);
 
@@ -54,6 +74,7 @@ export const InventoryValuationPage: React.FC<InventoryValuationPageProps> = ({ 
         </div>
       </div>
 
+      {staleAsOf && <StaleDataBanner cachedAt={staleAsOf} />}
       {error && <div className="text-xs text-rose-400 mb-3">{error}</div>}
       {isLoading ? (
         <div className="text-xs text-slate-500">Loading…</div>

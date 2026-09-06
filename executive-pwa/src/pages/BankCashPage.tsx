@@ -2,6 +2,8 @@ import React, { useEffect, useState } from 'react';
 import { PageShell } from '../components/PageShell';
 import { DataTable, type Column } from '@shared/components/ui/DataTable';
 import { Modal } from '@shared/components/ui/Modal';
+import { StaleDataBanner } from '../components/StaleDataBanner';
+import { readCache, writeCache } from '../lib/offlineCache';
 import {
   fetchCashBankAccounts,
   fetchChartOfAccounts,
@@ -15,11 +17,19 @@ export interface BankCashPageProps {
   onBack: () => void;
 }
 
+interface CachedShape {
+  accounts: CashBankAccountRow[];
+  glAccounts: ChartOfAccountRow[];
+}
+
+const CACHE_KEY = 'bank-cash';
+
 export const BankCashPage: React.FC<BankCashPageProps> = ({ onBack }) => {
   const [accounts, setAccounts] = useState<CashBankAccountRow[]>([]);
   const [glAccounts, setGlAccounts] = useState<ChartOfAccountRow[]>([]);
   const [drillAccount, setDrillAccount] = useState<CashBankAccountRow | null>(null);
   const [drillTx, setDrillTx] = useState<CashBankTransactionRow[]>([]);
+  const [staleAsOf, setStaleAsOf] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -28,8 +38,18 @@ export const BankCashPage: React.FC<BankCashPageProps> = ({ onBack }) => {
       .then(([a, g]) => {
         setAccounts(a);
         setGlAccounts(g);
+        writeCache<CachedShape>(CACHE_KEY, { accounts: a, glAccounts: g });
       })
-      .catch((err) => setError(err.message || 'Failed to load bank/cash accounts'))
+      .catch((err) => {
+        const cached = readCache<CachedShape>(CACHE_KEY);
+        if (cached) {
+          setAccounts(cached.data.accounts);
+          setGlAccounts(cached.data.glAccounts);
+          setStaleAsOf(cached.cachedAt);
+        } else {
+          setError(err.message || 'Failed to load bank/cash accounts');
+        }
+      })
       .finally(() => setIsLoading(false));
   }, []);
 
@@ -73,6 +93,7 @@ export const BankCashPage: React.FC<BankCashPageProps> = ({ onBack }) => {
         account-level registry, not a full posting ledger — see governance doc DL-013.
       </p>
 
+      {staleAsOf && <StaleDataBanner cachedAt={staleAsOf} />}
       {error && <div className="text-xs text-rose-400 mb-3">{error}</div>}
       {isLoading ? (
         <div className="text-xs text-slate-500">Loading…</div>
