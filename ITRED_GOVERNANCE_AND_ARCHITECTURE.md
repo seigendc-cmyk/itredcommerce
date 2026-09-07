@@ -462,6 +462,16 @@ accepted from `Requested`/`Approved` and refused from `Dispatched`/
 `Received`, dispatch/receive/approve state guards, missing-key rejection.
 Full suite 103/103; `tsc --noEmit` shows zero new errors anywhere touched.
 
+### DL-080: Stock transfer cancellation — the corrective path DL-079 flagged as missing
+
+**Decision**: cancel is distinct from reject — reject is an approver declining a request (only valid pre-dispatch, unchanged); cancel is the requester/staff withdrawing or recalling one, and is valid from `Requested`, `Approved`, **or** `Dispatched` (not `Received` — goods may already be mixed into destination stock by then, and unwinding that safely needs a different, not-yet-built correction workflow). Cancelling from `Requested`/`Approved` has no inventory impact, same as reject. Cancelling a `Dispatched` transfer reverses the earlier `stock_on_hand` decrement (goods recalled before reaching the destination) and writes a `'Transfer Cancelled'` ledger row — the original `'Transfer Out'` row and dispatch-time audit fields (`stock_on_hand_at_dispatch`/`dispatch_shortfall_qty`) are left untouched as history, matching this codebase's insert-only-ledger convention elsewhere (`rate_config`, credit notes) rather than erasing what happened.
+
+Same idempotency shape as the other four actions (`cancel_idempotency_key`, its own UNIQUE index, required-key + pre-check + race-handler). `App.tsx`'s `handleCancelTransfer` and a minimal Cancel/Cancel & Recall button were added to `StockTransfersView.tsx` for `Approved`/`Dispatched` only — not `Requested`, since Reject already covers that stage with equivalent effect and a second button there would be redundant, not because Cancel is somehow invalid at that stage (the backend accepts it).
+
+**Verified**: 6 new tests — cancel with no inventory impact (`Requested`/`Approved`), cancel from `Dispatched` reverses stock and writes the reversal ledger row (history preserved, not erased), cancel refused from `Received` and from an already-terminal status, idempotent retry does not double-reverse.
+
+### Open item unchanged from DL-079: cancelling/reversing a `Received` transfer is still not designed — see above for why.
+
 ### DL-008: Connectivity is an explicit, subscribable signal
 
 **Decision**: Online/offline state is tracked by one connectivity monitor
@@ -3874,6 +3884,28 @@ original audit's finding and unrelated to DL-069's debtor-ledger backfill
 decision (which governs `debtor_transactions`, a table still not written to
 by any runtime code path — see this addendum's audit findings). Fixing that
 durability gap is separate work, not folded into this reconciliation fix.
+
+### DL-081: Fiscal credit-note submission on returns built — a second FiscalizationProvider method, not a negative invoice
+
+**Decision**: resolves this addendum's own open item ("the approach for fiscal credit-note submission on returns... unresolved"). `FiscalizationProvider` gains `submitCreditNote(credentials, request: FiscalCreditNoteRequest)` — a deliberate, explicit departure from DL-025's original "`submitInvoice` is the only method any caller ever calls" design. A credit note is its own fiscal document type in ZIMRA's model (a CreditDebitNote referencing the original receipt being credited), not representable as a negative-amount invoice without misrepresenting what's actually submitted — the same reasoning already visible in `credit_notes`' own Prompt 16 linkage columns (`zimra_receipt_id`/`zimra_device_id`/`zimra_receipt_global_no`/`zimra_fiscal_day_no`). Required on every provider, same as `submitInvoice` — every real fiscal integration needs credit-note support. Both existing providers implement it: ZIMRA gets the same flagged-placeholder wire format discipline as its invoice path (`/credit-notes`, unconfirmed endpoint); KRA eTIMS returns the same reference-implementation-only failure as everything else it does.
+
+**Architecture**: a parallel `fiscal_credit_note_submissions` table and `fiscalCreditNoteSubmissionService.ts` (`queueCreditNoteForFiscalization`/`attemptCreditNoteSubmission`), mirroring `fiscal_submissions`/`fiscalSubmissionService.ts`'s exact shape rather than sharing a table with a nullable/discriminator column — `fiscal_submissions.sale_id` is `NOT NULL` and FK'd to `sales_transactions` in Supabase; loosening that to fit credit notes would weaken an existing invariant for every sale-submission row to accommodate a different entity. Same "third instance of an established pattern, not a fourth different one" discipline DL-021/DL-026 already used, applied to a sibling table instead of a sibling column. Drained on the same 30s tick as sale submissions (`fiscalDrainLoop.ts` extended, not a second interval — no reason for two identically-paced polls). `credit_note_items` gained `tax_rate`/`tax_amount`/`line_total` columns (previously absent — nothing needed a line's fiscal breakdown before) so a drain-loop retry can rebuild a credit note's fiscal lines from cold SQLite, the same reason `sale_line_items` already stores this trio. `queueCreditNoteForFiscalization` is called fire-and-forget immediately after `issueCreditNote`'s transaction commits — same non-blocking discipline as sale submission; a fiscalization problem must never surface as a return failure.
+
+**Scope boundary, flagged not silently skipped**: the Settings page's submission summary/drill-down (`GET /api/fiscalization/submissions`) is not extended to include credit-note submissions in this pass — they're tracked, drained, and retried, but not yet surfaced in that UI. Left for a follow-up, consistent with how dispatch-warning UI treatment was scoped out of the stock-transfer work (DL-079).
+
+**Verified**: new tests in `creditNotes.test.ts` (a credit note issued at an actively-fiscalized branch queues a `PENDING` `fiscal_credit_note_submissions` row; an unregistered branch queues nothing) and a dedicated `fiscalCreditNoteSubmissionService.test.ts`.
+
+### DL-082: Fiscal-submission backfill sweep built
+
+**Decision**: resolves this addendum's other open item ("design of the fiscal-submission backfill sweep... unresolved"). `server/sync/fiscalBackfillSweep.ts` scans `sales_transactions` for a `COMPLETED` sale at a branch with an `ACTIVE` fiscal registration that has no matching `fiscal_submissions` row at all, and calls the existing `queueSaleForFiscalization` for each (via a newly-exported `loadSaleForFiscalization`, reused rather than duplicated). Runs on a 5-minute cadence — deliberately much coarser than either 30s drain loop, since this is a safety net for a gap that shouldn't normally exist, not a routine path. Gated on the same `connectivityMonitor` check as the drain loops. Does **not** catch a sale that was queued but is stuck `FAILED`/non-retryable — that's already visible via the existing Settings failed-count and retryable via the existing drain loop; this sweep is specifically for the "never got a row at all" gap.
+
+**Verified**: `fiscalBackfillSweep.test.ts` exercises the query directly (an orphaned `COMPLETED` sale at a registered branch is found; one that already has a submission row is not; one at an unregistered branch is not flagged).
+
+### DL-083: `ORIGINAL_METHOD` refund tracking resolved via `sale_payments`
+
+**Decision**: resolves DL-072's own open item. `sale_payments.method` already recorded tender method per sale — what was missing was `credit_notes` ever looking it up. `issueCreditNote` now resolves this once, at issuance (not read live later, so a later change to how a sale's payments are recorded can't retroactively alter an already-issued credit note's report): `credit_notes.original_tender_method_resolved` is `'CASH'` only when **every** payment on the original sale was cash, `'NON_CASH'` for anything else (including a split-tender sale with any non-cash leg — confirmed conservative default, never overstates `cashRefunds`), and left `null` when `refundMethod` isn't `ORIGINAL_METHOD` or there's no original sale to resolve against (a Direct Return). `shiftReconciliation.ts`'s `cashRefundCreditNotes` filter now also includes an `ORIGINAL_METHOD` refund when `originalTenderMethodResolved === 'CASH'` — legacy/pre-migration rows with no resolution recorded keep the prior conservative exclude-by-default behavior unchanged.
+
+**Verified**: new tests in `creditNotes.test.ts` (single-cash-payment sale resolves `CASH`; single non-cash resolves `NON_CASH`; split-tender cash+card resolves `NON_CASH`; Direct Return and non-`ORIGINAL_METHOD` refunds stay unresolved) and `shiftReconciliation.test.ts` (resolved `CASH` counts toward `cashRefunds`; resolved `NON_CASH` and unresolved both stay excluded).
 
 ### Open items (deferred to implementation prompts, not decided here)
 
