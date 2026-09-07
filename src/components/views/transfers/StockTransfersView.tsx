@@ -48,6 +48,7 @@ export interface StockTransfersViewProps {
   onDispatchTransfer: (transferId: string) => void;
   onReceiveTransfer: (transferId: string) => void;
   onRejectTransfer: (transferId: string, reason: string) => void;
+  onCancelTransfer?: (transferId: string, reason: string) => void;
 }
 
 export const StockTransfersView: React.FC<StockTransfersViewProps> = ({
@@ -63,6 +64,7 @@ export const StockTransfersView: React.FC<StockTransfersViewProps> = ({
   onDispatchTransfer,
   onReceiveTransfer,
   onRejectTransfer,
+  onCancelTransfer,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
@@ -445,33 +447,63 @@ export const StockTransfersView: React.FC<StockTransfersViewProps> = ({
                 )}
 
                 {selectedTransfer.status === 'Approved' && (
-                  <Button
-                    variant="primary"
-                    size="sm"
-                    onClick={() => {
-                      onDispatchTransfer(selectedTransfer.id);
-                      setSelectedTransfer({ ...selectedTransfer, status: 'Dispatched' });
-                    }}
-                    className="bg-blue-600 hover:bg-blue-700 text-white font-bold"
-                    leftIcon={<Truck className="w-3.5 h-3.5" />}
-                  >
-                    Dispatch Freight
-                  </Button>
+                  <>
+                    {onCancelTransfer && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          onCancelTransfer(selectedTransfer.id, 'Cancelled before dispatch');
+                          setSelectedTransfer(null);
+                        }}
+                        className="text-red-600 border-red-300"
+                      >
+                        Cancel
+                      </Button>
+                    )}
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      onClick={() => {
+                        onDispatchTransfer(selectedTransfer.id);
+                        setSelectedTransfer({ ...selectedTransfer, status: 'Dispatched' });
+                      }}
+                      className="bg-blue-600 hover:bg-blue-700 text-white font-bold"
+                      leftIcon={<Truck className="w-3.5 h-3.5" />}
+                    >
+                      Dispatch Freight
+                    </Button>
+                  </>
                 )}
 
                 {(selectedTransfer.status === 'In Transit' || selectedTransfer.status === 'Dispatched') && (
-                  <Button
-                    variant="primary"
-                    size="sm"
-                    onClick={() => {
-                      onReceiveTransfer(selectedTransfer.id);
-                      setSelectedTransfer({ ...selectedTransfer, status: 'Received' });
-                    }}
-                    className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold"
-                    leftIcon={<PackageCheck className="w-3.5 h-3.5" />}
-                  >
-                    Confirm Goods Received at Destination
-                  </Button>
+                  <>
+                    {onCancelTransfer && selectedTransfer.status === 'Dispatched' && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          onCancelTransfer(selectedTransfer.id, 'Recalled after dispatch');
+                          setSelectedTransfer(null);
+                        }}
+                        className="text-red-600 border-red-300"
+                      >
+                        Cancel &amp; Recall
+                      </Button>
+                    )}
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      onClick={() => {
+                        onReceiveTransfer(selectedTransfer.id);
+                        setSelectedTransfer({ ...selectedTransfer, status: 'Received' });
+                      }}
+                      className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold"
+                      leftIcon={<PackageCheck className="w-3.5 h-3.5" />}
+                    >
+                      Confirm Goods Received at Destination
+                    </Button>
+                  </>
                 )}
 
                 <Button

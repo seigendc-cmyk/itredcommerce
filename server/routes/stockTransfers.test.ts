@@ -16,7 +16,7 @@ process.env.DB_PATH = path.join(os.tmpdir(), `itred-stock-transfers-test-${Date.
 
 const { db } = await import('../db/connection');
 const { runMigrations } = await import('../db/migrate');
-const { approveTransfer, dispatchTransfer, receiveTransfer, rejectTransfer } = await import('./stockTransfers');
+const { approveTransfer, dispatchTransfer, receiveTransfer, rejectTransfer, cancelTransfer } = await import('./stockTransfers');
 const { ApiError } = await import('../lib/http');
 
 runMigrations();
@@ -255,4 +255,85 @@ test('a missing idempotencyKey is rejected with a 400, not silently allowed thro
     () => approveTransfer({ transferId, staffName: 'Approver One', idempotencyKey: '' as any }),
     (err: unknown) => err instanceof ApiError && err.status === 400
   );
+});
+
+// Follow-up to DL-079's "open item carried forward": cancel closes the
+// dispatched-in-error gap reject deliberately does not.
+
+test('cancel from Requested has no inventory impact', () => {
+  const transferId = uniqueId('TRF');
+  seedTransfer(transferId, [{ sku: uniqueId('SKU'), requestedQty: 1 }], { status: 'Requested' });
+  const result = cancelTransfer({ transferId, staffId: 'STF-1', staffName: 'Canceller One', reason: 'no longer needed', idempotencyKey: uniqueId('IDEMP') });
+  assert.equal(result.transfer.status, 'Cancelled');
+  assert.equal(result.transfer.cancellationReason, 'no longer needed');
+});
+
+test('cancel from Approved has no inventory impact', () => {
+  const transferId = uniqueId('TRF');
+  seedTransfer(transferId, [{ sku: uniqueId('SKU'), requestedQty: 1 }], { status: 'Approved' });
+  const result = cancelTransfer({ transferId, staffId: 'STF-1', staffName: 'Canceller One', idempotencyKey: uniqueId('IDEMP') });
+  assert.equal(result.transfer.status, 'Cancelled');
+});
+
+test('cancel from Dispatched reverses the stock decrement and writes a Transfer Cancelled ledger row', () => {
+  const sku = uniqueId('SKU');
+  const transferId = uniqueId('TRF');
+  seedInventoryItem(sku, 20);
+  seedTransfer(transferId, [{ sku, requestedQty: 5 }], { status: 'Approved' });
+  dispatchTransfer({ transferId, staffId: 'STF-1', staffName: 'Dispatcher One', idempotencyKey: uniqueId('IDEMP') });
+  assert.equal(currentStock(sku), 15, 'sanity: dispatch decremented as expected');
+
+  const result = cancelTransfer({ transferId, staffId: 'STF-2', staffName: 'Canceller One', reason: 'recalled', idempotencyKey: uniqueId('IDEMP') });
+  assert.equal(result.transfer.status, 'Cancelled');
+  assert.equal(currentStock(sku), 20, 'the dispatch decrement is fully reversed');
+
+  const cancelMovement = db.prepare(`SELECT * FROM inventory_movements WHERE sku = ? AND movement_type = 'Transfer Cancelled'`).get(sku) as any;
+  assert.ok(cancelMovement, 'expected a Transfer Cancelled reversal ledger row');
+  assert.equal(cancelMovement.quantity, 5);
+
+  // History is preserved, not erased — the original Transfer Out row and
+  // dispatch-time audit fields are untouched.
+  assert.equal(countMovements(sku, 'Transfer Out'), 1);
+});
+
+test('cancel is refused on a Received transfer — goods may already be mixed into destination stock', () => {
+  const sku = uniqueId('SKU');
+  const transferId = uniqueId('TRF');
+  seedInventoryItem(sku, 20);
+  seedTransfer(transferId, [{ sku, requestedQty: 5 }], { status: 'Approved' });
+  dispatchTransfer({ transferId, staffId: 'STF-1', staffName: 'Dispatcher One', idempotencyKey: uniqueId('IDEMP') });
+  receiveTransfer({ transferId, staffId: 'STF-2', staffName: 'Receiver One', idempotencyKey: uniqueId('IDEMP') });
+
+  assert.throws(
+    () => cancelTransfer({ transferId, staffId: 'STF-3', staffName: 'Canceller One', idempotencyKey: uniqueId('IDEMP') }),
+    (err: unknown) => err instanceof ApiError && err.code === 'INVALID_TRANSFER_STATE'
+  );
+});
+
+test('cancel is refused on an already-Cancelled or Rejected transfer', () => {
+  const transferId = uniqueId('TRF');
+  seedTransfer(transferId, [{ sku: uniqueId('SKU'), requestedQty: 1 }], { status: 'Requested' });
+  rejectTransfer({ transferId, reason: 'declined', idempotencyKey: uniqueId('IDEMP') });
+
+  assert.throws(
+    () => cancelTransfer({ transferId, staffId: 'STF-1', staffName: 'Canceller One', idempotencyKey: uniqueId('IDEMP') }),
+    (err: unknown) => err instanceof ApiError && err.code === 'INVALID_TRANSFER_STATE'
+  );
+});
+
+test('idempotent retry of cancel on a Dispatched transfer does not double-reverse stock or duplicate the ledger row', () => {
+  const sku = uniqueId('SKU');
+  const transferId = uniqueId('TRF');
+  const cancelKey = uniqueId('IDEMP');
+  seedInventoryItem(sku, 20);
+  seedTransfer(transferId, [{ sku, requestedQty: 5 }], { status: 'Approved' });
+  dispatchTransfer({ transferId, staffId: 'STF-1', staffName: 'Dispatcher One', idempotencyKey: uniqueId('IDEMP') });
+
+  const first = cancelTransfer({ transferId, staffId: 'STF-2', staffName: 'Canceller One', idempotencyKey: cancelKey });
+  assert.equal(first.alreadyProcessed, false);
+  const retry = cancelTransfer({ transferId, staffId: 'STF-2', staffName: 'Canceller One', idempotencyKey: cancelKey });
+  assert.equal(retry.alreadyProcessed, true);
+
+  assert.equal(currentStock(sku), 20, '15 + 5, not 15 + 10 — the retry never re-ran the reversal');
+  assert.equal(countMovements(sku, 'Transfer Cancelled'), 1);
 });

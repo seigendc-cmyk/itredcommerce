@@ -1230,6 +1230,18 @@ export default function App() {
     }
   };
 
+  const handleCancelTransfer = async (transferId: string, reason: string) => {
+    try {
+      const saved = await apiPost<StockTransfer>(`/transfers/${encodeURIComponent(transferId)}/cancel`, {
+        reason,
+        idempotencyKey: generateTransferActionIdempotencyKey('cancel', transferId),
+      });
+      setStockTransfers((prev) => prev.map((t) => (t.id === transferId ? saved : t)));
+    } catch (err) {
+      console.error('Failed to cancel stock transfer', err);
+    }
+  };
+
   const handleCreatePurchaseMemo = async (memo: PurchaseMemo) => {
     try {
       const saved = await apiPost<PurchaseMemo>('/purchasing/memos', memo);
@@ -1955,6 +1967,7 @@ export default function App() {
             onDispatchTransfer={handleDispatchTransfer}
             onReceiveTransfer={handleReceiveTransfer}
             onRejectTransfer={handleRejectTransfer}
+            onCancelTransfer={handleCancelTransfer}
           />
         );
 

@@ -33,6 +33,7 @@ function rowToTransfer(row: any, itemRows: any[]) {
     receivedDate: row.received_date,
     receivingNotes: row.receiving_notes,
     rejectionReason: row.rejection_reason,
+    cancellationReason: row.cancellation_reason,
     notes: row.notes,
     hasDiscrepancy: !!row.has_discrepancy,
     discrepancyReason: row.discrepancy_reason,
@@ -172,6 +173,7 @@ interface StockTransferRow {
   dispatch_idempotency_key: string | null;
   receive_idempotency_key: string | null;
   reject_idempotency_key: string | null;
+  cancel_idempotency_key: string | null;
 }
 
 function loadTransferRow(id: string): StockTransferRow | undefined {
@@ -535,6 +537,111 @@ export function rejectTransfer(params: RejectTransferParams): RejectTransferResu
   return { transfer: loadTransfer(transferId)!, alreadyProcessed: false };
 }
 
+// ============================================================
+// CANCEL — the corrective path DL-079 flagged as missing: unlike reject
+// (an approver declining a request, only valid pre-dispatch), cancel is
+// the requester/staff withdrawing or recalling one, valid from Requested,
+// Approved, OR Dispatched. Cancelling a Requested/Approved transfer has no
+// inventory impact, same as reject. Cancelling a Dispatched transfer
+// REVERSES the earlier stock_on_hand decrement (goods recalled before
+// they reached the destination) and writes a 'Transfer Cancelled' ledger
+// row — the dispatch's original 'Transfer Out' row and per-item
+// stock_on_hand_at_dispatch/dispatch_shortfall_qty are left untouched as
+// history, not erased, matching this codebase's insert-only-ledger
+// convention elsewhere (rate_config, credit notes). Not valid once
+// Received: goods may already be mixed into destination stock by then, and
+// unwinding that safely needs a different, not-yet-built correction
+// workflow, not a cancel.
+// ============================================================
+export interface CancelTransferParams {
+  transferId: string;
+  staffId: string;
+  staffName: string;
+  reason?: string;
+  idempotencyKey: string;
+}
+export interface CancelTransferResult {
+  transfer: NonNullable<ReturnType<typeof loadTransfer>>;
+  alreadyProcessed: boolean;
+}
+
+const CANCELLABLE_STATUSES = ['Requested', 'Approved', 'Dispatched'];
+
+export function cancelTransfer(params: CancelTransferParams): CancelTransferResult {
+  const { transferId, staffId, staffName, reason, idempotencyKey } = params;
+  requireIdempotencyKey(idempotencyKey);
+  const row = loadTransferRow(transferId);
+  if (!row) throw new ApiError(404, 'Transfer not found');
+
+  if (row.cancel_idempotency_key === idempotencyKey) {
+    return { transfer: loadTransfer(transferId)!, alreadyProcessed: true };
+  }
+  if (!CANCELLABLE_STATUSES.includes(row.status)) {
+    throw new ApiError(
+      409,
+      `Transfer must be in Requested, Approved, or Dispatched status to cancel it (currently ${row.status}) — once Received, goods may already be mixed into destination stock and require a different correction workflow`,
+      'INVALID_TRANSFER_STATE'
+    );
+  }
+
+  const wasDispatched = row.status === 'Dispatched';
+  const timestamp = nowIso();
+
+  applyBatchWithOutbox({
+    db,
+    tenantId: null,
+    apply: () => {
+      const entries: BatchEntry[] = [];
+
+      if (wasDispatched) {
+        const items = db.prepare('SELECT * FROM stock_transfer_items WHERE transfer_id = ?').all(row.id) as any[];
+        const invStmt = db.prepare('SELECT sku, stock_on_hand FROM inventory_items WHERE sku = ?');
+        const updateInvStmt = db.prepare('UPDATE inventory_items SET stock_on_hand = ?, last_updated = ? WHERE sku = ?');
+        const movStmt = db.prepare(
+          `INSERT INTO inventory_movements (id, timestamp, movement_type, sku, item_name, quantity, unit_cost, total_value, source_location_id, source_location_name, destination_location_id, destination_location_name, reference_document, staff_id, staff_name)
+           VALUES (@id, @timestamp, 'Transfer Cancelled', @sku, @itemName, @quantity, @unitCost, @totalValue, @sourceLocationId, @sourceLocationName, @destinationLocationId, @destinationLocationName, @referenceDocument, @staffId, @staffName)`
+        );
+
+        for (const item of items) {
+          const recalledQty = item.dispatched_qty || item.requested_qty;
+          const invRow = invStmt.get(item.sku) as { sku: string; stock_on_hand: number } | undefined;
+          if (invRow) {
+            const newStock = invRow.stock_on_hand + recalledQty;
+            updateInvStmt.run(newStock, timestamp, item.sku);
+            entries.push({ table: 'inventory_items', pkColumn: 'sku', pk: item.sku, operation: 'UPDATE', payload: { sku: item.sku, stockOnHand: newStock } });
+          }
+
+          const movId = generateId('MOV');
+          movStmt.run({
+            id: movId,
+            timestamp,
+            sku: item.sku,
+            itemName: item.description,
+            quantity: recalledQty,
+            unitCost: item.unit_cost,
+            totalValue: recalledQty * item.unit_cost,
+            sourceLocationId: row.origin_location_id,
+            sourceLocationName: row.origin_location_name,
+            destinationLocationId: row.destination_location_id,
+            destinationLocationName: row.destination_location_name,
+            referenceDocument: row.transfer_number,
+            staffId,
+            staffName,
+          });
+          entries.push({ table: 'inventory_movements', pkColumn: 'id', pk: movId, operation: 'INSERT', payload: { id: movId } });
+        }
+      }
+
+      db.prepare(`UPDATE stock_transfers SET status = 'Cancelled', cancellation_reason = ?, cancel_idempotency_key = ? WHERE id = ?`).run(reason ?? null, idempotencyKey, row.id);
+      entries.push({ table: 'stock_transfers', pkColumn: 'id', pk: row.id, operation: 'UPDATE', payload: { id: row.id, status: 'Cancelled' } });
+
+      return { result: undefined, entries };
+    },
+  });
+
+  return { transfer: loadTransfer(transferId)!, alreadyProcessed: false };
+}
+
 function isIdempotencyKeyRaceError(err: any, column: string): boolean {
   return typeof err?.message === 'string' && err.message.includes('UNIQUE') && err.message.includes(column);
 }
@@ -606,6 +713,25 @@ router.post(
       res.json(transfer);
     } catch (err: any) {
       if (isIdempotencyKeyRaceError(err, 'reject_idempotency_key')) {
+        res.json(loadTransfer(req.params.id));
+        return;
+      }
+      throw err;
+    }
+  })
+);
+
+router.post(
+  '/:id/cancel',
+  requireAccessRole(...BACK_OFFICE_WRITE_ROLES),
+  asyncHandler(async (req, res) => {
+    const staff = req.currentStaff!;
+    const { reason, idempotencyKey } = req.body as { reason?: string; idempotencyKey?: string };
+    try {
+      const { transfer } = cancelTransfer({ transferId: req.params.id, staffId: staff.id, staffName: staff.name, reason, idempotencyKey: idempotencyKey! });
+      res.json(transfer);
+    } catch (err: any) {
+      if (isIdempotencyKeyRaceError(err, 'cancel_idempotency_key')) {
         res.json(loadTransfer(req.params.id));
         return;
       }

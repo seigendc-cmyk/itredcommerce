@@ -372,6 +372,7 @@ export interface StockTransfer {
   receivedDate?: string;
   receivingNotes?: string;
   rejectionReason?: string;
+  cancellationReason?: string;
   notes?: string;
   totalItemsCount?: number;
   totalValuation?: number;
@@ -785,6 +786,11 @@ export interface CreditNote {
   terminalId?: string;
   branchId?: string;
   shiftId?: string;
+  // DL-072 follow-up: resolved once at issuance from sale_payments — 'CASH'
+  // only when every original payment was cash, 'NON_CASH' for anything
+  // else (including split tender), undefined when refundMethod isn't
+  // ORIGINAL_METHOD or there was no original sale to resolve against.
+  originalTenderMethodResolved?: 'CASH' | 'NON_CASH';
 }
 
 // --------------------------------------------------------------------
