@@ -1515,9 +1515,6 @@ export default function App() {
         {
           status,
           decisionNotes: notes,
-          decidedByStaffId: currentStaff.id,
-          decidedByStaffName: currentStaff.name,
-          decidedByRole: currentStaff.roleTitle,
         }
       );
       decided = result.request;

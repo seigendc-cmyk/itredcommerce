@@ -6,6 +6,7 @@ import { BACK_OFFICE_READ_ROLES, BACK_OFFICE_WRITE_ROLES } from '../lib/accessRo
 import { getSupabaseAdmin } from '../lib/supabaseAdmin';
 import { getInstallationConfig } from '../lib/installationConfig';
 import { insertPurchaseMemoRecord } from './purchasing/memos';
+import { authorizeApprovalDecision } from '../lib/approvalAuthorization';
 
 // DL-065's flagged gap: `approval_requests` had no route at all — not even
 // a GET — so a BI_RULE_REDIRECT ticket biRuleGate.ts writes here was
@@ -83,9 +84,6 @@ router.get(
 interface DecideBody {
   status: 'APPROVED' | 'REJECTED';
   decisionNotes?: string;
-  decidedByStaffId: string;
-  decidedByStaffName: string;
-  decidedByRole?: string;
 }
 
 // What "approve" actually does to the action a ticket blocked, keyed by
@@ -143,15 +141,36 @@ router.patch(
       throw new ApiError(409, `This request was already ${row.status.toLowerCase()} — it cannot be decided again`, 'ALREADY_DECIDED');
     }
 
+    // DL-066's flagged gap: enforce server-side the same "manager-or-above,
+    // not the original requester" rule ApprovalDetailModal.tsx already
+    // enforces client-side (see server/lib/approvalAuthorization.ts) —
+    // BACK_OFFICE_WRITE_ROLES alone was too coarse (it also admits e.g. a
+    // non-manager HEAD_OFFICE_STAFF role, and doesn't block self-approval).
+    const decider = req.currentStaff!;
+    const auth = authorizeApprovalDecision(decider, row.requested_by_staff_id);
+    if (!auth.allowed) {
+      throw new ApiError(
+        403,
+        auth.reason === 'SELF_APPROVAL'
+          ? 'You cannot decide a request you submitted yourself'
+          : 'Only a Store Manager or System Administrator may decide an approval request',
+        `FORBIDDEN_${auth.reason}`
+      );
+    }
+
     const body = req.body as DecideBody;
     if (body.status !== 'APPROVED' && body.status !== 'REJECTED') {
       throw new ApiError(400, 'status must be APPROVED or REJECTED');
     }
-    if (!body.decidedByStaffId || !body.decidedByStaffName) {
-      throw new ApiError(400, 'decidedByStaffId and decidedByStaffName are required');
-    }
 
     const decisionDateTime = new Date().toISOString();
+    // Decided-by identity comes from the authenticated session, never the
+    // request body — a client-supplied decidedByStaffId would let the
+    // self-approval check above be defeated just by lying about who's
+    // deciding.
+    const decidedByStaffId = decider.id;
+    const decidedByStaffName = decider.name;
+    const decidedByRole = decider.roleTitle;
 
     db.prepare(
       `UPDATE approval_requests
@@ -161,9 +180,9 @@ router.patch(
     ).run({
       id: row.id,
       status: body.status,
-      decidedByStaffId: body.decidedByStaffId,
-      decidedByStaffName: body.decidedByStaffName,
-      decidedByRole: body.decidedByRole ?? null,
+      decidedByStaffId,
+      decidedByStaffName,
+      decidedByRole,
       decisionDateTime,
       decisionNotes: body.decisionNotes ?? null,
     });
@@ -180,9 +199,9 @@ router.patch(
         .from('approval_requests')
         .update({
           status: body.status,
-          decided_by_staff_id: body.decidedByStaffId,
-          decided_by_staff_name: body.decidedByStaffName,
-          decided_by_role: body.decidedByRole ?? null,
+          decided_by_staff_id: decidedByStaffId,
+          decided_by_staff_name: decidedByStaffName,
+          decided_by_role: decidedByRole,
           decision_date_time: decisionDateTime,
           decision_notes: body.decisionNotes ?? null,
         })

@@ -3479,10 +3479,40 @@ reconciler already reached for the offline-block path.
   route introduces, but worth restating here since a decide endpoint is a
   more consequential place for it to matter than a memo's `requestedBy`
   field.
-- **No integration test.** Verified by `tsc --noEmit` (clean on every file
-  touched — pre-existing, unrelated failures elsewhere in the tree are
-  untouched by this work) and 49/49 server unit tests passing, plus a
-  manual smoke test confirming both routes mount and are auth-gated
-  correctly; no supertest-style route test was added since none of
-  `biRuleGate.ts`, `biRules.ts`, or `purchasing/memos.ts` — the routes this
-  one most directly extends — have one either.
+- ~~No integration test.~~ — **Resolved: see DL-067.**
+- ~~No server-side self-approval or role-tier check.~~ — **Resolved: see DL-067.**
+
+### DL-067: `approvals.ts`'s decide route enforces its own manager-or-above/no-self-approval rule server-side, and derives the decider from the session instead of the request body
+
+**Decision**: added `server/lib/approvalAuthorization.ts`, a pure
+`authorizeApprovalDecision(decider, requestedByStaffId)` function mirroring
+`ApprovalDetailModal.tsx`'s existing client-side `canDecide` gate (manager
+tier — `STORE_MANAGER` or `SYS_ADMIN` via `roles.ts`'s `MANAGER_ROLES` — and
+not the ticket's own requester), called from `PATCH /:id/decide` before any
+write. `DecideBody` no longer accepts `decidedByStaffId`/`decidedByStaffName`/
+`decidedByRole` — the route now takes those from `req.currentStaff`
+(session-verified) instead, both for the SQLite update and the Supabase
+mirror. `src/App.tsx`'s `handleApprovalDecision` no longer sends them.
+
+**Rationale**: `BACK_OFFICE_WRITE_ROLES` (checked via `requireAccessRole`)
+is the coarse `StaffAccessRole` app-surface gate — it admits any
+`HEAD_OFFICE_STAFF`, manager or not — so DL-066 shipped with no equivalent
+of the client's finer `StaffRole` check, and no self-approval check at all
+server-side. Trusting a client-supplied `decidedByStaffId` for that check
+would have been hollow regardless — the ticket's own requester could just
+lie about who's deciding — so deriving identity from the authenticated
+session (`req.currentStaff`, already populated by `requireAuth` with the
+real `StaffRole`) closes both the missing check and that trust gap in one
+change, and matches every other back-office write route's existing
+`req.currentStaff!` convention (e.g. `sales.ts`, `inventory.ts`,
+`stockTransfers.ts`).
+
+**Testing**: `server/lib/approvalAuthorization.test.ts` unit-tests the four
+decision combinations (manager/non-manager × self/other) plus the
+null-requester edge case, following this codebase's existing convention of
+testing extracted pure decision logic directly (`biRuleEngine.test.ts`,
+`terminalActivationToken.test.ts`) rather than a supertest-style HTTP test —
+still no route-level test exists anywhere in this codebase, consistent with
+DL-066's own note that none of the routes it extends have one either.
+`tsc --noEmit` introduces zero new errors on either touched file; 55/55
+server unit tests pass (was 49, +6 from this file).
