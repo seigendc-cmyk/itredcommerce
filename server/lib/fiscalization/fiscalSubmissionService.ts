@@ -192,7 +192,12 @@ export async function attemptSubmission(submissionId: string, saleHint?: SaleFor
   markResult(row, result, invoiceSequenceNumber);
 }
 
-function loadSaleForFiscalization(saleId: string, branchId: string): SaleForFiscalization | undefined {
+// Exported for server/sync/fiscalBackfillSweep.ts, which has only a bare
+// sale_id/branch_id (no in-memory sale object the way the post-checkout
+// call site does) and needs to build a real SaleForFiscalization to hand
+// to queueSaleForFiscalization — reusing this rather than duplicating the
+// cold-load shape.
+export function loadSaleForFiscalization(saleId: string, branchId: string): SaleForFiscalization | undefined {
   const saleRow = db.prepare('SELECT * FROM sales_transactions WHERE sale_id = ?').get(saleId) as any;
   if (!saleRow) return undefined;
   const itemRows = db.prepare('SELECT * FROM sale_line_items WHERE sale_id = ?').all(saleId) as any[];
