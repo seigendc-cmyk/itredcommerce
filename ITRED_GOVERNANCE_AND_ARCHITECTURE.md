@@ -3873,6 +3873,79 @@ already built on — never fabricate history or state that was never
 actually recorded, and never let a derived figure drift silently out of
 sync with the ledger that is now the source of truth.
 
+### DL-085: Debtor ledger built — backfill, live posting, FIFO payments, real ageing (Prompt 15)
+
+**Decision**: DL-069/070/084 implemented. Four choices made during the
+build, each flagged rather than silently assumed:
+
+- The opening-balance backfill (DL-069) runs as an idempotent TypeScript
+  function (`backfillOpeningBalances`) on every server startup, not a raw
+  SQL data migration and not a manual one-shot script. A raw-SQL `INSERT`
+  would bypass the outbox entirely — outbox rows need a camelCase JSON
+  payload for the Supabase sync push, which a SQL migration can't cleanly
+  produce — so the backfill goes through `applyBatchWithOutbox` like every
+  other write path. It's cheap to run unconditionally: a `NOT EXISTS`
+  per-customer guard plus a deterministic `DTX-OPEN-<customerId>` row id
+  make every run after the first a no-op query.
+- A credit sale's invoice `due_date` falls back to 30 days
+  (`DEFAULT_PAYMENT_TERMS_DAYS` in `debtorLedger.ts`) when the customer has
+  no `payment_terms_days` set. Flagged per the prompt's instruction rather
+  than silently hardcoded — this is the standard net-30 default and matches
+  the example the prompt itself proposed, but is a genuine assumption, not
+  a value read from anywhere existing.
+- A payment that would exceed the customer's total outstanding balance is
+  rejected outright (400 `PAYMENT_EXCEEDS_BALANCE`) rather than allocated
+  and left as a credit balance. Overpayment/credit-balance handling isn't
+  built — `running_balance` never goes negative under this design, keeping
+  the FIFO allocator and the ageing/live-balance computation simple. A
+  genuine overpayment (customer pays before an invoice arrives, etc.) would
+  need its own design, not an implicit side effect of this endpoint.
+- "Open" for FIFO allocation purposes is defined as `debit > 0 AND
+  running_balance > 0.0001` — the ledger's own debit/credit semantics —
+  rather than a hardcoded `transaction_type IN ('INVOICE',
+  'OPENING_BALANCE')` list, so a future debit-side type keeps working
+  without a matching change to the payment endpoint.
+
+`customers.currentBalance`/`availableCredit`/`overdueAmount` are now
+computed live in `customers.ts`'s `GET /customers` via a single join against
+`debtor_transactions`, and flow to every existing consumer (checkout credit
+limit check, `DebtorsView`, `CashFlowProjectorView`, etc.) with no changes
+needed in any of them — same field names, now live-sourced. `DebtorsView`'s
+fixed 60/30/10 fabricated ageing split is replaced by
+`computeDebtorAgingBuckets` (`src/utils/debtorAgeing.ts`), a pure function
+bucketing each customer's open rows by actual elapsed days from `due_date`,
+extracted out of the component so it's independently testable (matching
+`shiftReconciliation.ts`'s precedent) rather than left inline in a
+`useMemo`.
+
+**Scope boundaries found and deliberately not fixed in this prompt**:
+credit-note refunds with `refundMethod: 'CUSTOMER_CREDIT'`
+(`creditNotes.ts`) still never post to `debtor_transactions` or update
+`customers.currentBalance` at all — a separate, pre-existing gap, not one
+this prompt's task list named. Nor does completing a credit sale refresh
+`App.tsx`'s in-memory `customers` state — the UI shows the pre-sale balance
+until the next full `/customers` fetch, the same staleness that existed
+before this prompt (never wired to `customers` state either). Both are
+flagged for a future prompt, not silently left implying they're covered.
+
+**Testing note**: `sales.ts`'s checkout route has no direct test in this
+codebase (none existed before this prompt either — it's not extracted into
+a testable function, unlike `creditNotes.ts`/`stockTransfers.ts`). Coverage
+for "a credit sale posts an INVOICE row with the right due date" comes from
+extracting the new logic into `insertCreditSaleInvoice`
+(`debtorLedger.ts`) — the exact function the route calls, tested directly
+against a real temp SQLite db — rather than refactoring the entire checkout
+route to enable route-level testing, which was out of scope here.
+
+**Verified**: `server/lib/debtorLedger.test.ts` (backfill idempotency, due-
+date computation, invoice posting), `server/routes/customers.test.ts`
+(FIFO allocation worked example, exceeds-balance rejection, idempotent
+payment retry, due-date-ordering independent of insertion order),
+`src/utils/debtorAgeing.test.ts` (bucket boundaries, paid/payment-row
+exclusion, multi-invoice sums) — 20 new tests, full suite 144/144 passing.
+`npx tsc --noEmit` diffed against a pre-change baseline: identical error
+set, zero new errors.
+
 ### DL-072: Till-cash reconciliation only counts refunds whose `refundMethod` is cash-equivalent
 
 **Decision**: discovered while closing out DL-068 — wiring real `credit_notes`
