@@ -282,6 +282,37 @@ function mirrorRegistrationToLocalCache(row: any) {
 const PENDING_ALERT_THRESHOLD_COUNT = 5;
 const PENDING_ALERT_THRESHOLD_MINUTES = 60;
 
+interface SubmissionSummaryRow {
+  status: string;
+  non_retryable: unknown;
+  created_at: string;
+}
+
+// Exported for direct unit testing (see fiscalization.test.ts) — pulled out
+// of the /submissions handler so this can be tested without a DB. `nowMs`
+// is injectable for the same reason.
+//
+// failedCount counts non_retryable rows only — fiscal_submissions.status
+// never actually takes the literal value 'FAILED' anywhere in this
+// codebase (markResult() in fiscalSubmissionService.ts always writes
+// 'PENDING' plus this separate flag on a terminal failure), so a prior
+// `r.status === 'FAILED' || r.non_retryable` check here was dead code:
+// non_retryable alone was already doing all the real work. Removed rather
+// than left in, since a reader could otherwise assume 'FAILED' is a real,
+// reachable status value.
+export function computeSubmissionsSummary(rows: SubmissionSummaryRow[], nowMs: number = Date.now()) {
+  const pending = rows.filter((r) => r.status === 'PENDING' && !r.non_retryable);
+  const failed = rows.filter((r) => !!r.non_retryable);
+  const oldestPendingAgeMinutes = pending.length > 0 ? Math.round((nowMs - new Date(pending[pending.length - 1].created_at).getTime()) / 60000) : 0;
+
+  return {
+    pendingCount: pending.length,
+    failedCount: failed.length,
+    oldestPendingAgeMinutes,
+    alert: pending.length >= PENDING_ALERT_THRESHOLD_COUNT || oldestPendingAgeMinutes >= PENDING_ALERT_THRESHOLD_MINUTES,
+  };
+}
+
 function mapSubmissionRow(r: any) {
   return {
     id: r.id,
@@ -338,22 +369,10 @@ router.get(
       scope = 'local';
     }
 
-    const pending = rows.filter((r) => r.status === 'PENDING' && !r.non_retryable);
-    const failed = rows.filter((r) => r.status === 'FAILED' || r.non_retryable);
-    const oldestPendingAgeMinutes =
-      pending.length > 0
-        ? Math.round((Date.now() - new Date(pending[pending.length - 1].created_at).getTime()) / 60000)
-        : 0;
-
     res.json({
       scope,
       submissions: rows.map(mapSubmissionRow),
-      summary: {
-        pendingCount: pending.length,
-        failedCount: failed.length,
-        oldestPendingAgeMinutes,
-        alert: pending.length >= PENDING_ALERT_THRESHOLD_COUNT || oldestPendingAgeMinutes >= PENDING_ALERT_THRESHOLD_MINUTES,
-      },
+      summary: computeSubmissionsSummary(rows),
     });
   })
 );
