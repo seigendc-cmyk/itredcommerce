@@ -342,6 +342,126 @@ question, rather than picking LWW-vs-merge per table in isolation, is what
 keeps this tractable across ~35 tables — new tables added later just need to
 be slotted into one of the four categories, not given a bespoke rule.
 
+### DL-077: Inter-branch stock transfers are an independent subsystem, not a reuse of the delivery subsystem (retroactive)
+
+An earlier discussion floated reusing the delivery subsystem
+(`delivery_orders`, dispatch/confirmation-code flow, rider assignment) for
+inter-branch stock transfers via a branch-transfer order type. This was
+never implemented. Instead, `stock_transfers` exists today as a fully
+independent table and route (`server/routes/stockTransfers.ts`, schema in
+`20260829120600_purchasing_and_logistics.sql`), with its own RLS policies
+and no relationship to `delivery_orders` or `riders` — already correctly
+reflected as a standalone "Single-owner workflow record" in this section's
+conflict-resolution table above.
+
+**Decision**: the independent implementation is confirmed as the intended
+design, retroactively.
+
+**Rationale**: inter-branch transfers are an internal inventory-movement
+concern between branches under common ownership, not a customer-facing
+delivery with a rider, a fare, or a confirmation-code handoff to an
+external party — the two workflows don't actually share enough structure
+to justify forcing them through the same dispatch/confirmation machinery.
+The original "reuse over duplication" framing conflated two different
+kinds of goods-movement that happen to both involve a vehicle.
+
+**Note**: this decision was made without first auditing
+`stockTransfers.ts`'s own internal correctness (atomicity of
+source-decrement/destination-increment, etc.) — that remains open if
+wanted as a separate check.
+
+### DL-078: Stock transfer stock-movement, idempotency, and cancellation fixes
+
+Audit finding: `stockTransfers.ts` records `inventory_movements` ledger
+rows for both dispatch and receive, but never writes to
+`inventory_items.stock_on_hand` at either branch — every other
+inventory-affecting route in the codebase pairs its ledger row with a
+same-transaction stock update; this route is the sole outlier.
+Separately: approve/dispatch/receive/reject have no idempotency guard
+(unlike create, which has one via UNIQUE-constraint dedup), no quantity
+cap at dispatch, and reject has no state guard at all (callable on a
+Dispatched or Received transfer with no reversal).
+
+**Decisions**:
+- Dispatch is **not** hard-capped at source `stock_on_hand`. Staff may
+  override and dispatch more than current on-hand quantity shows (e.g.
+  known incoming stock not yet received into the system) — the UI must
+  show a clear warning when this happens, and the override should be
+  visible in the transfer record for later reconciliation.
+- Idempotency on approve/dispatch/receive/reject uses a dedicated
+  `idempotencyKey` column, mirroring `sales.ts`/`creditNotes.ts` exactly —
+  not an extension of create's client-generated-id dedup pattern, since
+  that pattern relies on a unique row per call and these are
+  state-transition calls against an existing row.
+- Reject is only permitted from `Requested` or `Approved` status. Once a
+  transfer is `Dispatched`, goods are physically in transit and rejection
+  is no longer a valid action — cancellation-with-reversal after dispatch
+  is a separate, not-yet-designed capability and is explicitly out of
+  scope here.
+
+**Rationale**: these three together prevent the fix for the core
+missing-stock-movement bug from introducing new double-submission or
+over-transfer risk, per the audit's own recommendation to land points 1-3
+together. The reject restriction closes an unguarded state transition
+without requiring the more complex reversal logic a post-dispatch
+cancellation would need.
+
+**Open item carried forward**: cancellation/reversal of a `Dispatched` or
+`Received` transfer is not designed. If a transfer is dispatched in error
+today, there is no corrective path within this workflow.
+
+### DL-079: Stock transfer movement, idempotency, and reject-guard fixes built (Prompt 18)
+
+**Decision**: implemented DL-078's three fixes. `dispatchTransfer`/
+`receiveTransfer` (`server/routes/stockTransfers.ts`, extracted into
+testable, Express-decoupled functions mirroring `issueCreditNote`'s shape)
+now decrement/increment `inventory_items.stock_on_hand` in the same local
+`applyBatchWithOutbox` transaction as the existing `inventory_movements`
+ledger row — no second transaction. Over-dispatch is allowed, never
+blocked, and the resulting figure is left **negative** rather than clamped
+at zero (clamping would hide the exact deficit the warning exists to
+preserve); flagged via new `stock_transfer_items.stock_on_hand_at_dispatch`/
+`dispatch_shortfall_qty` (per line) and `stock_transfers.has_dispatch_stock_warning`
+(rollup), and returned in the dispatch response as `dispatchWarnings`.
+
+Idempotency uses four separate columns —
+`approve_/dispatch_/receive_/reject_idempotency_key` — not one shared
+column or a per-action table: a single transfer legitimately goes through
+all four actions over its lifetime, so one shared column could only ever
+remember the most recent action's key, while a separate table would add a
+join for a fixed, small (four-action) set with no real benefit. Same
+required-key + pre-check + UNIQUE-constraint race-handler pattern as
+`sales.ts`/`creditNotes.ts`. Status-precondition guards were also added to
+approve/dispatch/receive, not just reject (DL-078 only explicitly scoped
+reject) — necessary so a retry carrying a *different*, freshly-generated
+key can't re-apply a mutation past its valid state; a narrow, deliberate
+extension of DL-078's own safety goal, not scope creep.
+
+`stock_transfers.status`'s schema default was normalized to `'Requested'`
+in Supabase (a cheap `ALTER COLUMN`). Local SQLite's stale `'Draft'`
+default was deliberately left as-is: SQLite has no `ALTER COLUMN`, only a
+full table rebuild would change it, and the value is already dead code
+(the route always supplies an explicit status) — not worth that risk for
+zero behavioral change.
+
+**Consequence acknowledged**: making `idempotencyKey` required on all four
+action routes would have broken the existing Approve/Dispatch/Receive/
+Reject buttons outright, so `App.tsx`'s four handlers were updated to
+generate and send one per call (fresh per click, not a persisted session
+key — these are single fire-and-forget button presses, not a multi-step
+retry flow like checkout). `StockTransfersView.tsx` itself was not given
+new UI treatment (badges/alerts) for the dispatch warning — the data is
+now available on `StockTransfer`/`StockTransferItem` for a future UI pass,
+but that presentation work was left out of this prompt's backend/schema/
+test scope.
+
+**Verified**: 14 new tests (`server/routes/stockTransfers.test.ts`) —
+multi-line dispatch/receive, over-dispatch warning (not blocked),
+idempotent retry of all four actions (no double-movement), reject
+accepted from `Requested`/`Approved` and refused from `Dispatched`/
+`Received`, dispatch/receive/approve state guards, missing-key rejection.
+Full suite 103/103; `tsc --noEmit` shows zero new errors anywhere touched.
+
 ### DL-008: Connectivity is an explicit, subscribable signal
 
 **Decision**: Online/offline state is tracked by one connectivity monitor
@@ -3516,3 +3636,377 @@ still no route-level test exists anywhere in this codebase, consistent with
 DL-066's own note that none of the routes it extends have one either.
 `tsc --noEmit` introduces zero new errors on either touched file; 55/55
 server unit tests pass (was 49, +6 from this file).
+
+## SALES FLOW AUDIT & REMEDIATION ADDENDUM (2026-09-07)
+
+Prompt 12 requested a static-read, no-changes audit of the cash sale, credit
+sale, and sales returns flows end to end — cart math, tender/change,
+persistence, outbox, fiscalization, shift reconciliation, and the debtor
+ledger — followed by a documentation-only pass recording what the audit
+found and the architectural decisions needed to unblock remediation. No
+code was executed and no fixes were applied for either the audit or this
+addendum; implementation is deferred to later prompts against the decisions
+recorded here.
+
+### Audit findings (2026-09-07, static-read audit — no code executed, no fixes applied)
+
+**Financial-integrity / compliance:**
+- Tax is calculated via a hardcoded flat 15% in `SalesView.tsx:163`
+  (`totalTax = taxableAmount * 0.15`), ignoring each item's actual
+  `taxRate` — wrong for any non-15%-rated item, even though items already
+  carry their own rate (`taxRate: liveItem.taxRate ?? 15`, `:237`) and nearby
+  code (`creditNotes.ts`) reads real per-SKU rates.
+- Per-line `taxAmount` is set once on first add to cart
+  (`SalesView.tsx:232`) and never recomputed when quantity changes
+  (`:222`, `:292` both update `lineTotal` but not `taxAmount`) — it goes
+  stale and is persisted stale to `sale_line_items.tax_amount`.
+- Credit-note refunds are calculated from the item's CURRENT tax rate
+  (`inventory_items.tax_rate`, `creditNotes.ts:74-83`) rather than the rate
+  actually frozen on the original `sale_line_items` row at time of sale —
+  even though the same file's own `GET /sale/:saleNumber` handler
+  (`:38-51`) already exposes the correct frozen rate.
+- No server-side cap prevents a credit note from refunding more than was
+  ever sold on a given line (`creditNotes.ts`'s `POST /` never checks
+  `returnQty` against `sale_line_items.quantity`; the only cap is
+  client-side, `CreditNotesView.tsx:169-175`).
+- Fiscal submission queuing (`queueSaleForFiscalization`,
+  `fiscalSubmissionService.ts:51-91`) runs as a separate, untransacted step
+  after the sale commit (`sales.ts:375` vs. `:179-356`) and swallows errors
+  with only a `console.error` (`:87-90`) — a crash or insert failure leaves
+  a `COMPLETED` sale with no `fiscal_submissions` row, and no backfill
+  sweep ever catches it (`fiscalDrainLoop.ts` only re-attempts rows that
+  already exist as `PENDING`; it never scans `sales_transactions` for a
+  sale that never got a row at all).
+- No fiscalization credit-note handling exists on the returns path at all —
+  no call to `queueSaleForFiscalization` or any equivalent exists anywhere
+  in `creditNotes.ts` or `CreditNotesView.tsx`.
+- No single shared calculation engine exists: `deterministicRulesEngine.ts`
+  contains inventory reorder, price-floor/margin, and stocktake-risk logic
+  only — no tax/discount/line-total logic. Cart math is independently
+  implemented and already diverging in three places: `SalesView.tsx:160-164`
+  (sale), `creditNotes.ts:74-83` (return refund calc), and a reconstructed
+  calculation in `App.tsx:1148-1152` (return's shift-reconciliation record,
+  which reintroduces the flat-15% bug independently of `SalesView.tsx`).
+
+**Data durability / silent data loss:**
+- `debtor_transactions` exists with full downstream wiring (outbox →
+  Supabase → `mv_debtor_aging` → executive rollup, per
+  `entityRules.ts:14` and `supabase/migrations/20260831090000_
+  executive_rollups.sql:159-178`) but is never written to at runtime by any
+  route — only `customers.current_balance` (an aggregate) is updated on
+  credit sale checkout (`sales.ts:313-325`). The only writer of
+  `debtor_transactions` anywhere in the codebase is the one-time
+  `server/db/seed.ts:517`.
+- `DebtorsView.tsx`'s ageing display (`:149-158`) is a fabricated fixed
+  60/30/10 split of a flat `overdueAmount` number, with no reference to
+  real due dates or elapsed time — inconsistent with the real (but
+  unpopulated, per above) `mv_debtor_aging` view executive-pwa reads.
+  `customers.overdue_amount` itself is only ever set once, at seed time
+  (`server/db/seed.ts:129`) — nothing recomputes it from elapsed
+  payment-terms days.
+- Payments recorded via `DebtorsView.tsx:handleRecordPayment` (`:269-300`)
+  are never persisted — `onUpdateCustomer`/`onAddDebtorTransaction` resolve
+  to pure `setState` calls in `App.tsx:1553-1561` with no `apiPost`/
+  `apiPatch` anywhere in that path. A recorded payment updates only local
+  React state and is lost on refresh.
+- Returns reach shift reconciliation via a synthetic in-memory
+  `SaleTransaction` object constructed client-side in
+  `App.tsx:handleIssueCreditNote` (`:1121-1162`) rather than a real
+  persisted refund entity — invisible to reconciliation run from
+  server-loaded data, on a different terminal, or after a page reload. This
+  synthetic record also hardcodes `terminalId: 'POS-D01'` (`:1159`)
+  regardless of the actual current terminal, and independently reintroduces
+  the flat-15%-tax bug (`:1148, :1151-1152`).
+- No inventory restock occurs on returns regardless of the per-line
+  restock-vs-quarantine choice staff make at credit-note time
+  (`CreditNotesView.tsx`'s `restock` checkbox) — the flag is captured in
+  `credit_note_items.restock` and displayed, but nothing anywhere reads it
+  to move `inventory_items.stock_on_hand` or write an `inventory_movements`
+  row.
+- No idempotency guard exists on credit note creation
+  (`creditNotes.ts:62-121` has no idempotency-key field or duplicate-
+  submission check, unlike `POST /sales`) — a retry or double-click can
+  double-issue a refund with no dedup.
+
+**Accepted trust boundary (no action required):** credit limit enforcement
+is client-side only (`PaymentTenderModal.tsx:107-112`); the server persists
+whatever balance the client computes (`sales.ts:317`). This matches the
+codebase's already-documented single-till trust-boundary decision
+(`sales.ts:138-142`'s own comment) and is not being revisited here.
+
+### DL-068: Returns post a real, server-persisted refund entity; the client-side synthetic `SaleTransaction` reconstruction is removed
+
+**Decision**: at credit-note issuance, the server persists a real refund/
+credit entity that `shiftReconciliation.ts` reads directly for tender
+reconciliation, in place of today's arrangement where the only record a
+reconciliation calculation can see is the synthetic, never-persisted
+`SaleTransaction` object `App.tsx:handleIssueCreditNote` currently
+fabricates client-side and pushes into local React state. That
+client-side construction is removed entirely, not kept as a fallback — it
+is a workaround for the absence of a real server-side entity, and keeping
+it alongside a real one would just reintroduce the exact
+divergent-calculation problem (hardcoded terminal ID, flat-15%-tax
+reconstruction) this addendum's audit findings just catalogued.
+
+**Rationale**: this is a correctness fix, not a design choice. The current
+behavior already fails the basic requirement that a return reduce the
+reconciled cash/tender total of the shift that actually processed it — it
+only works, by accident, within the single browser tab and hardcoded
+terminal ID (`'POS-D01'`) the synthetic record happens to assume. A shift
+reconciled from server-loaded data, on any other terminal, or after a
+reload, sees nothing. There is no version of "keep the client-side
+reconstruction as a fallback" that doesn't also keep the bugs that came
+with it.
+
+### DL-069: Debtor ledger backfill — one opening-balance row per customer at migration time, real invoices from then on
+
+**Decision**: when `debtor_transactions` begins being populated at runtime
+(closing the gap where credit sales and returns currently touch only the
+aggregate `customers.current_balance`/`overdue_amount` columns), existing
+customers each receive exactly one opening-balance ledger row, seeded from
+their current `customers.current_balance`/`overdue_amount` at migration
+time. Every invoice-generating event from that point forward — credit sale,
+return/credit-note refund, payment — posts its own real, individual
+`debtor_transactions` row with a genuine `due_date`, feeding the ageing
+buckets (`mv_debtor_aging`) that already correctly compute from real
+`due_date`s but have had nothing real to aggregate.
+
+**Rationale**: reconstructing historical per-invoice detail for balances
+that already exist as an aggregate would be both costly and likely
+inaccurate — the original per-invoice due dates and line-item detail behind
+today's `current_balance`/`overdue_amount` figures were never captured
+anywhere to reconstruct from. A single opening-balance row preserves
+continuity (the ledger's running balance starts from the correct existing
+number) without pretending to know history the system never recorded, and
+it unblocks the real ageing view immediately for everything going forward.
+
+### DL-070: Partial payment allocation is FIFO by due date
+
+**Decision**: a partial payment against a customer's open invoices
+allocates oldest-open-invoice-first, ordered by `debtor_transactions.
+due_date` — standard FIFO accounts-receivable practice — with no manual
+allocation UI as a prerequisite.
+
+**Rationale**: this is the simplest allocation rule that makes "ageing must
+reflect reality" (the audit finding that `DebtorsView.tsx`'s ageing is
+currently fabricated, and that a real payment reduces only a flat aggregate
+number with no allocation logic at all) actually true once
+`debtor_transactions` rows exist to allocate against, without requiring a
+manual-allocation UI to be built first as a blocking prerequisite for a
+data-integrity fix. A more flexible allocation scheme (manual selection,
+non-FIFO ordering) can be layered on top of a FIFO default later without
+disturbing already-posted ledger rows.
+
+### DL-071: Credit-note refunds net out the original line's discount proportionally, not just the frozen tax rate
+
+**Decision**: discovered while designing the shared refund function (Prompt
+13) — today's refund calculation (`creditNotes.ts:82`,
+`item.returnQty * item.unitPrice * (1 + taxRate / 100)`) uses
+`sale_line_items.unit_price`, which is the **pre-discount** unit price
+(the original line's discount is stored separately as
+`discount_amount`/`discount_percent` and never read here). A return on a
+line that was sold at a discount therefore refunds more than the customer
+ever paid for it. The shared refund function instead nets out the original
+discount proportionally: `refundAmount` is based on
+`(returnQty / originalQuantity) × (original line's post-discount,
+tax-inclusive amount)`, computed from the line's frozen
+`sale_line_items.tax_rate` and `discount_percent` — not
+`inventory_items.tax_rate` (already known-wrong per this addendum's audit
+findings) and not the pre-discount `unit_price` alone.
+
+**Rationale**: a return should refund what the customer was actually
+charged, not what the item's tag price was — the same principle already
+motivating this addendum's frozen-tax-rate finding, just extended to
+discount as well. Nothing about this was caught by the original audit
+(which flagged the wrong tax-rate *source*, not the missing discount term)
+because the audit was reading the calculation as written rather than
+deriving what a correct one requires; it surfaced only once the shared
+function actually had to specify, precisely, what "the amount originally
+charged for this line" means.
+
+### DL-072: Till-cash reconciliation only counts refunds whose `refundMethod` is cash-equivalent
+
+**Decision**: discovered while closing out DL-068 — wiring real `credit_notes`
+rows into `computeShiftTenderMetrics` (Prompt 14) surfaced that it was
+summing *every* credit note's `totalRefundAmount` into `cashRefunds`
+regardless of `refundMethod`, a bug that predates DL-068 (the removed
+synthetic `App.tsx` reconstruction had the identical blind spot — it
+inspected `tx.payments` for a completed sale but never did the equivalent
+for a refund) and was simply never exercised until refunds became real.
+`CreditNote.refundMethod` (`src/types/index.ts`) has exactly three values in
+use anywhere in this codebase — confirmed directly against
+`CreditNotesView.tsx`'s own refund-method dropdown, not assumed: `'CASH'`,
+`'CUSTOMER_CREDIT'`, and `'ORIGINAL_METHOD'`. This is a narrower, separate
+type from `PaymentMethodType` (`PaymentTenderModal.tsx`'s six-value tender
+set — `CASH`/`MOBILE_MONEY`/`BANK_TRANSFER`/`DEBIT_CARD`/`CUSTOMER_CREDIT`/
+`OTHER`); nothing in the codebase currently offers a `MOBILE_MONEY` or
+`DEBIT_CARD` refund method.
+
+Going forward, `computeShiftTenderMetrics` only sums a credit note's
+`totalRefundAmount` into `cashRefunds` when `refundMethod === 'CASH'`.
+`CUSTOMER_CREDIT` correctly affects the customer's ledger/balance instead,
+never till cash. **`ORIGINAL_METHOD` is treated as non-cash too, and this is
+a known limitation, not a resolved case**: `credit_notes` has no column
+recording what the *original sale's* tender method actually was, so when a
+cash sale is refunded via `ORIGINAL_METHOD` there is currently no reliable
+way to tell that it should count as a cash outflow. Undercounting a real
+cash refund as non-cash is judged the safer default failure mode than the
+reverse (a `CUSTOMER_CREDIT` refund wrongly draining `expectedCash`, which
+was the bug just found) — but it is a real gap: an `ORIGINAL_METHOD` refund
+of a cash sale will still under-report `cashRefunds`, and the toleranced
+cash-variance workflow (`REFUND_DIFFERENCE` reason code,
+`shiftReconciliation.ts`) is the intended catch for that discrepancy until
+`credit_notes` gains a real "original tender method" field — out of scope
+for this fix.
+
+**Rationale**: `expectedCash` exists specifically to reconcile *physical
+till cash* — a refund method that never touched the till (crediting an
+account) has no business reducing it. This is the same class of fix as
+DL-071 (a return should reflect what actually happened, not a value that's
+merely adjacent to the truth) applied to the reconciliation side rather
+than the refund-amount side.
+
+**Confirmed out of scope for this fix**: whether a `CUSTOMER_CREDIT`
+refund's balance/credit-limit adjustment is itself durably persisted.
+It is not — `App.tsx:handleIssueCreditNote` still only updates local React
+`customers` state (`setCustomers`), never a server route, matching the
+original audit's finding and unrelated to DL-069's debtor-ledger backfill
+decision (which governs `debtor_transactions`, a table still not written to
+by any runtime code path — see this addendum's audit findings). Fixing that
+durability gap is separate work, not folded into this reconciliation fix.
+
+### Open items (deferred to implementation prompts, not decided here)
+
+- **Location/structure of the shared sale-calculation engine** that
+  replaces the three currently-divergent tax/discount/line-total
+  implementations (`SalesView.tsx`, `creditNotes.ts`, and DL-068's removed
+  `App.tsx` reconstruction) — to be proposed by Claude Code for review
+  before implementation.
+- **Rounding rule and rounding direction** for monetary calculations — none
+  exists today (totals are raw floating-point products, rounded only at
+  display time via `.toFixed(2)`); to be proposed for review.
+- **Whether return restock/quarantine writes to inventory immediately** at
+  credit-note issuance, or requires an approval gate first — unresolved.
+- **Idempotency key pattern for credit note creation** — unresolved;
+  `POST /sales`'s existing pattern (`sale.idempotencyKey`,
+  `sales.ts:154-167`) is a candidate but not yet decided as the one to
+  reuse.
+- **Design of the fiscal-submission backfill sweep** (catching a
+  `COMPLETED` sale on an actively-fiscalized branch that never got a
+  `fiscal_submissions` row) **and the approach for fiscal credit-note
+  submission on returns** — both unresolved.
+- **`ORIGINAL_METHOD` refund tracking** (DL-072): `credit_notes` has no
+  column recording what the original sale's tender method actually was, so
+  an `ORIGINAL_METHOD` refund of a cash sale currently under-reports
+  `cashRefunds` in till reconciliation — caught, when it happens, by the
+  existing `REFUND_DIFFERENCE` exception reason code (not silent, but not
+  resolved). A proper fix needs a schema addition — e.g. `sale_line_items`
+  or `sales_transactions` gains a recorded tender method, or `credit_notes`
+  captures it at issuance time by looking up the original sale's payment
+  record — and is deferred pending that design decision.
+
+## ZIMRA FISCALIZATION ADDENDUM (2026-09-07)
+
+Resolves three architectural questions the pluggable fiscalization layer
+(Prompt 11, DL-023–DL-027) deliberately left open — device registration
+granularity, currency scope for initial ZIMRA wiring, and the consequence
+those two answers have for where fiscal submission actually runs — before
+any of the placeholder wire format in `zimraVirtualProvider.ts` is replaced
+with a real implementation.
+
+### DL-073: Device registration granularity — one ZIMRA fiscal device per TENANT, not per branch or terminal
+
+**Decision**: a single virtual fiscal device is registered per tenant,
+serving the whole business, not one per branch (DL-023's existing
+per-branch `fiscal_registrations` shape) or one per terminal. This is
+consistent with ZIMRA's "Virtual Fiscalisation — direct interface of the
+taxpayer Server" onboarding option (Public Notice 26 of 2024).
+
+**Rationale**: matches this platform's existing tenant-owned-credentials
+principle and avoids provisioning and renewing a separate certificate per
+branch.
+
+### DL-074: Currency scope for initial ZIMRA wiring — USD-only, ZWG deferred
+
+**Decision**: ZIMRA wiring proceeds USD-only for now; ZWG dual-currency
+support is explicitly deferred and accepted as a known limitation until a
+dedicated currency workstream is scoped. Every receipt submitted will use
+`receiptCurrency: "USD"`.
+
+**Rationale**: currency support touches the shared calculation engine, the
+debtor ledger, and the pricing model broadly enough to warrant its own
+governance cycle rather than being folded into fiscal wiring.
+
+### DL-075: Centralized fiscal submission service — an architectural consequence of DL-073
+
+**Decision**: because fiscal day state, the device certificate, and receipt
+counters (`receiptCounter`, `receiptGlobalNo`) are singular per-tenant
+resources under a tenant-wide device (DL-073), per-terminal local
+submission (today's `fiscalDrainLoop.ts` model) cannot safely assign
+sequential numbers across concurrently-operating branches. ZIMRA
+submission — device registration, fiscal day open/close, and
+`submitReceipt` calls — moves to a single centralized service (a Supabase
+Edge Function, consistent with the existing WhatsApp notification
+architecture) that holds the device certificate and is the sole caller of
+the ZIMRA API. Local terminals are unaffected: they continue completing
+sales locally and syncing through the existing outbox; only the fiscal
+submission step (and the point at which a receipt's fiscal sequence number
+is assigned) moves from local-per-install to centralized. This does **not**
+change per-invoice non-blocking behavior (DL-025/DL-026) — a sale still
+completes locally regardless of fiscal submission status.
+
+**Rationale**: a tenant-wide device with tenant-wide sequence counters has
+no safe way to be claimed concurrently by multiple independent local
+drain loops without a shared coordination point; centralizing the actual
+ZIMRA call site is that coordination point, mirroring the same
+transactional-outbox-then-independently-paced-drain shape already used
+for WhatsApp notifications rather than inventing a new mechanism.
+
+### DL-076: Device registration, certificate lifecycle, and config sync built
+
+**Decision**: implemented CSR/keypair generation (ECDSA P-256, via
+`@peculiar/x509`), AES-256-GCM encrypted certificate/key storage keyed by a
+dedicated `ZIMRA_CREDENTIALS_KEY` (distinct from the per-terminal
+`FISCAL_CREDENTIALS_KEY` — see DL-075), a centralized
+`zimra-fiscal-service` Edge Function (`register`/`syncConfig`/
+`renewCertificate`/`renewCertificateSweep`), the Express relay
+(`server/routes/zimraFiscal.ts`), and the schema additions (
+`zimra_fiscal_device`, `zimra_fiscal_day`, plus `credit_notes`/
+`inventory_items.hs_code`/`sales_transactions` columns). Verified via
+standalone crypto smoke tests (keypair generation, CSR round-trip,
+encrypt/decrypt, tamper detection); `tsc` clean.
+
+**Correction to spec transcription**: the CSR Subject's state/province RDN
+resolves as `ST`, not `S` as transcribed into Prompt 16 from the spec
+text — confirmed by round-tripping the generated CSR. Noting this so
+future spec references use `ST`.
+
+**Explicitly not built (blocked)**: `submitReceipt`, `openDay`,
+`closeDay`, and the central sequencer (DL-075) — all require Section 13
+(signature generation), not yet available.
+
+**Flagged unknowns, not yet resolved**:
+- Whether Supabase's Edge Runtime can present a TLS client certificate
+  (mTLS) via `Deno.createHttpClient` — assumed but unverified against a
+  real deployment.
+- `callFdms()` endpoint paths and response field names are placeholders,
+  unverified against ZIMRA's actual test environment
+  (`fdmsapitest.zimra.co.zw`).
+
+### Open items carried into implementation prompts (not decided here)
+
+- **Exact mechanism for triggering the central sequencer** once a sale or
+  credit note lands in Supabase via outbox sync — DB trigger vs. polling
+  vs. `pg_cron`, consistent with existing patterns.
+- **Signature generation implementation** (Section 13 of the ZIMRA spec —
+  needs full retrieval before implementation; ECDSA P-256 is proposed for
+  consistency with existing `TerminalActivationToken` signing, pending
+  confirmation against the spec's exact signing procedure).
+- **`credit_notes` schema addition** to carry the original receipt's
+  `receiptID`/`deviceID`/`receiptGlobalNo`/`fiscalDayNo` for
+  `CreditDebitNote` linkage.
+- **HS code field addition to `inventory_items`** (currently absent,
+  confirmed mandatory per receipt line for VAT payers).
+- **Fiscal day open/close operational ownership** — who/what triggers
+  `openDay` at start of business and `closeDay` at end, across a tenant
+  with multiple branches potentially operating different hours.
