@@ -1,0 +1,12 @@
+-- Resolves DL-072's ORIGINAL_METHOD open item. sale_payments.method already
+-- records tender method per sale (it always has) — what was missing was
+-- credit_notes ever looking it up. Resolved at issuance time, not read live
+-- later, so a later change to how a sale's payments are recorded can't
+-- retroactively alter what an already-issued credit note reported.
+--
+-- 'CASH' only when EVERY payment on the original sale was cash (a
+-- split-tender sale with any non-cash leg resolves to 'NON_CASH' —
+-- conservative: never overstates cashRefunds in till reconciliation). NULL
+-- when refundMethod isn't ORIGINAL_METHOD, or there's no original sale to
+-- resolve against (a Direct Return).
+ALTER TABLE credit_notes ADD COLUMN original_tender_method_resolved TEXT;

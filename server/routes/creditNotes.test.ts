@@ -51,6 +51,10 @@ function seedSaleWithLine(
   ).run(saleId, sku, overrides.quantity ?? 3, overrides.unitPrice ?? 100, overrides.discountPercent ?? 0, overrides.taxRate ?? 15);
 }
 
+function seedPayment(saleId: string, method: string, amount: number) {
+  db.prepare('INSERT INTO sale_payments (sale_id, method, amount) VALUES (?, ?, ?)').run(saleId, method, amount);
+}
+
 let counter = 0;
 function uniqueId(prefix: string): string {
   counter += 1;
@@ -281,4 +285,192 @@ test('issuing against a shift that is not OPEN is rejected', () => {
       }),
     (err: unknown) => err instanceof ApiError && err.code === 'SHIFT_NOT_OPEN'
   );
+});
+
+// DL-072 follow-up: ORIGINAL_METHOD resolution via sale_payments.
+
+test('ORIGINAL_METHOD resolves to CASH when the original sale was paid entirely in cash', () => {
+  const shiftId = uniqueId('SHIFT');
+  const saleId = uniqueId('SALE');
+  const saleNumber = uniqueId('INV');
+  const sku = uniqueId('SKU');
+  seedShift(shiftId);
+  seedInventoryItem(sku);
+  seedSaleWithLine(saleId, saleNumber, sku, { quantity: 3 });
+  seedPayment(saleId, 'CASH', 300);
+
+  const result = issueCreditNote({
+    body: {
+      originalSaleNumber: saleNumber,
+      refundMethod: 'ORIGINAL_METHOD',
+      reasonCategory: 'CUSTOMER_RETURN',
+      shiftId,
+      idempotencyKey: uniqueId('IDEMP'),
+      returnedItems: [{ sku, returnQty: 1, unitPrice: 100, reason: 'x', restock: true }],
+    },
+    staffId: 'STF-1',
+    staffName: 'Cashier One',
+  });
+
+  assert.equal(result.creditNote.originalTenderMethodResolved, 'CASH');
+});
+
+test('ORIGINAL_METHOD resolves to NON_CASH when the original sale was paid by a single non-cash method', () => {
+  const shiftId = uniqueId('SHIFT');
+  const saleId = uniqueId('SALE');
+  const saleNumber = uniqueId('INV');
+  const sku = uniqueId('SKU');
+  seedShift(shiftId);
+  seedInventoryItem(sku);
+  seedSaleWithLine(saleId, saleNumber, sku, { quantity: 3 });
+  seedPayment(saleId, 'MOBILE_MONEY', 300);
+
+  const result = issueCreditNote({
+    body: {
+      originalSaleNumber: saleNumber,
+      refundMethod: 'ORIGINAL_METHOD',
+      reasonCategory: 'CUSTOMER_RETURN',
+      shiftId,
+      idempotencyKey: uniqueId('IDEMP'),
+      returnedItems: [{ sku, returnQty: 1, unitPrice: 100, reason: 'x', restock: true }],
+    },
+    staffId: 'STF-1',
+    staffName: 'Cashier One',
+  });
+
+  assert.equal(result.creditNote.originalTenderMethodResolved, 'NON_CASH');
+});
+
+test('ORIGINAL_METHOD resolves to NON_CASH for a split-tender sale even though part of it was cash — conservative default', () => {
+  const shiftId = uniqueId('SHIFT');
+  const saleId = uniqueId('SALE');
+  const saleNumber = uniqueId('INV');
+  const sku = uniqueId('SKU');
+  seedShift(shiftId);
+  seedInventoryItem(sku);
+  seedSaleWithLine(saleId, saleNumber, sku, { quantity: 3 });
+  seedPayment(saleId, 'CASH', 150);
+  seedPayment(saleId, 'DEBIT_CARD', 150);
+
+  const result = issueCreditNote({
+    body: {
+      originalSaleNumber: saleNumber,
+      refundMethod: 'ORIGINAL_METHOD',
+      reasonCategory: 'CUSTOMER_RETURN',
+      shiftId,
+      idempotencyKey: uniqueId('IDEMP'),
+      returnedItems: [{ sku, returnQty: 1, unitPrice: 100, reason: 'x', restock: true }],
+    },
+    staffId: 'STF-1',
+    staffName: 'Cashier One',
+  });
+
+  assert.equal(result.creditNote.originalTenderMethodResolved, 'NON_CASH');
+});
+
+test('ORIGINAL_METHOD is unresolved (undefined) for a Direct Return with no original sale to check against', () => {
+  const shiftId = uniqueId('SHIFT');
+  const sku = uniqueId('SKU');
+  seedShift(shiftId);
+  seedInventoryItem(sku);
+
+  const result = issueCreditNote({
+    body: {
+      refundMethod: 'ORIGINAL_METHOD',
+      reasonCategory: 'CUSTOMER_RETURN',
+      shiftId,
+      idempotencyKey: uniqueId('IDEMP'),
+      returnedItems: [{ sku, returnQty: 1, unitPrice: 100, reason: 'no receipt', restock: true }],
+    },
+    staffId: 'STF-1',
+    staffName: 'Cashier One',
+  });
+
+  assert.equal(result.creditNote.originalTenderMethodResolved, undefined);
+});
+
+test('originalTenderMethodResolved is left unset (null) when refundMethod is not ORIGINAL_METHOD, even for an all-cash sale', () => {
+  const shiftId = uniqueId('SHIFT');
+  const saleId = uniqueId('SALE');
+  const saleNumber = uniqueId('INV');
+  const sku = uniqueId('SKU');
+  seedShift(shiftId);
+  seedInventoryItem(sku);
+  seedSaleWithLine(saleId, saleNumber, sku, { quantity: 3 });
+  seedPayment(saleId, 'CASH', 300);
+
+  const result = issueCreditNote({
+    body: {
+      originalSaleNumber: saleNumber,
+      refundMethod: 'CASH',
+      reasonCategory: 'CUSTOMER_RETURN',
+      shiftId,
+      idempotencyKey: uniqueId('IDEMP'),
+      returnedItems: [{ sku, returnQty: 1, unitPrice: 100, reason: 'x', restock: true }],
+    },
+    staffId: 'STF-1',
+    staffName: 'Cashier One',
+  });
+
+  assert.equal(result.creditNote.originalTenderMethodResolved, undefined);
+});
+
+// Fiscal credit-note submission on returns.
+
+test('issuing a credit note at a branch with an ACTIVE fiscal registration queues a fiscal_credit_note_submissions row', () => {
+  const shiftId = uniqueId('SHIFT');
+  const saleId = uniqueId('SALE');
+  const saleNumber = uniqueId('INV');
+  const sku = uniqueId('SKU');
+  const branchId = uniqueId('BR');
+  seedShift(shiftId, { branchId });
+  seedInventoryItem(sku);
+  seedSaleWithLine(saleId, saleNumber, sku, { quantity: 3, unitPrice: 100, taxRate: 15 });
+  db.prepare(
+    `INSERT INTO fiscal_registration_cache (id, branch_id, country, provider_key, integration_path, status, invoice_sequence_counter)
+     VALUES (?, ?, 'ZW', 'zimra_virtual', 'Virtual Fiscalisation API (FDMS)', 'ACTIVE', 0)`
+  ).run(uniqueId('FISCREG'), branchId);
+
+  const result = issueCreditNote({
+    body: {
+      originalSaleNumber: saleNumber,
+      refundMethod: 'CASH',
+      reasonCategory: 'CUSTOMER_RETURN',
+      shiftId,
+      idempotencyKey: uniqueId('IDEMP'),
+      returnedItems: [{ sku, returnQty: 2, unitPrice: 100, reason: 'x', restock: true }],
+    },
+    staffId: 'STF-1',
+    staffName: 'Cashier One',
+  });
+
+  const submissionRow = db.prepare('SELECT * FROM fiscal_credit_note_submissions WHERE credit_note_id = ?').get(result.creditNote.id) as any;
+  assert.ok(submissionRow, 'expected a fiscal_credit_note_submissions row to be queued');
+  assert.equal(submissionRow.status, 'PENDING');
+});
+
+test('issuing a credit note at a branch with no fiscal registration queues nothing (not required)', () => {
+  const shiftId = uniqueId('SHIFT');
+  const saleId = uniqueId('SALE');
+  const saleNumber = uniqueId('INV');
+  const sku = uniqueId('SKU');
+  seedShift(shiftId);
+  seedInventoryItem(sku);
+  seedSaleWithLine(saleId, saleNumber, sku, { quantity: 3 });
+
+  const result = issueCreditNote({
+    body: {
+      originalSaleNumber: saleNumber,
+      refundMethod: 'CASH',
+      reasonCategory: 'CUSTOMER_RETURN',
+      shiftId,
+      idempotencyKey: uniqueId('IDEMP'),
+      returnedItems: [{ sku, returnQty: 1, unitPrice: 100, reason: 'x', restock: true }],
+    },
+    staffId: 'STF-1',
+    staffName: 'Cashier One',
+  });
+
+  const submissionRow = db.prepare('SELECT * FROM fiscal_credit_note_submissions WHERE credit_note_id = ?').get(result.creditNote.id) as any;
+  assert.equal(submissionRow, undefined);
 });

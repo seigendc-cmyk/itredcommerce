@@ -1,6 +1,7 @@
 import { db } from '../db/connection';
 import { connectivityMonitor } from './connectivityInstance';
 import { attemptSubmission, resetSubmissionForRetry } from '../lib/fiscalization/fiscalSubmissionService';
+import { attemptCreditNoteSubmission } from '../lib/fiscalization/fiscalCreditNoteSubmissionService';
 import { getSupabaseAdmin } from '../lib/supabaseAdmin';
 import { env } from '../env';
 
@@ -75,6 +76,22 @@ async function drainOnce(): Promise<void> {
       await attemptSubmission(row.id);
     } catch (err) {
       console.error(`[fiscalDrainLoop] unexpected error draining submission ${row.id}:`, err);
+    }
+  }
+
+  // Credit-note submissions (fiscal_credit_note_submissions) share this
+  // same drain tick and connectivity gate rather than a second interval —
+  // no reason for the two to poll independently when they're identically
+  // paced and already gated by the same ONLINE check above.
+  const creditNoteRows = db
+    .prepare(`SELECT id FROM fiscal_credit_note_submissions WHERE status = 'PENDING' AND non_retryable = 0 ORDER BY created_at ASC LIMIT ?`)
+    .all(BATCH_SIZE) as any as PendingRow[];
+
+  for (const row of creditNoteRows) {
+    try {
+      await attemptCreditNoteSubmission(row.id);
+    } catch (err) {
+      console.error(`[fiscalDrainLoop] unexpected error draining credit note submission ${row.id}:`, err);
     }
   }
 }

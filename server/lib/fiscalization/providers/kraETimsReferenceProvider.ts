@@ -16,6 +16,12 @@ import type {
   FiscalSubmissionResult,
 } from '../types';
 
+const REFERENCE_ONLY_RESULT: FiscalSubmissionResult = {
+  outcome: 'FAILED',
+  errorMessage: 'KRA eTIMS is a reference implementation only in this build — not wired to a live endpoint.',
+  retryable: false,
+};
+
 const descriptor: FiscalizationProviderDescriptor = {
   providerKey: 'kra_etims_reference',
   countryCode: 'KE',
@@ -41,10 +47,10 @@ export const kraETimsReferenceProvider: FiscalizationProvider = {
   },
 
   async submitInvoice(): Promise<FiscalSubmissionResult> {
-    return {
-      outcome: 'FAILED',
-      errorMessage: 'KRA eTIMS is a reference implementation only in this build — not wired to a live endpoint.',
-      retryable: false,
-    };
+    return REFERENCE_ONLY_RESULT;
+  },
+
+  async submitCreditNote(): Promise<FiscalSubmissionResult> {
+    return REFERENCE_ONLY_RESULT;
   },
 };

@@ -21,6 +21,7 @@ import type {
   FiscalizationProviderDescriptor,
   FiscalConnectionTestResult,
   FiscalInvoiceRequest,
+  FiscalCreditNoteRequest,
   FiscalSubmissionResult,
 } from '../types';
 
@@ -95,6 +96,37 @@ function buildInvoicePayload(credentials: Record<string, string>, request: Fisca
   };
 }
 
+// PLACEHOLDER shape — see file header. Distinct endpoint/shape from an
+// invoice: a CreditDebitNote references the original receipt being
+// credited, per ZIMRA's own document model.
+function buildCreditNotePayload(credentials: Record<string, string>, request: FiscalCreditNoteRequest) {
+  return {
+    taxpayerTin: credentials.taxpayerTin,
+    deviceId: credentials.deviceId,
+    creditNoteNumber: request.invoiceSequenceNumber,
+    issuedAt: request.issuedAt,
+    currency: request.currency,
+    lines: request.lines.map((l) => ({
+      description: l.description,
+      quantity: l.quantity,
+      unitPrice: l.unitPrice,
+      taxRate: l.taxRate,
+      taxAmount: l.taxAmount,
+      lineTotal: l.lineTotal,
+    })),
+    subtotal: request.subtotal,
+    taxTotal: request.taxTotal,
+    grandTotal: request.grandTotal,
+    buyer: request.customerTaxId ? { name: request.customerName, tin: request.customerTaxId } : undefined,
+    originalReceipt: request.originalReceiptReference
+      ? {
+          fiscalReferenceNumber: request.originalReceiptReference.fiscalReferenceNumber,
+          invoiceSequenceNumber: request.originalReceiptReference.invoiceSequenceNumber,
+        }
+      : undefined,
+  };
+}
+
 export const zimraVirtualProvider: FiscalizationProvider = {
   descriptor,
 
@@ -144,6 +176,33 @@ export const zimraVirtualProvider: FiscalizationProvider = {
     } catch (err) {
       // Network-level failure (DNS, timeout, connection refused) — always
       // transient from this provider's point of view.
+      return { outcome: 'FAILED', errorMessage: err instanceof Error ? err.message : String(err), retryable: true };
+    }
+  },
+
+  async submitCreditNote(credentials, request): Promise<FiscalSubmissionResult> {
+    const missing = missingCredentialFields(credentials);
+    if (missing.length > 0) {
+      return { outcome: 'FAILED', errorMessage: `Missing required field(s): ${missing.join(', ')}`, retryable: false };
+    }
+    try {
+      // PLACEHOLDER endpoint path — see file header.
+      const { ok, status, json } = await callFdms(credentials, '/credit-notes', buildCreditNotePayload(credentials, request));
+      if (ok) {
+        return {
+          outcome: 'SUBMITTED',
+          fiscalReferenceNumber: json.referenceNumber ?? json.receiptId ?? undefined,
+          qrCodePayload: json.qrCodePayload ?? json.verificationUrl ?? undefined,
+          rawResponseSummary: `HTTP ${status}`,
+        };
+      }
+      const retryable = status >= 500 || status === 0;
+      return {
+        outcome: 'FAILED',
+        errorMessage: `FDMS rejected the credit note (HTTP ${status}): ${JSON.stringify(json).slice(0, 500)}`,
+        retryable,
+      };
+    } catch (err) {
       return { outcome: 'FAILED', errorMessage: err instanceof Error ? err.message : String(err), retryable: true };
     }
   },

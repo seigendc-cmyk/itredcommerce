@@ -54,6 +54,33 @@ export interface FiscalInvoiceRequest {
   customerTaxId?: string;
 }
 
+// A credit note is its own fiscal document type (a CreditDebitNote in
+// ZIMRA's terms), not a negative-amount invoice — it references the
+// original receipt being credited. originalReceiptReference is best-effort:
+// populated from the original sale's own fiscal_submissions row when one
+// exists (a SUBMITTED sale on a fiscalized branch), omitted otherwise (the
+// original sale predates fiscalization, or was never fiscalized) — a
+// provider that requires this reference for a valid submission should
+// treat its absence as a non-retryable rejection, not guess at one.
+export interface FiscalCreditNoteRequest {
+  creditNoteId: string;
+  creditNoteNumber: string;
+  branchId: string;
+  invoiceSequenceNumber: number; // allocated by claim_next_fiscal_sequence, same as an invoice
+  issuedAt: string;
+  currency: string;
+  lines: FiscalInvoiceLine[];
+  subtotal: number;
+  taxTotal: number;
+  grandTotal: number;
+  customerName?: string;
+  customerTaxId?: string;
+  originalReceiptReference?: {
+    fiscalReferenceNumber?: string;
+    invoiceSequenceNumber?: number;
+  };
+}
+
 export type FiscalSubmissionOutcome = 'SUBMITTED' | 'QUEUED_FOR_BATCH' | 'FAILED';
 
 export interface FiscalSubmissionResult {
@@ -91,6 +118,19 @@ export interface FiscalizationProvider {
    * they're talking to.
    */
   submitInvoice(credentials: Record<string, string>, request: FiscalInvoiceRequest): Promise<FiscalSubmissionResult>;
+
+  /**
+   * The credit-note counterpart to submitInvoice — a deliberate, explicit
+   * departure from this interface's original "submitInvoice is the only
+   * method any caller ever calls" design (see the governance doc's
+   * ZIMRA FISCALIZATION ADDENDUM follow-up decision). A credit note is a
+   * distinct fiscal document type in ZIMRA's own model (references the
+   * original receipt), not representable as a negative-amount invoice
+   * without misrepresenting what's actually being submitted. Required on
+   * every provider — every real fiscal integration needs credit-note
+   * support, the same way every one needs invoice support.
+   */
+  submitCreditNote(credentials: Record<string, string>, request: FiscalCreditNoteRequest): Promise<FiscalSubmissionResult>;
 
   /**
    * Batch-mode providers only — invisible to call sites, invoked by a

@@ -5,6 +5,7 @@ import { requireAuth } from '../middleware/auth';
 import { generateId, nowIso } from '../lib/ids';
 import { applyBatchWithOutbox, type BatchEntry } from '../sync/outboxWriter';
 import { calculateRefundAmount, roundCurrency } from '../../src/utils/saleCalculationEngine';
+import { queueCreditNoteForFiscalization } from '../lib/fiscalization/fiscalCreditNoteSubmissionService';
 
 const router = Router();
 router.use(requireAuth);
@@ -28,6 +29,9 @@ function rowToCreditNote(row: any, itemRows: any[]) {
     terminalId: row.terminal_id ?? undefined,
     branchId: row.branch_id ?? undefined,
     shiftId: row.shift_id ?? undefined,
+    // DL-072 follow-up: resolved once, at issuance, from sale_payments —
+    // see the resolution logic below for what "resolved" means.
+    originalTenderMethodResolved: row.original_tender_method_resolved ?? undefined,
     returnedItems: itemRows.map((r) => ({
       sku: r.sku,
       itemName: r.item_name,
@@ -145,7 +149,11 @@ export function issueCreditNote({ body, staffId, staffName }: IssueCreditNotePar
   );
 
   let totalRefundAmount = 0;
-  const refundAmountBySku = new Map<string, number>();
+  // Per-line tax breakdown, persisted onto credit_note_items (Prompt 18
+  // follow-up) so a later fiscal-submission drain-loop retry can rebuild
+  // this credit note's fiscal line items from cold SQLite, the same reason
+  // sale_line_items already stores this trio.
+  const fiscalLineDataBySku = new Map<string, { taxRate: number; taxAmount: number; lineTotal: number }>();
 
   for (const item of body.returnedItems) {
     if (!(item.returnQty > 0)) {
@@ -159,6 +167,8 @@ export function issueCreditNote({ body, staffId, staffName }: IssueCreditNotePar
       : undefined;
 
     let refundAmount: number;
+    let refundTax: number;
+    let taxRate: number;
     if (originalLine) {
       // Only enforceable when there's a real original line to check
       // against — a "Direct Return" with no originalSaleNumber, or a SKU
@@ -175,26 +185,45 @@ export function issueCreditNote({ body, staffId, staffName }: IssueCreditNotePar
         );
       }
 
-      const { refundAmount: amt } = calculateRefundAmount(
+      taxRate = originalLine.tax_rate ?? 0;
+      const calc = calculateRefundAmount(
         {
           originalQuantity: originalLine.quantity,
           unitPrice: originalLine.unit_price,
-          taxRate: originalLine.tax_rate ?? 0,
+          taxRate,
           discountPercent: originalLine.discount_percent ?? 0,
         },
         item.returnQty
       );
-      refundAmount = amt;
+      refundAmount = calc.refundAmount;
+      refundTax = calc.refundTax;
     } else {
       const invRow = inventoryLookupStmt.get(item.sku) as { tax_rate: number } | undefined;
-      const taxRate = invRow?.tax_rate ?? 0;
+      taxRate = invRow?.tax_rate ?? 0;
       refundAmount = roundCurrency(item.returnQty * item.unitPrice * (1 + taxRate / 100));
+      refundTax = roundCurrency(item.returnQty * item.unitPrice * (taxRate / 100));
     }
 
-    refundAmountBySku.set(item.sku, refundAmount);
+    fiscalLineDataBySku.set(item.sku, { taxRate, taxAmount: refundTax, lineTotal: refundAmount });
     totalRefundAmount += refundAmount;
   }
   totalRefundAmount = roundCurrency(totalRefundAmount);
+
+  // ORIGINAL_METHOD resolution (DL-072 follow-up): sale_payments already
+  // records tender method per sale — resolve it once, here, rather than
+  // leaving refundMethod === 'ORIGINAL_METHOD' unresolved for till
+  // reconciliation to guess at later. 'CASH' only when every payment on the
+  // original sale was cash; a split-tender sale with any non-cash leg
+  // resolves to 'NON_CASH' (conservative — never overstates cashRefunds).
+  // null when refundMethod isn't ORIGINAL_METHOD, or there's no original
+  // sale to resolve against (a Direct Return).
+  let originalTenderMethodResolved: string | null = null;
+  if (body.refundMethod === 'ORIGINAL_METHOD' && originalSaleRow) {
+    const paymentRows = db.prepare('SELECT method FROM sale_payments WHERE sale_id = ?').all(originalSaleRow.sale_id) as Array<{ method: string }>;
+    if (paymentRows.length > 0) {
+      originalTenderMethodResolved = paymentRows.every((p) => p.method === 'CASH') ? 'CASH' : 'NON_CASH';
+    }
+  }
 
   applyBatchWithOutbox({
     db,
@@ -204,8 +233,8 @@ export function issueCreditNote({ body, staffId, staffName }: IssueCreditNotePar
       const entries: BatchEntry[] = [];
 
       db.prepare(
-        `INSERT INTO credit_notes (id, original_sale_number, customer_id, customer_name, cashier_id, cashier_name, date_time, total_refund_amount, refund_method, reason_category, status, terminal_id, branch_id, shift_id, idempotency_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ISSUED', ?, ?, ?, ?)`
+        `INSERT INTO credit_notes (id, original_sale_number, customer_id, customer_name, cashier_id, cashier_name, date_time, total_refund_amount, refund_method, reason_category, status, terminal_id, branch_id, shift_id, idempotency_key, original_tender_method_resolved)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ISSUED', ?, ?, ?, ?, ?)`
       ).run(
         id,
         body.originalSaleNumber ?? null,
@@ -220,7 +249,8 @@ export function issueCreditNote({ body, staffId, staffName }: IssueCreditNotePar
         shiftRow.terminal_id,
         shiftRow.branch_id,
         shiftRow.id,
-        body.idempotencyKey
+        body.idempotencyKey,
+        originalTenderMethodResolved
       );
       entries.push({
         table: 'credit_notes',
@@ -231,12 +261,24 @@ export function issueCreditNote({ body, staffId, staffName }: IssueCreditNotePar
       });
 
       const itemStmt = db.prepare(
-        `INSERT INTO credit_note_items (credit_note_id, sku, item_name, return_qty, unit_price, reason, restock)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO credit_note_items (credit_note_id, sku, item_name, return_qty, unit_price, reason, restock, tax_rate, tax_amount, line_total)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       );
       for (const item of body.returnedItems) {
         const doRestock = item.restock !== false;
-        itemStmt.run(id, item.sku, item.itemName ?? null, item.returnQty, item.unitPrice, item.reason, doRestock ? 1 : 0);
+        const fiscalLineData = fiscalLineDataBySku.get(item.sku);
+        itemStmt.run(
+          id,
+          item.sku,
+          item.itemName ?? null,
+          item.returnQty,
+          item.unitPrice,
+          item.reason,
+          doRestock ? 1 : 0,
+          fiscalLineData?.taxRate ?? null,
+          fiscalLineData?.taxAmount ?? null,
+          fiscalLineData?.lineTotal ?? null
+        );
         const lineId = String(db.prepare('SELECT last_insert_rowid() AS id').get()!.id);
         entries.push({ table: 'credit_note_items', pkColumn: 'id', pk: lineId, operation: 'INSERT', payload: { ...item, creditNoteId: id } });
 
@@ -305,6 +347,31 @@ export function issueCreditNote({ body, staffId, staffName }: IssueCreditNotePar
 
   const row = db.prepare('SELECT * FROM credit_notes WHERE id = ?').get(id) as any;
   const itemRows = db.prepare('SELECT * FROM credit_note_items WHERE credit_note_id = ?').all(id) as any[];
+
+  // Fiscal credit-note submission: fire-and-forget, right after commit,
+  // same non-blocking discipline as sales.ts's queueSaleForFiscalization —
+  // a fiscalization problem must never surface as a return failure. No-op
+  // entirely if this branch has no ACTIVE fiscal registration.
+  queueCreditNoteForFiscalization({
+    creditNoteId: id,
+    creditNoteNumber: id,
+    branchId: shiftRow.branch_id,
+    dateTime,
+    lines: itemRows.map((r) => ({
+      description: r.item_name ?? r.sku,
+      quantity: r.return_qty,
+      unitPrice: r.unit_price,
+      taxRate: r.tax_rate ?? 0,
+      taxAmount: r.tax_amount ?? 0,
+      lineTotal: r.line_total ?? r.return_qty * r.unit_price,
+    })),
+    subtotal: roundCurrency(totalRefundAmount - itemRows.reduce((sum, r) => sum + (r.tax_amount ?? 0), 0)),
+    taxTotal: roundCurrency(itemRows.reduce((sum, r) => sum + (r.tax_amount ?? 0), 0)),
+    grandTotal: totalRefundAmount,
+    customerName: body.customerName ?? null,
+    originalSaleId: originalSaleRow?.sale_id ?? null,
+  });
+
   return { creditNote: rowToCreditNote(row, itemRows), alreadyProcessed: false };
 }
 
