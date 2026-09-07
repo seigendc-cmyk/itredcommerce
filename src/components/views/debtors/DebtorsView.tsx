@@ -41,6 +41,7 @@ import {
   ApprovalRequest 
 } from '../../../types';
 import { isManager } from '../../../utils/roles';
+import { computeDebtorAgingBuckets } from '../../../utils/debtorAgeing';
 import { Button } from '../../ui/Button';
 
 export interface DebtorsViewProps {
@@ -49,6 +50,18 @@ export interface DebtorsViewProps {
   debtorTransactions?: DebtorTransaction[];
   onUpdateCustomer: (customer: Customer) => void;
   onAddDebtorTransaction: (transaction: DebtorTransaction) => void;
+  // DL-069/070/084 (Prompt 15): real server-side payment recording, FIFO-
+  // allocated against open invoices. Distinct from onUpdateCustomer/
+  // onAddDebtorTransaction above, which stay wired to this view's other,
+  // still-client-side-only flows (new customer, credit limit edit) —
+  // out of scope for this prompt.
+  onRecordPayment: (
+    customerId: string,
+    amount: number,
+    method: PaymentMethodType,
+    reference: string,
+    notes: string
+  ) => Promise<{ customer: Customer; payment: DebtorTransaction } | null>;
   onCreateApprovalRequest: (request: Partial<ApprovalRequest>) => void;
   onBackToLanding: () => void;
   onNavigateToPOS?: () => void;
@@ -60,6 +73,7 @@ export const DebtorsView: React.FC<DebtorsViewProps> = ({
   debtorTransactions = [],
   onUpdateCustomer,
   onAddDebtorTransaction,
+  onRecordPayment,
   onCreateApprovalRequest,
   onBackToLanding,
   onNavigateToPOS,
@@ -145,28 +159,17 @@ export const DebtorsView: React.FC<DebtorsViewProps> = ({
     });
   }, [safeCustomers, searchTerm, filterCreditStatus, filterOverdueOnly]);
 
-  // Aging Analysis Calculations
-  const agingData = useMemo(() => {
-    return safeCustomers
-      .filter(c => (c.currentBalance || 0) > 0)
-      .map(c => {
-        const bal = c.currentBalance || 0;
-        const overdue = c.overdueAmount || 0;
-        const current0To30 = Math.max(0, bal - overdue);
-        const days31To60 = overdue > 0 ? overdue * 0.6 : 0;
-        const days61To90 = overdue > 0 ? overdue * 0.3 : 0;
-        const days90Plus = overdue > 0 ? overdue * 0.1 : 0;
-
-        return {
-          customer: c,
-          current0To30,
-          days31To60,
-          days61To90,
-          days90Plus,
-          total: bal,
-        };
-      });
-  }, [customers]);
+  // Aging Analysis Calculations — DL-069/070/084 (Prompt 15): real buckets
+  // computed from each customer's open debtor_transactions rows (see
+  // computeDebtorAgingBuckets), against *this device's* current date
+  // (DL-084: head-office ageing is computed locally, offline-first, not
+  // from Supabase's mv_debtor_aging — so it can transiently disagree with
+  // the Executive PWA between syncs). Replaces the previous fabricated
+  // fixed 60/30/10 split of overdueAmount.
+  const agingData = useMemo(
+    () => computeDebtorAgingBuckets(safeCustomers, safeTransactions),
+    [safeCustomers, safeTransactions]
+  );
 
   const agingTotals = useMemo(() => {
     return agingData.reduce((acc, row) => {
@@ -265,62 +268,44 @@ export const DebtorsView: React.FC<DebtorsViewProps> = ({
     setIsCreditApprovalModalOpen(false);
   };
 
-  // Handle Recording Customer Payment
-  const handleRecordPayment = (e: React.FormEvent) => {
+  // Handle Recording Customer Payment — DL-069/070/084 (Prompt 15): real
+  // server-side FIFO allocation via onRecordPayment, replacing the previous
+  // client-computed balance that only ever reached setState.
+  const [isSubmittingPayment, setIsSubmittingPayment] = useState<boolean>(false);
+  const [paymentError, setPaymentError] = useState<string>('');
+
+  const handleRecordPayment = async (e: React.FormEvent) => {
     e.preventDefault();
     const cust = customers.find(c => c.id === paymentCustomerId);
-    if (!cust || paymentAmount <= 0) return;
+    if (!cust || paymentAmount <= 0 || isSubmittingPayment) return;
 
-    const newBalance = Math.max(0, cust.currentBalance - paymentAmount);
-    const newAvailable = Math.max(0, cust.creditLimit - newBalance);
-    const newOverdue = Math.max(0, (cust.overdueAmount || 0) - paymentAmount);
+    setPaymentError('');
+    setIsSubmittingPayment(true);
+    const balanceBefore = cust.currentBalance;
+    try {
+      const result = await onRecordPayment(cust.id, paymentAmount, paymentMethod, paymentRef, paymentNotes);
+      if (!result) {
+        setPaymentError('Could not record this payment — please try again.');
+        return;
+      }
 
-    const updatedCustomer: Customer = {
-      ...cust,
-      currentBalance: newBalance,
-      availableCredit: newAvailable,
-      overdueAmount: newOverdue,
-      lastPaymentDate: new Date().toISOString().split('T')[0],
-      lastPaymentAmount: paymentAmount,
-      lastPaymentRef: paymentRef,
-      debtorStatus: newOverdue > 0 ? 'OVERDUE' : 'GOOD_STANDING',
-    };
+      setPaymentSuccessReceipt({
+        receiptNumber: result.payment.referenceNumber,
+        customerName: cust.name,
+        accountNumber: cust.accountNumber,
+        company: cust.companyName,
+        amount: paymentAmount,
+        method: paymentMethod,
+        balanceBefore,
+        balanceAfter: result.customer.currentBalance,
+        date: result.payment.dateTime,
+        receivedBy: currentStaff.name,
+      });
 
-    onUpdateCustomer(updatedCustomer);
-
-    const newTx: DebtorTransaction = {
-      id: `DTX-${Date.now()}`,
-      customerId: cust.id,
-      customerName: cust.name,
-      accountNumber: cust.accountNumber,
-      dateTime: new Date().toISOString().replace('T', ' ').slice(0, 16),
-      transactionType: 'PAYMENT',
-      referenceNumber: paymentRef,
-      description: paymentNotes || 'Customer Account Settlement Receipt',
-      debit: 0,
-      credit: paymentAmount,
-      runningBalance: newBalance,
-      status: 'PAID',
-      paymentMethod: paymentMethod,
-      cashierOrStaffName: currentStaff.name,
-    };
-
-    onAddDebtorTransaction(newTx);
-
-    setPaymentSuccessReceipt({
-      receiptNumber: paymentRef,
-      customerName: cust.name,
-      accountNumber: cust.accountNumber,
-      company: cust.companyName,
-      amount: paymentAmount,
-      method: paymentMethod,
-      balanceBefore: cust.currentBalance,
-      balanceAfter: newBalance,
-      date: newTx.dateTime,
-      receivedBy: currentStaff.name,
-    });
-
-    setIsPaymentModalOpen(false);
+      setIsPaymentModalOpen(false);
+    } finally {
+      setIsSubmittingPayment(false);
+    }
   };
 
   return (
@@ -1369,17 +1354,24 @@ export const DebtorsView: React.FC<DebtorsViewProps> = ({
                 />
               </div>
 
+              {paymentError && (
+                <div className="text-red-400 bg-red-950/40 border border-red-800 rounded-lg px-3 py-2">
+                  {paymentError}
+                </div>
+              )}
+
               <div className="flex justify-end gap-3 pt-3 border-t border-slate-800">
                 <Button
                   type="button"
                   variant="ghost"
                   onClick={() => setIsPaymentModalOpen(false)}
+                  disabled={isSubmittingPayment}
                 >
                   Cancel
                 </Button>
-                <Button type="submit" className="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold">
+                <Button type="submit" disabled={isSubmittingPayment} className="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold">
                   <CheckCircle2 className="w-4 h-4 mr-2" />
-                  Post Payment & Issue Receipt
+                  {isSubmittingPayment ? 'Posting…' : 'Post Payment & Issue Receipt'}
                 </Button>
               </div>
             </form>

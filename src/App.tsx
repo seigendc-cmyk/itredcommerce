@@ -629,13 +629,15 @@ export default function App() {
 
     (async () => {
       try {
-        const [items, customerList, currentShift] = await Promise.all([
+        const [items, customerList, debtorTxList, currentShift] = await Promise.all([
           apiGet<InventoryItem[]>('/inventory/items'),
           apiGet<Customer[]>('/customers'),
+          apiGet<DebtorTransaction[]>('/customers/debtor-transactions'),
           apiGet<Shift | null>(`/shifts/current?terminalId=${encodeURIComponent(currentTerminalId)}`),
         ]);
         setInventoryItems(items);
         setCustomers(customerList);
+        setDebtorTransactions(debtorTxList);
         // Replace this terminal's shift state with the real backend truth —
         // otherwise a stale mock-seeded "open" shift for this terminal can
         // never be cleared and permanently blocks opening a real one.
@@ -1572,6 +1574,36 @@ export default function App() {
     setDebtorTransactions((prev) => [transaction, ...prev]);
   };
 
+  // DL-069/070/084 (Prompt 15): real server-side payment recording —
+  // replaces DebtorsView's old handleRecordPayment, which computed a new
+  // balance client-side and only ever called setState (lost on refresh).
+  // The server allocates FIFO against open invoices and returns every row
+  // it touched so local state can merge without a full refetch.
+  const generateDebtorPaymentIdempotencyKey = (customerId: string): string =>
+    `DTXPAY-${customerId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  const handleRecordDebtorPayment = async (
+    customerId: string,
+    amount: number,
+    method: PaymentMethodType,
+    reference: string,
+    notes: string
+  ): Promise<{ customer: Customer; payment: DebtorTransaction } | null> => {
+    try {
+      const result = await apiPost<{ payment: DebtorTransaction; updatedInvoices: DebtorTransaction[]; customer: Customer }>(
+        `/customers/${encodeURIComponent(customerId)}/payments`,
+        { amount, method, reference, notes, idempotencyKey: generateDebtorPaymentIdempotencyKey(customerId) }
+      );
+      const touchedIds = new Set([result.payment.id, ...result.updatedInvoices.map((t) => t.id)]);
+      setDebtorTransactions((prev) => [result.payment, ...result.updatedInvoices, ...prev.filter((t) => !touchedIds.has(t.id))]);
+      setCustomers((prev) => prev.map((c) => (c.id === result.customer.id ? result.customer : c)));
+      return { customer: result.customer, payment: result.payment };
+    } catch (err) {
+      console.error('Failed to record customer payment', err);
+      return null;
+    }
+  };
+
   const handleUpdateSupplier = (updatedSupplier: Supplier) => {
     setSuppliers((prev) =>
       prev.map((s) => (s.code === updatedSupplier.code ? updatedSupplier : s))
@@ -2085,6 +2117,7 @@ export default function App() {
             debtorTransactions={debtorTransactions}
             onUpdateCustomer={handleUpdateCustomer}
             onAddDebtorTransaction={handleAddDebtorTransaction}
+            onRecordPayment={handleRecordDebtorPayment}
             onCreateApprovalRequest={handleCreateApprovalRequest}
             onBackToLanding={() => handleNavigate('LANDING')}
             onNavigateToPOS={() => handleNavigate('SALES_CASH')}

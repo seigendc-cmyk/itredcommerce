@@ -5,6 +5,7 @@ import { requireAuth } from '../middleware/auth';
 import { generateId, nowIso } from '../lib/ids';
 import { applyBatchWithOutbox, type BatchEntry } from '../sync/outboxWriter';
 import { queueSaleForFiscalization } from '../lib/fiscalization/fiscalSubmissionService';
+import { insertCreditSaleInvoice } from '../lib/debtorLedger';
 
 const router = Router();
 router.use(requireAuth);
@@ -311,10 +312,15 @@ router.post(
           }
 
           if (body.updatedCustomer) {
+            // DL-084: current_balance/available_credit are deprecated stored
+            // aggregates — no longer written here, only computed live from
+            // debtor_transactions (see customers.ts). last_purchase_* are
+            // informational, not balance figures, so they still get written
+            // from the client-supplied blob.
             const c = body.updatedCustomer;
             db.prepare(
-              `UPDATE customers SET current_balance = ?, available_credit = ?, last_purchase_date = ?, last_purchase_amount = ?, last_purchase_ref = ? WHERE id = ?`
-            ).run(c.currentBalance, c.availableCredit, c.lastPurchaseDate ?? dateTime, c.lastPurchaseAmount ?? sale.grandTotal, c.lastPurchaseRef ?? sale.saleNumber, c.id);
+              `UPDATE customers SET last_purchase_date = ?, last_purchase_amount = ?, last_purchase_ref = ? WHERE id = ?`
+            ).run(c.lastPurchaseDate ?? dateTime, c.lastPurchaseAmount ?? sale.grandTotal, c.lastPurchaseRef ?? sale.saleNumber, c.id);
             entries.push({
               table: 'customers',
               pkColumn: 'id',
@@ -322,6 +328,21 @@ router.post(
               operation: 'UPDATE',
               payload: c as unknown as Record<string, unknown>,
             });
+          }
+
+          // DL-069/084 (Prompt 15): a credit sale posts a real debtor_transactions
+          // INVOICE row alongside the sale, closing the gap where only the
+          // (now-deprecated) customers.current_balance aggregate was updated.
+          // due_date falls back to a default when the customer has no
+          // payment_terms_days set — see insertCreditSaleInvoice/DL-085.
+          if (sale.transactionType === 'CREDIT_SALE' && customerId) {
+            const invoiceEntry = insertCreditSaleInvoice(db, {
+              customerId,
+              saleNumber: sale.saleNumber,
+              saleDateTime: dateTime,
+              grandTotal: sale.grandTotal,
+            });
+            if (invoiceEntry) entries.push(invoiceEntry);
           }
 
           if (body.newActivityEvent) {

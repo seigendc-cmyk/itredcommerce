@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import { env } from './env';
 import { runMigrations } from './db/migrate';
 import { seedIfEmpty } from './db/seed';
+import { db } from './db/connection';
+import { backfillOpeningBalances } from './lib/debtorLedger';
 import { sessionMiddleware } from './middleware/session';
 import { ApiError } from './lib/http';
 import authRouter from './routes/auth';
@@ -55,6 +57,12 @@ runMigrations();
 if (!env.isProduction) {
   seedIfEmpty();
 }
+
+// DL-069/084 (Prompt 15): one-time-per-customer opening-balance backfill,
+// run after seeding so dev/demo customers get a real ledger row too, not
+// just production installs. Cheap no-op on every subsequent boot once every
+// existing customer has been covered — see debtorLedger.ts's header comment.
+backfillOpeningBalances(db);
 
 // A fresh install has no TENANT_ID env var — if the Business Profile
 // onboarding wizard already ran in a previous process (this is a restart,
