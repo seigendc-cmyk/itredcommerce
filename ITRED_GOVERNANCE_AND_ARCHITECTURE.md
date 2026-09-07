@@ -3834,6 +3834,45 @@ deriving what a correct one requires; it surfaced only once the shared
 function actually had to specify, precisely, what "the amount originally
 charged for this line" means.
 
+### DL-084: Debtor ledger implementation decisions (Prompt 15)
+
+**Decision**: building on DL-069 (opening-balance backfill) and DL-070
+(FIFO allocation), three implementation-level decisions were made in
+Prompt 15:
+
+- The seeded opening-balance row's `due_date` is set to the migration date
+  (today), not backdated or apportioned. No real historical invoice data
+  exists to derive an accurate date from, and a fabricated backdate would
+  just be a different kind of invented ageing data — the same failure mode
+  DL-069 exists to fix. Every existing customer's balance therefore shows
+  as "current" (0-30 days) immediately after migration and ages normally
+  from there; historical ageing prior to migration is accepted as
+  unrecoverable.
+- `DebtorsView` (head-office app) computes ageing locally from
+  `debtor_transactions` in its own synced local data, not by querying
+  Supabase's `mv_debtor_aging` (which remains Executive PWA-only, per its
+  existing read-only-from-Supabase architecture). Head-office apps are
+  offline-first by design: a local computation keeps ageing available
+  without connectivity, consistent with every other head-office view. This
+  means head-office and Executive PWA ageing can transiently disagree
+  between syncs — accepted, consistent with the Executive PWA's existing
+  "as of last sync" labeling convention.
+- `customers.overdue_amount` and `customers.current_balance` are
+  deprecated as stored aggregates. Both are computed live from
+  `debtor_transactions` wherever needed (checkout credit-limit checks,
+  `DebtorsView`, executive rollups). A stored aggregate that isn't kept in
+  sync (as found in the original audit) is worse than no aggregate —
+  computing live removes the drift risk entirely rather than adding a
+  trigger to maintain it. Existing callers of these columns must be
+  migrated, not left reading stale values alongside the new live
+  computation.
+
+**Rationale**: each of these three choices resolves an ambiguity DL-069/
+DL-070 left open by favoring the same principle those decisions were
+already built on — never fabricate history or state that was never
+actually recorded, and never let a derived figure drift silently out of
+sync with the ledger that is now the source of truth.
+
 ### DL-072: Till-cash reconciliation only counts refunds whose `refundMethod` is cash-equivalent
 
 **Decision**: discovered while closing out DL-068 — wiring real `credit_notes`
