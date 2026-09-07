@@ -91,6 +91,7 @@ function rowToCreditNoteForMetrics(row: any): CreditNote {
     refundMethod: row.refund_method,
     shiftId: row.shift_id,
     terminalId: row.terminal_id,
+    originalTenderMethodResolved: row.original_tender_method_resolved ?? undefined,
   } as unknown as CreditNote;
 }
 

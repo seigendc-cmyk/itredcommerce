@@ -112,12 +112,16 @@ export function computeShiftTenderMetrics(
   });
   // DL-072: till cash reconciliation only counts a refund that actually
   // left the till. CUSTOMER_CREDIT never touched cash — it adjusts the
-  // customer's ledger/balance instead. ORIGINAL_METHOD is excluded here
-  // too, deliberately conservative: credit_notes has no record of what the
-  // original sale's tender actually was, so there's no reliable way to
-  // know an ORIGINAL_METHOD refund was cash — see DL-072's own note on why
-  // undercounting here is the safer failure mode than the bug it replaces.
-  const cashRefundCreditNotes = shiftCreditNotes.filter((cn) => cn.refundMethod === 'CASH');
+  // customer's ledger/balance instead. ORIGINAL_METHOD follow-up: credit
+  // notes now resolve the original sale's actual tender method at issuance
+  // (via sale_payments) — an ORIGINAL_METHOD refund counts as cash only
+  // when originalTenderMethodResolved is exactly 'CASH' (every payment on
+  // the original sale was cash); anything else (non-cash, split tender, or
+  // unresolved — no original sale to check against) stays excluded, the
+  // same conservative default DL-072 already established.
+  const cashRefundCreditNotes = shiftCreditNotes.filter(
+    (cn) => cn.refundMethod === 'CASH' || (cn.refundMethod === 'ORIGINAL_METHOD' && cn.originalTenderMethodResolved === 'CASH')
+  );
   const refunds = cashRefundCreditNotes.reduce((sum, cn) => sum + (cn.totalRefundAmount || 0), 0);
 
   // Include base shift stored totals if no dynamic transactions found

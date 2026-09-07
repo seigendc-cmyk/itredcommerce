@@ -102,11 +102,36 @@ test('a CASH refund and a CUSTOMER_CREDIT refund of equal amounts on the same sh
   assert.equal(metrics.expectedCash, 60); // 100 opening float - 40, not - 80
 });
 
-test('an ORIGINAL_METHOD refund is excluded from cashRefunds too (no record of what the original tender was)', () => {
+test('an ORIGINAL_METHOD refund with no resolution recorded (legacy/pre-migration row) is excluded from cashRefunds', () => {
   const shift = makeShift({ id: 'SHIFT-1', openingFloat: 100 });
   const creditNotes = [makeCreditNote({ shiftId: 'SHIFT-1', totalRefundAmount: 40, refundMethod: 'ORIGINAL_METHOD' })];
   const metrics = computeShiftTenderMetrics(shift, [], [], creditNotes);
   assert.equal(metrics.cashMovements.cashRefunds, 0);
+});
+
+// DL-072 follow-up: ORIGINAL_METHOD refunds now resolve the original
+// sale's real tender method at issuance (creditNotes.ts, via
+// sale_payments) — an ORIGINAL_METHOD refund counts as cash only when that
+// resolution says so.
+
+test('an ORIGINAL_METHOD refund resolved to CASH counts toward cashRefunds', () => {
+  const shift = makeShift({ id: 'SHIFT-1', openingFloat: 100 });
+  const creditNotes = [
+    makeCreditNote({ shiftId: 'SHIFT-1', totalRefundAmount: 40, refundMethod: 'ORIGINAL_METHOD', originalTenderMethodResolved: 'CASH' }),
+  ];
+  const metrics = computeShiftTenderMetrics(shift, [], [], creditNotes);
+  assert.equal(metrics.cashMovements.cashRefunds, 40);
+  assert.equal(metrics.expectedCash, 60);
+});
+
+test('an ORIGINAL_METHOD refund resolved to NON_CASH (including a split-tender original sale) is excluded from cashRefunds', () => {
+  const shift = makeShift({ id: 'SHIFT-1', openingFloat: 100 });
+  const creditNotes = [
+    makeCreditNote({ shiftId: 'SHIFT-1', totalRefundAmount: 40, refundMethod: 'ORIGINAL_METHOD', originalTenderMethodResolved: 'NON_CASH' }),
+  ];
+  const metrics = computeShiftTenderMetrics(shift, [], [], creditNotes);
+  assert.equal(metrics.cashMovements.cashRefunds, 0);
+  assert.equal(metrics.expectedCash, 100);
 });
 
 test('a shift with only non-cash refunds has zero cashRefunds even though real refunds were issued', () => {
