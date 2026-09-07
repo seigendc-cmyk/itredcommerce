@@ -1,17 +1,18 @@
-import { 
-  Shift, 
-  StaffMember, 
-  SaleTransaction, 
-  HeldSale, 
-  TenderReconciliationEntry, 
-  CashMovementBreakdown, 
-  ImmutableShiftReconciliationSnapshot, 
-  OperationalException, 
-  ActivityEvent, 
-  CashUpMode, 
-  ExceptionSeverity, 
+import {
+  Shift,
+  StaffMember,
+  SaleTransaction,
+  HeldSale,
+  CreditNote,
+  TenderReconciliationEntry,
+  CashMovementBreakdown,
+  ImmutableShiftReconciliationSnapshot,
+  OperationalException,
+  ActivityEvent,
+  CashUpMode,
+  ExceptionSeverity,
   ActivityReasonCode,
-  ShiftTenderType 
+  ShiftTenderType
 } from '../types';
 
 export const CONTROLLED_VARIANCE_REASON_CODES: { code: ActivityReasonCode; label: string; description: string }[] = [
@@ -37,7 +38,8 @@ export function calculateVarianceSeverity(varianceAmount: number): ExceptionSeve
 export function computeShiftTenderMetrics(
   shift: Shift,
   transactions: SaleTransaction[] = [],
-  heldSales: HeldSale[] = []
+  heldSales: HeldSale[] = [],
+  creditNotes: CreditNote[] = []
 ): {
   tenderReconciliation: TenderReconciliationEntry[];
   cashMovements: CashMovementBreakdown;
@@ -62,7 +64,6 @@ export function computeShiftTenderMetrics(
   let cardSales = 0;
   let customerCreditSales = 0;
   let otherSales = 0;
-  let refunds = 0;
   let totalGross = 0;
 
   shiftTx.forEach((tx) => {
@@ -91,10 +92,33 @@ export function computeShiftTenderMetrics(
         else if (tx.transactionType === 'LAYAWAY') cashSales += tx.grandTotal;
         else cashSales += tx.grandTotal;
       }
-    } else if (tx.status === 'REFUNDED') {
-      refunds += tx.grandTotal || 0;
     }
   });
+
+  // DL-068 (Prompt 14): refunds are read from real, server-persisted
+  // credit notes attributed to the shift/terminal that actually issued
+  // them — no longer inferred from a REFUNDED-status SaleTransaction.
+  // Nothing produces one of those anymore; that was App.tsx's removed
+  // synthetic client-side reconstruction, which was also invisible to
+  // reconciliation run from server-loaded data or on another terminal.
+  // Filtered by shiftId first (the precise signal now available); falls
+  // back to terminalId only for a credit note issued before this column
+  // existed.
+  const safeCreditNotes = Array.isArray(creditNotes) ? creditNotes : [];
+  const shiftCreditNotes = safeCreditNotes.filter((cn) => {
+    if (cn.shiftId) return cn.shiftId === shift.id;
+    if (cn.terminalId && shift.terminalId) return cn.terminalId === shift.terminalId;
+    return false;
+  });
+  // DL-072: till cash reconciliation only counts a refund that actually
+  // left the till. CUSTOMER_CREDIT never touched cash — it adjusts the
+  // customer's ledger/balance instead. ORIGINAL_METHOD is excluded here
+  // too, deliberately conservative: credit_notes has no record of what the
+  // original sale's tender actually was, so there's no reliable way to
+  // know an ORIGINAL_METHOD refund was cash — see DL-072's own note on why
+  // undercounting here is the safer failure mode than the bug it replaces.
+  const cashRefundCreditNotes = shiftCreditNotes.filter((cn) => cn.refundMethod === 'CASH');
+  const refunds = cashRefundCreditNotes.reduce((sum, cn) => sum + (cn.totalRefundAmount || 0), 0);
 
   // Include base shift stored totals if no dynamic transactions found
   if (shiftTx.length === 0 && (shift.totalCashSales > 0 || shift.totalCardSales > 0 || shift.totalMobileMoneySales > 0)) {
@@ -291,6 +315,7 @@ export interface BuildSnapshotOptions {
   closedByStaff?: StaffMember;
   transactions?: SaleTransaction[];
   heldSales?: HeldSale[];
+  creditNotes?: CreditNote[];
   exceptionIds?: string[];
 }
 
@@ -317,7 +342,7 @@ export function buildImmutableReconciliationSnapshot(
     const opts = shiftOrOptions as BuildSnapshotOptions;
     const shift = opts.shift;
     const closureData = opts.closureData;
-    const calculated = computeShiftTenderMetrics(shift, opts.transactions, opts.heldSales);
+    const calculated = computeShiftTenderMetrics(shift, opts.transactions, opts.heldSales, opts.creditNotes);
 
     const tenderReconciliation = closureData.tenderReconciliation && closureData.tenderReconciliation.length > 0
       ? closureData.tenderReconciliation

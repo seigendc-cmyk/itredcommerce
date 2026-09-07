@@ -49,6 +49,7 @@ import {
 } from '../../../data/mockData';
 import { searchInventoryItems } from '../../../utils/searchUtils';
 import { executeAtomicSaleTransaction, validateSaleEligibility } from '../../../utils/saleTransactionEngine';
+import { calculateLineTotal, calculateCartTotals } from '../../../utils/saleCalculationEngine';
 import { apiPost, ApiClientError } from '../../../api/client';
 import { Button } from '../../ui/Button';
 import { Modal } from '../../ui/Modal';
@@ -156,12 +157,17 @@ export const SalesView: React.FC<SalesViewProps> = ({
     ? searchInventoryItems(inventoryItems, catalogSearch)
     : inventoryItems;
 
-  // Cart Calculations
-  const subtotal = cartItems.reduce((sum, item) => sum + (item.quantity * item.unitPrice), 0);
-  const totalDiscount = (subtotal * globalDiscountPercent) / 100;
-  const taxableAmount = Math.max(0, subtotal - totalDiscount);
-  const totalTax = taxableAmount * 0.15; // 15% VAT
-  const grandTotal = taxableAmount + totalTax;
+  // Cart Calculations — sums per-line tax/discount via the shared engine
+  // (Prompt 13) rather than applying one flat rate to the whole cart.
+  const cartTotals = calculateCartTotals(
+    cartItems.map((c) => ({
+      quantity: c.quantity,
+      unitPrice: c.unitPrice,
+      taxRate: c.taxRate ?? 15,
+      discountPercent: c.discountPercent,
+    }))
+  );
+  const { subtotal, totalDiscount, totalTax, grandTotal } = cartTotals;
   const totalItemCount = cartItems.reduce((sum, item) => sum + item.quantity, 0);
 
   // Hotkey listener for POS function keys
@@ -218,23 +224,46 @@ export const SalesView: React.FC<SalesViewProps> = ({
         return;
       }
       const updated = [...cartItems];
-      updated[existingIndex].quantity += 1;
-      updated[existingIndex].lineTotal = updated[existingIndex].quantity * updated[existingIndex].unitPrice;
+      const existingLine = updated[existingIndex];
+      const newQty = existingLine.quantity + 1;
+      // Recompute fresh from the new quantity — the bug this replaces left
+      // taxAmount frozen at whatever it was when the line was first added.
+      const recalced = calculateLineTotal({
+        quantity: newQty,
+        unitPrice: existingLine.unitPrice,
+        taxRate: existingLine.taxRate ?? 15,
+        discountPercent: existingLine.discountPercent,
+      });
+      updated[existingIndex] = {
+        ...existingLine,
+        quantity: newQty,
+        discountAmount: recalced.discountAmount,
+        taxAmount: recalced.taxAmount,
+        lineTotal: recalced.lineTotal,
+      };
       setCartItems(updated);
       setAlertNotice({ message: `Incremented quantity for ${liveItem.sku} (${updated[existingIndex].quantity} Units)`, type: 'success' });
     } else {
+      const taxRate = liveItem.taxRate ?? 15;
+      const calc = calculateLineTotal({
+        quantity: 1,
+        unitPrice: liveItem.retailPrice,
+        taxRate,
+        discountPercent: globalDiscountPercent,
+      });
       const newItem: CartLineItem = {
         id: `cart-${Date.now()}-${Math.random()}`,
         item: { ...liveItem },
         quantity: 1,
         unitPrice: liveItem.retailPrice,
         discountPercent: globalDiscountPercent,
-        taxAmount: (liveItem.retailPrice * (liveItem.taxRate ?? 15)) / 100,
-        lineTotal: liveItem.retailPrice,
+        discountAmount: calc.discountAmount,
+        taxAmount: calc.taxAmount,
+        lineTotal: calc.lineTotal,
         itemName: liveItem.name || liveItem.description,
         sku: liveItem.sku,
         unitCostBasis: liveItem.unitCost ?? liveItem.cost ?? 0,
-        taxRate: liveItem.taxRate ?? 15,
+        taxRate,
         frozenSnapshot: { ...liveItem },
       };
       setCartItems([...cartItems, newItem]);
@@ -286,10 +315,18 @@ export const SalesView: React.FC<SalesViewProps> = ({
               return line;
             }
             if (newQty < 1) return null;
+            const recalced = calculateLineTotal({
+              quantity: newQty,
+              unitPrice: line.unitPrice,
+              taxRate: line.taxRate ?? 15,
+              discountPercent: line.discountPercent,
+            });
             return {
               ...line,
               quantity: newQty,
-              lineTotal: newQty * line.unitPrice,
+              discountAmount: recalced.discountAmount,
+              taxAmount: recalced.taxAmount,
+              lineTotal: recalced.lineTotal,
             };
           }
           return line;
@@ -1076,6 +1113,27 @@ export const SalesView: React.FC<SalesViewProps> = ({
         currentStaff={currentStaff}
         onApplyDiscount={(percent) => {
           setGlobalDiscountPercent(percent);
+          // Recompute every existing line against the new percent — same
+          // staleness bug as quantity change, triggered by the other input
+          // (discount, not quantity) that invalidates a cached per-line
+          // calc result.
+          setCartItems((prev) =>
+            prev.map((line) => {
+              const recalced = calculateLineTotal({
+                quantity: line.quantity,
+                unitPrice: line.unitPrice,
+                taxRate: line.taxRate ?? 15,
+                discountPercent: percent,
+              });
+              return {
+                ...line,
+                discountPercent: percent,
+                discountAmount: recalced.discountAmount,
+                taxAmount: recalced.taxAmount,
+                lineTotal: recalced.lineTotal,
+              };
+            })
+          );
           setAlertNotice({
             message: percent > 0 ? `Applied ${percent.toFixed(1)}% cart discount.` : 'Discount cleared.',
             type: 'info',

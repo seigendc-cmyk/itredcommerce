@@ -21,15 +21,16 @@ import {
   HelpCircle,
   Clock
 } from 'lucide-react';
-import { 
-  StaffMember, 
-  Shift, 
-  SaleTransaction, 
-  HeldSale, 
-  CashUpMode, 
-  TenderReconciliationEntry, 
+import {
+  StaffMember,
+  Shift,
+  SaleTransaction,
+  HeldSale,
+  CreditNote,
+  CashUpMode,
+  TenderReconciliationEntry,
   ActivityReasonCode,
-  ExceptionSeverity 
+  ExceptionSeverity
 } from '../../../types';
 import { Button } from '../../ui/Button';
 import { Alert } from '../../ui/Alert';
@@ -46,6 +47,7 @@ export interface ShiftClosureModalProps {
   currentStaff: StaffMember;
   transactions?: SaleTransaction[];
   heldSales?: HeldSale[];
+  creditNotes?: CreditNote[];
   onConfirmCloseShift: (shiftId: string, closureData: {
     closingFloat: number;
     countedCash: number;
@@ -69,6 +71,7 @@ export const ShiftClosureModal: React.FC<ShiftClosureModalProps> = ({
   currentStaff,
   transactions = [],
   heldSales = [],
+  creditNotes = [],
   onConfirmCloseShift,
 }) => {
   if (!isOpen || !shift) return null;
@@ -80,8 +83,8 @@ export const ShiftClosureModal: React.FC<ShiftClosureModalProps> = ({
 
   // Computed expected metrics from the transaction engine
   const computedMetrics = useMemo(() => {
-    return computeShiftTenderMetrics(shift, transactions, heldSales);
-  }, [shift, transactions, heldSales]);
+    return computeShiftTenderMetrics(shift, transactions, heldSales, creditNotes);
+  }, [shift, transactions, heldSales, creditNotes]);
 
   const [closingFloat, setClosingFloat] = useState<string>((shift.openingFloat || 0).toFixed(2));
   

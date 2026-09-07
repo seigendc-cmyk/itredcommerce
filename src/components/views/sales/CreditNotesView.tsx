@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   RotateCcw, 
   ArrowLeft, 
@@ -12,18 +12,21 @@ import {
   User,
   DollarSign
 } from 'lucide-react';
-import { CreditNote, Customer, InventoryItem, StaffMember, SaleTransaction } from '../../../types';
+import { CreditNote, Customer, InventoryItem, StaffMember, SaleTransaction, Shift } from '../../../types';
 import { Button } from '../../ui/Button';
 import { Modal } from '../../ui/Modal';
 import { Alert } from '../../ui/Alert';
 import { INITIAL_INVENTORY_ITEMS } from '../../../data/mockData';
 import { apiGet, apiPost, ApiClientError } from '../../../api/client';
+import { createCheckoutIdempotencyKey } from '../../../utils/saleTransactionEngine';
 
 export interface CreditNotesViewProps {
   creditNotes: CreditNote[];
   customers: Customer[];
   sales: SaleTransaction[];
   currentStaff: StaffMember;
+  activeShift?: Shift | null;
+  terminalId?: string;
   onIssueCreditNote: (newNote: CreditNote) => void;
   onBackToLanding: () => void;
   onNavigateToPOS: () => void;
@@ -34,12 +37,25 @@ export const CreditNotesView: React.FC<CreditNotesViewProps> = ({
   customers = [],
   sales = [],
   currentStaff,
+  activeShift,
+  terminalId = 'POS-D01',
   onIssueCreditNote,
   onBackToLanding,
   onNavigateToPOS,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+  // Prompt 14: generated fresh each time the issuance modal opens, held for
+  // the lifetime of that one attempt (including its own retries) — mirrors
+  // PaymentTenderModal.tsx's sessionIdempotencyKey exactly, so two genuinely
+  // separate returns of the same qty/sku never collide, but a retried
+  // submit of the same attempt safely dedupes server-side.
+  const [sessionIdempotencyKey, setSessionIdempotencyKey] = useState<string>('');
+  useEffect(() => {
+    if (isCreateModalOpen) {
+      setSessionIdempotencyKey(createCheckoutIdempotencyKey(terminalId, currentStaff.id));
+    }
+  }, [isCreateModalOpen, terminalId, currentStaff.id]);
   const [selectedNote, setSelectedNote] = useState<CreditNote | null>(null);
   const [actionAlert, setActionAlert] = useState<{ message: string; type: 'success' | 'warning' | 'error' } | null>(null);
 
@@ -162,6 +178,11 @@ export const CreditNotesView: React.FC<CreditNotesViewProps> = ({
       currentBalance: 0,
     } as any;
 
+    if (!activeShift || activeShift.status !== 'OPEN') {
+      setActionAlert({ message: 'Active Shift Required: an open shift on this terminal is required before a return can be processed.', type: 'error' });
+      return;
+    }
+
     if (returnItems.length === 0) {
       setActionAlert({ message: 'At least one return item line is required.', type: 'error' });
       return;
@@ -176,21 +197,26 @@ export const CreditNotesView: React.FC<CreditNotesViewProps> = ({
 
     setIsSubmittingCreditNote(true);
     try {
-      const created = await apiPost<{ id: string; totalRefundAmount: number }>('/credit-notes', {
-        originalSaleNumber: refSaleNumber.trim() || undefined,
-        customerId: cust.id !== 'CUST-001' ? cust.id : undefined,
-        customerName: cust.name,
-        refundMethod,
-        reasonCategory,
-        returnedItems: returnItems.map((line) => ({
-          sku: line.item.sku,
-          itemName: line.item.name || line.item.description,
-          returnQty: line.returnQty,
-          unitPrice: line.unitPrice,
-          reason: line.reason,
-          restock: line.restock,
-        })),
-      });
+      const created = await apiPost<{ id: string; totalRefundAmount: number; terminalId?: string; branchId?: string; shiftId?: string }>(
+        '/credit-notes',
+        {
+          originalSaleNumber: refSaleNumber.trim() || undefined,
+          customerId: cust.id !== 'CUST-001' ? cust.id : undefined,
+          customerName: cust.name,
+          refundMethod,
+          reasonCategory,
+          shiftId: activeShift.id,
+          idempotencyKey: sessionIdempotencyKey,
+          returnedItems: returnItems.map((line) => ({
+            sku: line.item.sku,
+            itemName: line.item.name || line.item.description,
+            returnQty: line.returnQty,
+            unitPrice: line.unitPrice,
+            reason: line.reason,
+            restock: line.restock,
+          })),
+        }
+      );
 
       const newCreditNote: CreditNote = {
         id: created.id,
@@ -203,6 +229,9 @@ export const CreditNotesView: React.FC<CreditNotesViewProps> = ({
         refundMethod,
         reasonCategory,
         status: 'ISSUED',
+        terminalId: created.terminalId,
+        branchId: created.branchId,
+        shiftId: created.shiftId,
       };
 
       onIssueCreditNote(newCreditNote);

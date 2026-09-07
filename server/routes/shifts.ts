@@ -8,7 +8,7 @@ import {
   buildImmutableReconciliationSnapshot,
   createOperationalExceptionFromVariance,
 } from '../../src/utils/shiftReconciliation';
-import type { Shift, SaleTransaction, HeldSale, StaffMember, CashUpMode, TenderReconciliationEntry } from '../../src/types';
+import type { Shift, SaleTransaction, HeldSale, CreditNote, StaffMember, CashUpMode, TenderReconciliationEntry } from '../../src/types';
 
 const router = Router();
 router.use(requireAuth);
@@ -76,6 +76,22 @@ function rowToSaleForMetrics(row: any): SaleTransaction {
     terminalId: row.terminal_id,
     payments: (row.paymentsJson ? JSON.parse(row.paymentsJson) : []),
   } as unknown as SaleTransaction;
+}
+
+// DL-068 (Prompt 14): the real, server-persisted refund entity
+// computeShiftTenderMetrics reads instead of a REFUNDED-status
+// SaleTransaction — only the fields it actually reads (shiftId, terminalId,
+// totalRefundAmount, and — DL-072 — refundMethod, since only a cash refund
+// should count against till cash), same under-populated-on-purpose
+// convention as rowToSaleForMetrics above.
+function rowToCreditNoteForMetrics(row: any): CreditNote {
+  return {
+    id: row.id,
+    totalRefundAmount: row.total_refund_amount,
+    refundMethod: row.refund_method,
+    shiftId: row.shift_id,
+    terminalId: row.terminal_id,
+  } as unknown as CreditNote;
 }
 
 router.post(
@@ -202,6 +218,9 @@ router.post(
       (r) => ({ status: r.status, grandTotal: r.grand_total } as unknown as HeldSale)
     );
 
+    const creditNoteRows = db.prepare('SELECT * FROM credit_notes WHERE shift_id = ?').all(shiftId) as any[];
+    const creditNotes = creditNoteRows.map(rowToCreditNoteForMetrics);
+
     const closedByStaff = { name: req.currentStaff!.name } as StaffMember;
     const closedDateTime = nowIso();
 
@@ -247,6 +266,7 @@ router.post(
       closedByStaff,
       transactions,
       heldSales,
+      creditNotes,
       exceptionIds: exceptionId ? [exceptionId] : [],
     });
 
@@ -263,6 +283,7 @@ router.post(
              counted_cash = ?, cash_variance = ?, cash_up_mode = ?,
              total_sales_count = ?, gross_sales = ?, total_cash_sales = ?,
              total_mobile_money_sales = ?, total_card_sales = ?, total_credit_sales = ?,
+             total_refunds = ?,
              expected_cash = ?,
              tender_reconciliation = ?, cash_movements = ?, reconciliation_snapshot = ?,
              closure_reason_code = ?, cash_discrepancy_severity = ?, closing_notes = ?,
@@ -280,6 +301,11 @@ router.post(
           snapshot.tenderReconciliation.find((t) => t.tenderType === 'MOBILE_MONEY')?.expectedAmount ?? 0,
           snapshot.tenderReconciliation.find((t) => t.tenderType === 'DEBIT_CARD')?.expectedAmount ?? 0,
           snapshot.tenderReconciliation.find((t) => t.tenderType === 'CUSTOMER_CREDIT')?.expectedAmount ?? 0,
+          // DL-068: previously never persisted at all (only nested inside
+          // the cash_movements/reconciliation_snapshot JSON blobs), so
+          // ShiftSlipModal.tsx's own shift.totalRefunds display always
+          // read as $0.00 even when a refund had genuinely occurred.
+          snapshot.cashMovements.cashRefunds,
           snapshot.expectedCash,
           JSON.stringify(snapshot.tenderReconciliation),
           JSON.stringify(snapshot.cashMovements),
