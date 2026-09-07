@@ -1118,6 +1118,14 @@ export default function App() {
     setDeliveryOrders((prev) => prev.map((o) => (o.id === updatedOrder.id ? updatedOrder : o)));
   };
 
+  // DL-068 (Prompt 14): the synthetic negative SaleTransaction this used to
+  // fabricate and push into local-only salesTransactions state — invisible
+  // to reconciliation run from server-loaded data or on another terminal,
+  // and hardcoded to terminalId 'POS-D01' regardless of which terminal
+  // actually processed the return — is gone. server/routes/creditNotes.ts
+  // now persists a real refund entity (the credit note itself, carrying
+  // shiftId/terminalId) that shiftReconciliation.ts reads directly; no
+  // client-side reconstruction is needed for that anymore.
   const handleIssueCreditNote = (newNote: CreditNote) => {
     setCreditNotes((prev) => [newNote, ...prev]);
 
@@ -1133,32 +1141,6 @@ export default function App() {
         })
       );
     }
-
-    const returnTx: SaleTransaction = {
-      saleNumber: newNote.id,
-      dateTime: newNote.dateTime,
-      customer: newNote.customer,
-      cashier: newNote.cashier,
-      items: newNote.returnedItems.map((ri) => ({
-        id: `ret-${Date.now()}`,
-        item: ri.item,
-        quantity: -ri.returnQty,
-        unitPrice: ri.unitPrice,
-        discountPercent: 0,
-        taxAmount: -ri.unitPrice * 0.15,
-        lineTotal: -(ri.returnQty * ri.unitPrice),
-      })),
-      subtotal: -(newNote.totalRefundAmount / 1.15),
-      taxTotal: -(newNote.totalRefundAmount - newNote.totalRefundAmount / 1.15),
-      discountTotal: 0,
-      grandTotal: -newNote.totalRefundAmount,
-      payments: [{ method: newNote.refundMethod === 'CUSTOMER_CREDIT' ? 'CUSTOMER_CREDIT' : 'CASH', amount: -newNote.totalRefundAmount }],
-      changeGiven: 0,
-      transactionType: 'CREDIT_NOTE',
-      status: 'REFUNDED',
-      terminalId: 'POS-D01',
-    };
-    setSalesTransactions((prev) => [returnTx, ...prev]);
   };
 
   // Phase 4 Logistics & Location Handlers
@@ -1194,9 +1176,19 @@ export default function App() {
     }
   };
 
+  // Prompt 18 / DL-078: approve/dispatch/receive/reject now require an
+  // idempotencyKey (mirroring sales.ts/creditNotes.ts) — generated fresh
+  // per click, not persisted across a modal session like checkout's
+  // sessionIdempotencyKey, since these are single fire-and-forget button
+  // presses with no multi-step retry UI to correlate across.
+  const generateTransferActionIdempotencyKey = (action: string, transferId: string): string =>
+    `TRXFER-${action}-${transferId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
   const handleApproveTransfer = async (transferId: string) => {
     try {
-      const saved = await apiPost<StockTransfer>(`/transfers/${encodeURIComponent(transferId)}/approve`);
+      const saved = await apiPost<StockTransfer>(`/transfers/${encodeURIComponent(transferId)}/approve`, {
+        idempotencyKey: generateTransferActionIdempotencyKey('approve', transferId),
+      });
       setStockTransfers((prev) => prev.map((t) => (t.id === transferId ? saved : t)));
     } catch (err) {
       console.error('Failed to approve stock transfer', err);
@@ -1205,7 +1197,10 @@ export default function App() {
 
   const handleDispatchTransfer = async (transferId: string) => {
     try {
-      const saved = await apiPost<StockTransfer>(`/transfers/${encodeURIComponent(transferId)}/dispatch`);
+      const saved = await apiPost<StockTransfer & { dispatchWarnings?: Array<{ sku: string; requestedQty: number; stockOnHandBeforeDispatch: number; shortfallQty: number }> }>(
+        `/transfers/${encodeURIComponent(transferId)}/dispatch`,
+        { idempotencyKey: generateTransferActionIdempotencyKey('dispatch', transferId) }
+      );
       setStockTransfers((prev) => prev.map((t) => (t.id === transferId ? saved : t)));
     } catch (err) {
       console.error('Failed to dispatch stock transfer', err);
@@ -1214,7 +1209,9 @@ export default function App() {
 
   const handleReceiveTransfer = async (transferId: string) => {
     try {
-      const saved = await apiPost<StockTransfer>(`/transfers/${encodeURIComponent(transferId)}/receive`);
+      const saved = await apiPost<StockTransfer>(`/transfers/${encodeURIComponent(transferId)}/receive`, {
+        idempotencyKey: generateTransferActionIdempotencyKey('receive', transferId),
+      });
       setStockTransfers((prev) => prev.map((t) => (t.id === transferId ? saved : t)));
     } catch (err) {
       console.error('Failed to receive stock transfer', err);
@@ -1223,7 +1220,10 @@ export default function App() {
 
   const handleRejectTransfer = async (transferId: string, reason: string) => {
     try {
-      const saved = await apiPost<StockTransfer>(`/transfers/${encodeURIComponent(transferId)}/reject`, { reason });
+      const saved = await apiPost<StockTransfer>(`/transfers/${encodeURIComponent(transferId)}/reject`, {
+        reason,
+        idempotencyKey: generateTransferActionIdempotencyKey('reject', transferId),
+      });
       setStockTransfers((prev) => prev.map((t) => (t.id === transferId ? saved : t)));
     } catch (err) {
       console.error('Failed to reject stock transfer', err);
@@ -1751,6 +1751,8 @@ export default function App() {
             customers={customers}
             sales={salesTransactions}
             currentStaff={currentStaff}
+            activeShift={shifts.find((s) => s.status === 'OPEN' && (s.terminalId === currentTerminalId || s.branchId === selectedBranchId)) || shifts.find((s) => s.status === 'OPEN') || null}
+            terminalId={currentTerminalId}
             onIssueCreditNote={handleIssueCreditNote}
             onBackToLanding={() => handleNavigate('LANDING')}
             onNavigateToPOS={() => handleNavigate('SALES_CASH')}

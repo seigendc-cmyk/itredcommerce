@@ -335,6 +335,11 @@ export interface StockTransferItem {
   discrepancyReason?: TransferDiscrepancyReasonCode;
   discrepancyNotes?: string;
   unitCost: number;
+  // Prompt 18 / DL-078: stock_on_hand at the moment this line was
+  // dispatched, and how much the dispatch exceeded it (if at all) — dispatch
+  // is never blocked on insufficient stock, only flagged for reconciliation.
+  stockOnHandAtDispatch?: number;
+  dispatchShortfallQty?: number;
 }
 
 export interface StockTransfer {
@@ -373,6 +378,10 @@ export interface StockTransfer {
   hasDiscrepancy?: boolean;
   discrepancyReason?: TransferDiscrepancyReasonCode;
   discrepancyNotes?: string;
+  // Prompt 18 / DL-078: true if any line's dispatched_qty exceeded
+  // stock_on_hand at dispatch time — see each item's dispatchShortfallQty
+  // for the per-line detail.
+  hasDispatchStockWarning?: boolean;
 }
 
 export type MovementType = 
@@ -770,6 +779,12 @@ export interface CreditNote {
   refundMethod: 'CASH' | 'CUSTOMER_CREDIT' | 'ORIGINAL_METHOD';
   reasonCategory: 'DEFECTIVE' | 'WRONG_ITEM' | 'CUSTOMER_RETURN' | 'PRICE_ADJUSTMENT';
   status: 'ISSUED' | 'APPLIED' | 'CANCELLED';
+  // DL-068 (Prompt 14): the terminal/branch/shift that actually issued this
+  // refund — what shiftReconciliation.ts now attributes it to, replacing
+  // the removed synthetic reconstruction that used to hardcode 'POS-D01'.
+  terminalId?: string;
+  branchId?: string;
+  shiftId?: string;
 }
 
 // --------------------------------------------------------------------
