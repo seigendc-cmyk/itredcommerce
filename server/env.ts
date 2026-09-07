@@ -22,6 +22,15 @@ export const env = {
   // without that, every route already scoped by env.tenantId would need a
   // full process restart before it could see a newly-onboarded tenant.
   tenantId: process.env.TENANT_ID || '',
+  // Prompt 16 / DL-075: shared secret this backend sends (as
+  // x-zimra-service-secret) when it triggers the centralized
+  // zimra-fiscal-service Edge Function on a staff-initiated
+  // register/syncConfig/renewCertificate action. Must match that Edge
+  // Function's own ZIMRA_SERVICE_SECRET secret exactly — a manual,
+  // out-of-band deployment step, the same class of gap as
+  // FISCAL_CREDENTIALS_KEY's distribution. NOT the same value as
+  // ZIMRA_CREDENTIALS_KEY (which this backend never holds at all).
+  zimraServiceSecret: process.env.ZIMRA_SERVICE_SECRET || '',
 };
 
 // A function, not a boolean, for the same reason env.tenantId is mutable —
